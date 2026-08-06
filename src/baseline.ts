@@ -11,13 +11,22 @@
  *
  * It runs at a far lower particle count than the GPU arm because at parity it
  * simply never paints a frame. The HUD shows both counts side by side; the point
- * of the toggle is that the naive arm struggles at 1/500th the workload.
+ * of the toggle is that the naive arm struggles at 1/200th the workload.
  */
 
-import { integrateCPU, STRIDE, SPECIES_NAMES, SPECIES_COLORS, type Sim } from './sim/world';
+import {
+  integrateCPU,
+  integrateChladniCPU,
+  chladniWarp,
+  reseed,
+  STRIDE,
+  SPECIES_NAMES,
+  SPECIES_COLORS,
+  type Sim,
+} from './sim/world';
 
-/** Even this is generous — 4000 absolutely-positioned nodes is already a lot. */
-export const BASELINE_COUNT = 4_000;
+/** Even this is generous — 5000 absolutely-positioned nodes is already a lot. */
+export const BASELINE_COUNT = 5_000;
 const BASELINE_ROWS = 400;
 
 export class BaselineArm {
@@ -25,6 +34,8 @@ export class BaselineArm {
   private nodes: HTMLElement[] = [];
   private listHost: HTMLElement;
   private active = false;
+  private mode = 0;
+  private elapsed = 0;
 
   constructor(
     private sim: Sim,
@@ -80,12 +91,25 @@ export class BaselineArm {
     return this.active ? this.nodes.length + BASELINE_ROWS : 0;
   }
 
+  /** Re-seed for the mode being compared, so both arms start from like states. */
+  setMode(mode: number) {
+    this.mode = mode;
+    this.elapsed = 0;
+    reseed(this.sim, BASELINE_COUNT, mode);
+  }
+
   frame(dt: number, mx: number, my: number) {
     if (!this.active) return;
 
+    this.elapsed += dt;
     const saved = this.sim.count;
     this.sim.count = BASELINE_COUNT;
-    integrateCPU(this.sim, dt, mx, my);
+    if (this.mode === 1) {
+      const { n, m } = chladniWarp(mx, my, this.elapsed);
+      integrateChladniCPU(this.sim, dt, n, m, this.elapsed);
+    } else {
+      integrateCPU(this.sim, dt, mx, my);
+    }
     this.sim.count = saved;
 
     const w = innerWidth;

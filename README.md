@@ -51,17 +51,17 @@ reaches the screen.
 
 | | GPU arm | naive DOM arm |
 | --- | --- | --- |
-| particles | **1,000,000** | 4,000 |
+| particles | **1,000,000** | 5,000 |
 | fps | **58** | 16 |
 | p50 frame time | **16.70 ms** | 66.60 ms |
-| p99 frame time | **33.40 ms** | 199.90 ms |
-| dropped frames | 3.9% | **98.9%** |
-| blocking long tasks | **0 / 0 ms** | 93 / 5,746 ms |
-| live DOM nodes | **33** | 4,400 |
-| reactive effect runs | 1 per 650 frames | 1 per 94 frames |
+| p99 frame time | **33.40 ms** | 83.40 ms |
+| dropped frames | 3.9% | **99.6%** |
+| blocking long tasks (~15 s of arm) | **0 / 0 ms** | 238 / 14,811 ms |
+| live DOM nodes | **33** | 5,400 |
+| reactive effect runs | 1 per 650 frames | 1 per 239 frames |
 
-**250× the particles at 3.6× the frame rate**, and the main thread goes from
-5.7 seconds of blocking long tasks to zero.
+**200× the particles at 3.6× the frame rate**, and the main thread goes from
+essentially every millisecond spent inside a blocking long task to zero.
 
 The naive arm is not a strawman in its arithmetic — it calls the same
 `integrateCPU`. What it does differently is what most dashboards do: one DOM
@@ -140,7 +140,47 @@ npm install && npm run dev
 ```
 
 Controls: `M` switches simulation mode, `B` switches arm, click the species
-chips to filter, move the cursor to drive the field.
+chips to filter, move the cursor to drive the field. `B` compares within
+whichever mode is active, so both arms always run the same force law.
+
+## Deploying (self-hosted)
+
+Fully static — no server, no runtime, no API. `npm run build` emits three files
+totalling ~45 kB (15 kB gzipped JS) into `dist/`. Copy that directory to your
+web root. Verified by serving the built output and confirming numbers identical
+to the dev server.
+
+**Serve it over HTTPS.** This is the one that will bite you. WebGPU requires a
+secure context, so over plain `http://` on a LAN address every visitor silently
+falls back to the WebGL2 path — it still works, but you lose the compute-shader
+headline. `localhost` is exempt; a LAN IP is not. `file://` fails outright,
+because ES module imports are blocked too.
+
+Nginx, root-served:
+
+```nginx
+root /var/www/particles;
+index index.html;
+
+# Hashed filenames — safe to cache forever.
+location /assets/ {
+  add_header Cache-Control "public, max-age=31536000, immutable";
+}
+
+# index.html must not be cached, or clients pin to stale asset hashes.
+location = /index.html {
+  add_header Cache-Control "no-cache";
+}
+```
+
+No SPA rewrite rule is needed — it is a single page and the query parameters are
+read client-side. No COOP/COEP headers either, since nothing here uses
+`SharedArrayBuffer`. Just confirm your server sends a JavaScript MIME type for
+`.js`, or the module script will refuse to execute.
+
+If you serve from a subdirectory rather than the root, build with
+`BASE_PATH=/subdir/ npm run build`. (In Git Bash on Windows, MSYS mangles a
+leading-slash value into a Windows path — use `MSYS_NO_PATHCONV=1` there.)
 
 Query parameters:
 

@@ -97,21 +97,25 @@ const banner = document.createElement('div');
 banner.id = 'banner';
 document.body.appendChild(banner);
 
+const modeLabel = () => (mode === 1 ? 'Chladni plate · 6 frequencies' : 'orbital galaxy');
+
 function refreshBanner() {
-  const label = mode === 1 ? 'Chladni plate · 6 frequencies' : 'orbital galaxy';
   banner.textContent =
-    `${backend.name} compute · ${sim.count.toLocaleString()} particles · ${label} — ` +
+    `${backend.name} compute · ${sim.count.toLocaleString()} particles · ${modeLabel()} — ` +
     `[M] mode · [B] compare`;
 }
 
 function setArm(next: 'gpu' | 'baseline') {
   arm(next);
   if (next === 'baseline') {
+    // Compare within the current mode: the naive arm runs the same force law the
+    // GPU arm is running, not whichever one it happened to be written against.
+    baseline.setMode(mode);
     baseline.start();
     canvas.style.display = 'none';
     banner.textContent =
       `naive DOM · ${BASELINE_COUNT.toLocaleString()} particles as elements · ` +
-      `sidebar rebuilt per frame — press [B]`;
+      `${modeLabel()} · sidebar rebuilt per frame — press [B]`;
   } else {
     baseline.stop();
     canvas.style.display = 'block';
@@ -129,6 +133,8 @@ function setMode(next: number) {
   mode = next;
   backend.setMode(mode);
   if (arm() === 'gpu') refreshBanner();
+  // Switching mode while comparing should switch the thing being compared.
+  else setArm('baseline');
 }
 
 addEventListener('keydown', (e) => {

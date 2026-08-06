@@ -180,3 +180,100 @@ export function integrateCPU(sim: Sim, dt: number, mx: number, my: number) {
     p[o + 3] = vy;
   }
 }
+
+/** Mirrors MODES in both shaders — per-species (n, m) offsets. */
+const MODE_OFFSETS = new Float32Array([0, 1, 1, 0, 0, 2, 2, 0, 1, 3, 3, 1]);
+
+function hash2(n: number) {
+  let x = Math.imul(n, 747796405) + 2891336453;
+  x = Math.imul((x >>> ((x >>> 28) + 4)) ^ x, 277803737);
+  return (((x >>> 22) ^ x) >>> 0) / 4294967296;
+}
+
+/**
+ * Cursor-driven base frequencies. Shared by every arm and backend so they all
+ * sweep identically — otherwise the A/B comparison is between two different
+ * simulations, which proves nothing.
+ */
+export function chladniWarp(mx: number, my: number, elapsed: number) {
+  const drift = Math.sin(elapsed * 0.11) * 1.4;
+  return {
+    n: 1 + (mx * 0.5 + 0.5) * 12 + drift,
+    m: 1 + (my * 0.5 + 0.5) * 12 + drift,
+  };
+}
+
+/**
+ * CPU reference for the Chladni plate — same math as the WGSL chladni function.
+ * Without this the naive arm ran galaxy physics behind a plate-labelled banner,
+ * which would have made the comparison a lie in one of the two modes.
+ */
+export function integrateChladniCPU(
+  sim: Sim,
+  dt: number,
+  warpN: number,
+  warpM: number,
+  time: number,
+) {
+  const p = sim.particles;
+  const n = sim.count;
+  const tick = (time * 60) | 0;
+
+  for (let i = 0; i < n; i++) {
+    const o = i * STRIDE;
+    const sp = sim.species[i];
+    const fn = warpN + MODE_OFFSETS[sp * 2];
+    const fm = warpM + MODE_OFFSETS[sp * 2 + 1];
+
+    const u = (p[o] + 1) * 0.5;
+    const v = (p[o + 1] + 1) * 0.5;
+
+    const cnu = Math.cos(fn * Math.PI * u);
+    const cmv = Math.cos(fm * Math.PI * v);
+    const cmu = Math.cos(fm * Math.PI * u);
+    const cnv = Math.cos(fn * Math.PI * v);
+
+    const w = cnu * cmv - cmu * cnv;
+    const dwdu =
+      -fn * Math.PI * Math.sin(fn * Math.PI * u) * cmv +
+      fm * Math.PI * Math.sin(fm * Math.PI * u) * cnv;
+    const dwdv =
+      -fm * Math.PI * cnu * Math.sin(fm * Math.PI * v) +
+      fn * Math.PI * cmu * Math.sin(fn * Math.PI * v);
+
+    const s = Math.sign(w) * 0.5;
+    const amp = Math.abs(w);
+    const jx = hash2(i * 2 + tick) - 0.5;
+    const jy = hash2(i * 2 + 1 + tick) - 0.5;
+
+    const vx = (p[o + 2] - dwdu * s * 2.4 * dt + jx * amp * 2.2 * dt) * 0.86;
+    const vy = (p[o + 3] - dwdv * s * 2.4 * dt + jy * amp * 2.2 * dt) * 0.86;
+
+    p[o] = Math.max(-1, Math.min(1, p[o] + vx * dt));
+    p[o + 1] = Math.max(-1, Math.min(1, p[o + 1] + vy * dt));
+    p[o + 2] = vx;
+    p[o + 3] = vy;
+  }
+}
+
+/** Re-seed the first `n` slots for a mode. Used by the naive arm on switch. */
+export function reseed(sim: Sim, n: number, mode: number) {
+  const p = sim.particles;
+  for (let i = 0; i < n; i++) {
+    const o = i * STRIDE;
+    if (mode === 1) {
+      p[o] = Math.random() * 2 - 1;
+      p[o + 1] = Math.random() * 2 - 1;
+      p[o + 2] = 0;
+      p[o + 3] = 0;
+    } else {
+      const a = Math.random() * Math.PI * 2;
+      const r = Math.sqrt(Math.random()) * 0.65;
+      const vOrb = Math.sqrt(G_CORE / Math.max(r, 0.06)) * 0.94;
+      p[o] = Math.cos(a) * r;
+      p[o + 1] = Math.sin(a) * r;
+      p[o + 2] = -Math.sin(a) * vOrb;
+      p[o + 3] = Math.cos(a) * vOrb;
+    }
+  }
+}
