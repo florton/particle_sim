@@ -17,6 +17,7 @@
 import {
   integrateCPU,
   integrateChladniCPU,
+  integrateCollisionCPU,
   chladniWarp,
   reseed,
   STRIDE,
@@ -24,6 +25,7 @@ import {
   SPECIES_COLORS,
   type Sim,
 } from './sim/world';
+import type { PairState } from './sim/pair';
 
 /** Even this is generous — 5000 absolutely-positioned nodes is already a lot. */
 export const BASELINE_COUNT = 5_000;
@@ -36,6 +38,7 @@ export class BaselineArm {
   private active = false;
   private mode = 0;
   private elapsed = 0;
+  private pair?: PairState;
 
   constructor(
     private sim: Sim,
@@ -92,10 +95,11 @@ export class BaselineArm {
   }
 
   /** Re-seed for the mode being compared, so both arms start from like states. */
-  setMode(mode: number) {
+  setMode(mode: number, pair?: PairState) {
     this.mode = mode;
     this.elapsed = 0;
-    reseed(this.sim, BASELINE_COUNT, mode);
+    this.pair = pair;
+    reseed(this.sim, BASELINE_COUNT, mode, pair);
   }
 
   frame(dt: number, mx: number, my: number, gCursor?: number) {
@@ -104,7 +108,9 @@ export class BaselineArm {
     this.elapsed += dt;
     const saved = this.sim.count;
     this.sim.count = BASELINE_COUNT;
-    if (this.mode === 1) {
+    if (this.mode === 2 && this.pair) {
+      integrateCollisionCPU(this.sim, dt, mx, my, this.pair, gCursor);
+    } else if (this.mode === 1) {
       const { n, m } = chladniWarp(mx, my, this.elapsed);
       integrateChladniCPU(this.sim, dt, n, m, this.elapsed);
     } else {
@@ -117,14 +123,17 @@ export class BaselineArm {
     const w = innerWidth;
     const h = innerHeight;
     const p = this.sim.particles;
+    // Same camera as the GPU arm — the collision is drawn pulled back, and an arm
+    // that framed it differently would not be showing the same scene.
+    const s = this.mode === 2 ? 0.55 : 1;
 
     // The classic mistake: writing layout-triggering properties per node, per
     // frame. Each assignment invalidates layout for the whole layer.
     for (let i = 0; i < BASELINE_COUNT; i++) {
       const o = i * STRIDE;
       const node = this.nodes[i];
-      node.style.left = ((p[o] * 0.5 + 0.5) * w).toFixed(1) + 'px';
-      node.style.top = ((-p[o + 1] * 0.5 + 0.5) * h).toFixed(1) + 'px';
+      node.style.left = ((p[o] * s * 0.5 + 0.5) * w).toFixed(1) + 'px';
+      node.style.top = ((-p[o + 1] * s * 0.5 + 0.5) * h).toFixed(1) + 'px';
     }
 
     // And the other classic mistake: rebuilding the list markup every frame.

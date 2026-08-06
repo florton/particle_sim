@@ -15,6 +15,8 @@
  * of "data-oriented ECS" is the memory layout below, not the library.
  */
 
+import { PAIR_DISC_R, PAIR_MASS, type PairState } from './pair';
+
 export const STRIDE = 4; // x, y, vx, vy
 
 /** Primary attractor strength, fixed at the origin. */
@@ -32,8 +34,13 @@ export const G_CURSOR = 0.2;
 export const G_CURSOR_HELD = 0.6;
 /** Terminal speed. */
 export const V_MAX = 3.0;
-/** Radial-velocity retention per step. Circularizes orbits without killing them. */
-export const RADIAL_DAMP = 0.995;
+/**
+ * Radial-velocity retention per step, inside and outside the disc. Dissipation
+ * is a function of radius — see the note in render/webgpu.ts for the measurement
+ * that forced it to be.
+ */
+export const DAMP_INNER = 0.9995;
+export const DAMP_OUTER = 0.995;
 export const SPECIES_COUNT = 6;
 
 /**
@@ -51,8 +58,17 @@ export const BAR_K = 0.045;
 export const BAR_A2 = 0.35 * 0.35;
 /** Past this radius a particle is recycled rather than bounced off the box. */
 export const ESCAPE_R = 1.15;
-/** Radius it comes back at, on a circular orbit. */
-export const RETURN_R = 0.8;
+/** Each species comes back into its own annulus inside this band. */
+export const RETURN_LO = 0.04;
+export const RETURN_HI = 0.80;
+/** And is recycled once it falls to this fraction of its own home radius. */
+export const CORE_FRAC = 0.28;
+/**
+ * How far a home radius may wander from its species' centre, in species widths.
+ * Over one, so the bands overlap and no edge between two colours is anywhere —
+ * see homeRadius() in render/webgpu.ts.
+ */
+export const SPECIES_SPREAD = 1.6;
 
 export const SPECIES_NAMES = [
   'argon',
@@ -112,7 +128,7 @@ export function createSim(capacity: number, seed = 0x9e3779b9): Sim {
     const o = i * STRIDE;
     // Start in a disc so frame one reads as a structure rather than noise.
     const a = rand() * Math.PI * 2;
-    const r = Math.sqrt(rand()) * 0.65;
+    const r = Math.max(0.03, Math.sqrt(rand()) * 0.65);
     particles[o] = Math.cos(a) * r;
     particles[o + 1] = Math.sin(a) * r;
 
@@ -123,14 +139,16 @@ export function createSim(capacity: number, seed = 0x9e3779b9): Sim {
     // the walls — after a minute the whole field decays to uniform noise. Seeded
     // on-orbit, the disc is stable indefinitely. Slightly sub-orbital (0.94) so
     // it precesses into spiral arms instead of sitting as a featureless annulus.
-    const vOrb = Math.sqrt(G_CORE / Math.max(r, 0.06)) * 0.94;
+    const vOrb = circularSpeed(r) * 0.94;
     particles[o + 2] = -Math.sin(a) * vOrb;
     particles[o + 3] = Math.cos(a) * vOrb;
 
     // Species banded by radius: the galaxy reads as composed rings rather than
-    // uniform confetti, and the filter chips then carve visible structure.
+    // uniform confetti, and the filter chips then carve visible structure. The
+    // jitter is wide on purpose: the bands have to overlap, or the disc reads as
+    // six authored rings rather than as a population that happens to be sorted.
     const band = (r / 0.65) * SPECIES_COUNT;
-    const jitter = (rand() - 0.5) * 1.6;
+    const jitter = (rand() - 0.5) * SPECIES_SPREAD;
     species[i] = Math.max(0, Math.min(SPECIES_COUNT - 1, (band + jitter) | 0));
     stat[i] = rand();
   }
@@ -173,7 +191,7 @@ export function integrateCPU(
     const cy = -y;
     const dc2 = cx * cx + cy * cy + 0.004;
     const rc = Math.sqrt(dc2);
-    const fc = G_CORE / (dc2 * rc) - 0.0025 / (dc2 * dc2);
+    const fc = coreF(dc2);
 
     const dx = mx - x;
     const dy = my - y;
@@ -208,8 +226,10 @@ export function integrateCPU(
     const rdx = cx / rc;
     const rdy = cy / rc;
     const vr = vx * rdx + vy * rdy;
-    vx = (vx - vr * rdx) + vr * rdx * RADIAL_DAMP;
-    vy = (vy - vr * rdy) + vr * rdy * RADIAL_DAMP;
+    const ds = Math.max(0, Math.min(1, (rc - 0.25) / 0.35));
+    const dampR = DAMP_INNER + (DAMP_OUTER - DAMP_INNER) * ds * ds * (3 - 2 * ds);
+    vx = (vx - vr * rdx) + vr * rdx * dampR;
+    vy = (vy - vr * rdy) + vr * rdy * dampR;
     vx *= damp;
     vy *= damp;
 
@@ -225,14 +245,19 @@ export function integrateCPU(
     // Recycle escapees onto a circular orbit rather than reflecting them off the
     // box — see render/webgpu.ts. Bouncing left a speckle along the edges that
     // nothing ever cleared, and that speckle was most of what read as static.
+    // Per-particle inner bound, at half its own home radius — see webgpu.ts.
+    const home = homeRadius(sim.species[i], i);
+    const floorR = Math.max(0.05, home * CORE_FRAC);
     const pr = Math.hypot(nx, ny);
-    if (pr > ESCAPE_R) {
-      const rx = nx / pr;
-      const ry = ny / pr;
+    if (pr > ESCAPE_R || pr < floorR) {
+      const inv = 1 / Math.max(pr, 1e-6);
+      const rx = nx * inv;
+      const ry = ny * inv;
       const spin = nx * vy - ny * vx >= 0 ? 1 : -1;
-      const vOrb = Math.sqrt(G_CORE / RETURN_R) * spin;
-      nx = rx * RETURN_R;
-      ny = ry * RETURN_R;
+      const rr = home;
+      const vOrb = circularSpeed(rr) * spin;
+      nx = rx * rr;
+      ny = ry * rr;
       vx = -ry * vOrb;
       vy = rx * vOrb;
     }
@@ -242,6 +267,28 @@ export function integrateCPU(
     p[o + 2] = vx;
     p[o + 3] = vy;
   }
+}
+
+/** Radial acceleration factor of the primary — see coreF() in render/webgpu.ts. */
+export function coreF(q: number) {
+  return G_CORE / (q * Math.sqrt(q)) - 0.0025 / (q * q);
+}
+
+/**
+ * Circular-orbit speed under that force, which is not sqrt(G/r). See vCirc() in
+ * render/webgpu.ts — inside the softening length the difference is what decides
+ * whether the middle holds a bulge or stays a clean dark hole.
+ */
+export function circularSpeed(r: number) {
+  const q = r * r + 0.004;
+  return r * Math.sqrt(Math.max(0, coreF(q)));
+}
+
+/** Home radius from species, bands overlapping — see render/webgpu.ts. */
+export function homeRadius(species: number, i: number) {
+  const j = (hash2(i * 11 + 5) - 0.5) * SPECIES_SPREAD;
+  const f = Math.min(1, Math.max(0.04, (species + 0.5 + j) / SPECIES_COUNT));
+  return RETURN_LO + (RETURN_HI - RETURN_LO) * f;
 }
 
 /** Mirrors MODES in both shaders — per-species (n, m) offsets. */
@@ -319,20 +366,85 @@ export function integrateChladniCPU(
   }
 }
 
+/**
+ * CPU reference for the collision — the naive arm has to run the same force law
+ * in every mode, or the A/B comparison is a comparison between two different
+ * simulations. Two softened point masses plus the cursor; no walls, no
+ * recycling, because a tidal tail is material genuinely leaving.
+ */
+export function integrateCollisionCPU(
+  sim: Sim,
+  dt: number,
+  mx: number,
+  my: number,
+  pair: PairState,
+  gCursor = G_CURSOR,
+) {
+  const p = sim.particles;
+  const n = sim.count;
+
+  for (let i = 0; i < n; i++) {
+    const o = i * STRIDE;
+    const x = p[o];
+    const y = p[o + 1];
+
+    const ax = pair.x0 - x;
+    const ay = pair.y0 - y;
+    const qa = ax * ax + ay * ay + 0.004;
+    const fa = PAIR_MASS / (qa * Math.sqrt(qa));
+
+    const bx = pair.x1 - x;
+    const by = pair.y1 - y;
+    const qb = bx * bx + by * by + 0.004;
+    const fb = PAIR_MASS / (qb * Math.sqrt(qb));
+
+    const cx = mx - x;
+    const cy = my - y;
+    const qc = cx * cx + cy * cy + 0.02;
+    const fc = gCursor / (qc * Math.sqrt(qc));
+
+    let vx = p[o + 2] + (ax * fa + bx * fb + cx * fc) * dt;
+    let vy = p[o + 3] + (ay * fa + by * fb + cy * fc) * dt;
+
+    const speed = Math.hypot(vx, vy);
+    if (speed > V_MAX) {
+      vx *= V_MAX / speed;
+      vy *= V_MAX / speed;
+    }
+
+    p[o] = x + vx * dt;
+    p[o + 1] = y + vy * dt;
+    p[o + 2] = vx;
+    p[o + 3] = vy;
+  }
+}
+
 /** Re-seed the first `n` slots for a mode. Used by the naive arm on switch. */
-export function reseed(sim: Sim, n: number, mode: number) {
+export function reseed(sim: Sim, n: number, mode: number, pair?: PairState) {
   const p = sim.particles;
   for (let i = 0; i < n; i++) {
     const o = i * STRIDE;
-    if (mode === 1) {
+    if (mode === 2 && pair) {
+      // Two discs, interleaved by parity — mirrors the WGSL scatter pass.
+      const g = i & 1;
+      const a = Math.random() * Math.PI * 2;
+      const j = (Math.random() - 0.5) * SPECIES_SPREAD;
+      const f = Math.min(1, Math.max(0.02, (sim.species[i] + 0.5 + j) / SPECIES_COUNT));
+      const r = Math.max(0.05, PAIR_DISC_R * Math.sqrt(f));
+      const vOrb = Math.sqrt(PAIR_MASS / r) * (g ? pair.spin1 : 1);
+      p[o] = (g ? pair.x1 : pair.x0) + Math.cos(a) * r;
+      p[o + 1] = (g ? pair.y1 : pair.y0) + Math.sin(a) * r;
+      p[o + 2] = (g ? pair.vx1 : pair.vx0) - Math.sin(a) * vOrb;
+      p[o + 3] = (g ? pair.vy1 : pair.vy0) + Math.cos(a) * vOrb;
+    } else if (mode === 1) {
       p[o] = Math.random() * 2 - 1;
       p[o + 1] = Math.random() * 2 - 1;
       p[o + 2] = 0;
       p[o + 3] = 0;
     } else {
       const a = Math.random() * Math.PI * 2;
-      const r = Math.sqrt(Math.random()) * 0.65;
-      const vOrb = Math.sqrt(G_CORE / Math.max(r, 0.06)) * 0.94;
+      const r = Math.max(0.03, Math.sqrt(Math.random()) * 0.65);
+      const vOrb = circularSpeed(r) * 0.94;
       p[o] = Math.cos(a) * r;
       p[o + 1] = Math.sin(a) * r;
       p[o + 2] = -Math.sin(a) * vOrb;

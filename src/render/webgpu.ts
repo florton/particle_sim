@@ -5,6 +5,7 @@
  */
 
 import { G_CURSOR, type Sim } from '../sim/world';
+import { PAIR_DISC_R, PAIR_MASS, type PairState } from '../sim/pair';
 import { READBACK_MAX, type Backend } from './backend';
 
 const WORKGROUP = 64;
@@ -23,6 +24,16 @@ struct Params {
   warpN  : f32,
   warpM  : f32,
   gcur   : f32,
+  // Collision mode only: the two cores, their velocities (needed at seeding, so
+  // each disc is born already moving with its host) and the second disc's spin.
+  c0     : vec2<f32>,
+  v0     : vec2<f32>,
+  c1     : vec2<f32>,
+  v1     : vec2<f32>,
+  pmass  : f32,
+  spin1  : f32,
+  discR  : f32,
+  scale  : f32,
 };
 
 // Primary attractor strength. Fixed at the origin -- see the integrate entry
@@ -32,6 +43,10 @@ const G_CORE = 0.55;
 // near-core while it is held. See sim/world.ts for the two values.
 // Terminal speed. Without it a close cursor pass flings grains off to infinity.
 const V_MAX = 3.0;
+// Radial-velocity retention per step, as a function of radius -- see damping()
+// below. Mirrored in sim/world.ts and render/webgl2.ts.
+const DAMP_INNER = 0.9995;
+const DAMP_OUTER = 0.995;
 
 // Rotating bar -- see the bar() function for why this exists at all. Mirrored in
 // sim/world.ts and render/webgl2.ts; the three must stay in sync.
@@ -42,9 +57,14 @@ const BAR_A2 = 0.1225;   // (0.35)^2 -- bar radial scale, squared
 // Recycling bounds -- see the respawn() note. Anything past ESCAPE_R or inside
 // CORE_R rejoins the disc between RETURN_LO and RETURN_HI.
 const ESCAPE_R = 1.15;
-const CORE_R = 0.07;
-const RETURN_LO = 0.55;
-const RETURN_HI = 0.95;
+const RETURN_LO = 0.04;
+const RETURN_HI = 0.80;
+// A species is recycled once it has fallen to this fraction of its home radius --
+// far enough in to shear into an arm first, not so far that the bands merge.
+const CORE_FRAC = 0.28;
+// How far a particle's home radius is allowed to wander from its species' centre,
+// in species widths. Mirrors the seeding jitter in sim/world.ts.
+const SPECIES_SPREAD = 1.6;
 
 // Per-species (n, m) offsets from the cursor-driven base frequency. Each species
 // settles onto the nodal lines of its own standing wave, so six figures resolve
@@ -125,6 +145,47 @@ fn chladni(i : u32, p : vec4<f32>, dt : f32) -> vec4<f32> {
 }
 
 /**
+ * Galaxy collision: the restricted three-body model.
+ *
+ * Two cores on their own two-body orbit, solved on the CPU and arriving here as
+ * six floats; every particle is a massless test particle in the sum of their two
+ * fields. Toomre & Toomre showed in 1972 that this -- no self-gravity, no gas,
+ * no N-body -- is enough to produce the tidal tails and the bridge that the
+ * Antennae and the Mice are famous for. The tails are not thrown out by the
+ * collision so much as left behind by it: material on the far side of each disc
+ * is held less tightly than material on the near side, so the differential pull
+ * stretches the disc into a tail pointing away and a bridge pointing across.
+ *
+ * The disc's spin sense relative to the orbit is the whole story. A prograde
+ * encounter -- disc rotating the same way the cores swing -- keeps the outer
+ * particles in step with the perturber for a long fraction of an orbit, and that
+ * sustained pull is what throws a tail half the frame long. Flip the spin and
+ * the same encounter barely marks it. Press R to see the difference; it is the
+ * single most surprising result in the file.
+ *
+ * Nothing is recycled here and there are no walls. A tail is material genuinely
+ * leaving, and catching it would be catching the thing worth watching.
+ */
+fn collide(p : vec4<f32>, dt : f32) -> vec4<f32> {
+  let d0 = params.c0 - p.xy;
+  let q0 = dot(d0, d0) + 0.004;
+  let d1 = params.c1 - p.xy;
+  let q1 = dot(d1, d1) + 0.004;
+
+  let dm = vec2<f32>(params.mx - p.x, params.my - p.y);
+  let qm = dot(dm, dm) + 0.02;
+
+  var v = p.zw
+    + d0 * (params.pmass / (q0 * sqrt(q0))) * dt
+    + d1 * (params.pmass / (q1 * sqrt(q1))) * dt
+    + dm * (params.gcur / (qm * sqrt(qm))) * dt;
+
+  let speed = length(v);
+  if (speed > V_MAX) { v = v * (V_MAX / speed); }
+  return vec4<f32>(p.xy + v * dt, v);
+}
+
+/**
  * Put a particle back on the disc, on a circular orbit along its current ray.
  *
  * Both ends of the disc leak, and each leak is what the demo used to decay into.
@@ -146,9 +207,64 @@ fn chladni(i : u32, p : vec4<f32>, dt : f32) -> vec4<f32> {
  * over a band and follows the ray the particle left on, so the replenishment
  * reads as circulation rather than as a ring appearing out of nowhere.
  */
+fn damping(r : f32) -> f32 {
+  return mix(DAMP_INNER, DAMP_OUTER, smoothstep(0.25, 0.6, r));
+}
+
+/**
+ * The radius a particle belongs at, from its species -- and deliberately not a
+ * clean function of it.
+ *
+ * Some species/radius correlation has to survive recycling. Returning everything
+ * to one shared band was measured to converge all six species onto the same mean
+ * radius within a minute, and additive blending over a mixed population is grey:
+ * the disc whitens and the filter chips stop carving anything.
+ *
+ * But the first fix for that -- one hard annulus per species -- traded the
+ * problem for a worse one. Six disjoint bands draw six clean concentric rings,
+ * and clean concentric rings look authored. This demo's whole claim is that its
+ * structure is emergent, and a ring you can predict from a constant is not.
+ *
+ * So the bands overlap, by more than a full species width. Each particle draws a
+ * home radius from a distribution centred on its species and wide enough to reach
+ * well into its neighbours', which is the same jitter the initial seeding uses.
+ * Statistically the six colours still occupy six different parts of the disc.
+ * Locally, no edge between them is anywhere.
+ */
+/**
+ * The primary's radial acceleration factor: multiply by the vector to the centre
+ * to get the acceleration. Attraction minus a short-range repulsive core --
+ * without the second term the whole population collapses to a single point.
+ */
+fn coreF(q : f32) -> f32 {
+  return G_CORE / (q * sqrt(q)) - 0.0025 / (q * q);
+}
+
+/**
+ * Speed of a circular orbit at r under that force -- not sqrt(G/r).
+ *
+ * The difference only matters near the middle, and near the middle it decides
+ * whether there is a galaxy or a hole. The potential is softened, so inside the
+ * softening length the true circular speed falls well below the Kepler value;
+ * seeding at the Kepler value there launches everything straight back out and
+ * the centre can never hold a population. Deriving the speed from the same
+ * expression the integrator uses lets the innermost species sit as a bulge
+ * instead of leaving a clean dark disc where the nucleus should be.
+ */
+fn vCirc(r : f32) -> f32 {
+  let q = r * r + 0.004;
+  return r * sqrt(max(0.0, coreF(q)));
+}
+
+fn homeRadius(i : u32) -> f32 {
+  let j = (hash(i * 11u + 5u) - 0.5) * SPECIES_SPREAD;
+  let f = clamp((f32(cspecies[i]) + 0.5 + j) / 6.0, 0.04, 1.0);
+  return RETURN_LO + (RETURN_HI - RETURN_LO) * f;
+}
+
 fn respawn(i : u32, dir : vec2<f32>, spin : f32) -> vec4<f32> {
-  let r = RETURN_LO + hash(i * 7u + 13u) * (RETURN_HI - RETURN_LO);
-  let vOrb = sqrt(G_CORE / r) * spin;
+  let r = homeRadius(i);
+  let vOrb = vCirc(r) * spin;
   return vec4<f32>(dir * r, -dir.y * vOrb, dir.x * vOrb);
 }
 
@@ -218,12 +334,43 @@ fn scatter(@builtin(global_invocation_id) gid : vec3<u32>) {
     return;
   }
 
+  let a = hash(i * 3u) * 6.2831853;
+
+  if (params.mode == 2u) {
+    // Collision: two discs, one per core, interleaved by parity so both inherit
+    // the full species mix and the colour bands survive the merger.
+    let g = i & 1u;
+    let c = select(params.c0, params.c1, g == 1u);
+    let cv = select(params.v0, params.v1, g == 1u);
+    let spin = select(1.0, params.spin1, g == 1u);
+
+    // Filled discs, not rings.
+    //
+    // The sqrt is what makes them discs: it gives uniform surface density, where
+    // sampling the radius directly piles everything at the centre. Species still
+    // correlates with radius, softly and with the bands overlapping, so the
+    // encounter draws the tail out roughly sorted by where it came from without
+    // either disc reading as a set of concentric hoops.
+    let j = (hash(i * 11u + 5u) - 0.5) * SPECIES_SPREAD;
+    let f = clamp((f32(cspecies[i]) + 0.5 + j) / 6.0, 0.02, 1.0);
+    // Small inner cutoff: seeding on top of a core gives an orbital speed that
+    // saturates the velocity clamp and the nucleus blows out flat white.
+    let r = max(0.05, params.discR * sqrt(f));
+    let vOrb = sqrt(params.pmass / r) * spin;
+    // Each disc is born already moving with its host, or it would be left behind
+    // on the first frame and the encounter would never happen.
+    parts[i] = vec4<f32>(
+      c + vec2<f32>(cos(a), sin(a)) * r,
+      cv + vec2<f32>(-sin(a), cos(a)) * vOrb
+    );
+    return;
+  }
+
   // Galaxy: re-seed the orbital disc. Returning from Chladni would otherwise
   // leave a million grains sitting on nodal lines with zero angular momentum,
   // and they would simply rain into the core.
-  let a = hash(i * 3u) * 6.2831853;
-  let r = sqrt(hash(i * 3u + 1u)) * 0.65;
-  let vOrb = sqrt(G_CORE / max(r, 0.06)) * 0.94;
+  let r = max(0.03, sqrt(hash(i * 3u + 1u)) * 0.65);
+  let vOrb = vCirc(r) * 0.94;
   parts[i] = vec4<f32>(cos(a) * r, sin(a) * r, -sin(a) * vOrb, cos(a) * vOrb);
 }
 
@@ -240,6 +387,11 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
     return;
   }
 
+  if (params.mode == 2u) {
+    parts[i] = collide(p, dt);
+    return;
+  }
+
   // Primary: fixed at the origin. This is what holds the disc together.
   //
   // An earlier revision made the *cursor* the only attractor. Moving it broke
@@ -250,9 +402,7 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   let dc = -p.xy;
   let dc2 = dot(dc, dc) + 0.004;
   let rc = sqrt(dc2);
-  // Attraction minus a short-range repulsive core. Without the second term the
-  // whole population collapses to a single point.
-  let fc = G_CORE / (dc2 * rc) - 0.0025 / (dc2 * dc2);
+  let fc = coreF(dc2);
 
   // Secondary: the cursor. Softened harder so a direct hit shears rather than
   // slingshots.
@@ -275,9 +425,18 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   // angular momentum intact, which is what real accretion discs do — orbits
   // circularize instead of decaying. The practical payoff is that the disc
   // actively re-forms after the cursor stirs it, rather than staying wrecked.
+  //
+  // The rate is a function of radius, and it has to be. Measured at a single
+  // uniform rate, the two failure modes are exclusive: damp hard enough to
+  // circularize the scattered material (which is what stops the field turning
+  // into speckle) and the bar's torque drains the disc inward until the inner
+  // annulus is fourteen times denser than everything else -- the white core.
+  // Damp gently enough to prevent that and the speckle never clears. Dissipating
+  // in the outer disc and not in the inner one separates the two: the outside
+  // stays swept, and nothing has a mechanism to pile up in the middle.
   let rdir = dc / rc;
   let vRad = dot(v, rdir) * rdir;
-  v = (v - vRad) + vRad * 0.995;
+  v = (v - vRad) + vRad * damping(rc);
 
   // Whisper of global damping purely to bound energy the moving cursor injects.
   v = v * 0.99995;
@@ -289,8 +448,12 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
 
   // Close the disc at both ends -- see respawn(). Sign of angular momentum is
   // carried across, so a recycled grain rejoins moving the way the disc moves.
+  //
+  // The inner bound is per particle, at half its own home radius -- so it is as
+  // ragged as homeRadius() is, and the hole in the middle has no clean edge.
+  let floorR = max(0.05, homeRadius(i) * CORE_FRAC);
   let pr = length(pos);
-  if (pr > ESCAPE_R || pr < CORE_R) {
+  if (pr > ESCAPE_R || pr < floorR) {
     let spin = select(-1.0, 1.0, (pos.x * v.y - pos.y * v.x) >= 0.0);
     parts[i] = respawn(i, pos / max(pr, 1e-6), spin);
     return;
@@ -337,13 +500,28 @@ fn vs(@builtin(vertex_index) vi : u32, @builtin(instance_index) ii : u32) -> VSO
     return out;
   }
 
+  // Fit the unit disc to the *short* side of the viewport, and apply the same
+  // factor to the position as to the quad.
+  //
+  // Without this the unit square is stretched to fill the window and a circular
+  // orbit draws as an ellipse -- the disc reads as something squashed rather than
+  // as something seen face-on, and that one detail is the largest single
+  // difference in whether this looks like a galaxy. Handling only the landscape
+  // case is not enough: on a portrait window the same correction overflows the
+  // disc off both sides instead, so the limiting dimension has to be chosen.
+  let a = rparams.aspect;
+  let fx = 1.0 / max(a, 1.0);
+  let fy = min(a, 1.0);
+  let scale = rparams.scale;
   out.pos = vec4<f32>(
-    p.x + corner.x * size / rparams.aspect,
-    p.y + corner.y * size,
+    (p.x * scale + corner.x * size) * fx,
+    (p.y * scale + corner.y * size) * fy,
     0.0, 1.0
   );
   out.uv = corner;
   out.speed = clamp(length(p.zw) * 0.22, 0.0, 1.0);
+  // Shift toward white with speed so the dense hot core still reads as bright
+  // without losing species identity in the arms.
   // Shift toward white with speed so the dense hot core still reads as bright
   // without losing species identity in the arms.
   out.tint = mix(PALETTE[sp], vec3<f32>(1.0, 0.95, 0.88), out.speed * 0.3);
@@ -393,13 +571,15 @@ export async function createWebGPUBackend(
   });
   device.queue.writeBuffer(particleBuf, 0, sim.particles);
 
+  // 96 bytes: 12 floats of shared state, then the collision pair. Must match the
+  // Params struct exactly, including the trailing pad.
   const paramBuf = device.createBuffer({
-    size: 48,
+    size: 96,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  // Reused every frame; the only per-frame CPU->GPU traffic in the demo (32 bytes).
+  // Reused every frame; the only per-frame CPU->GPU traffic in the demo (96 bytes).
   // Two views over one buffer because `mask` is a u32 among f32s.
-  const paramBytes = new ArrayBuffer(48);
+  const paramBytes = new ArrayBuffer(96);
   const paramData = new Float32Array(paramBytes);
   const paramU32 = new Uint32Array(paramBytes);
 
@@ -416,6 +596,8 @@ export async function createWebGPUBackend(
   let mask = (1 << 6) - 1;
   let mode = 0;
   let cursorMass = G_CURSOR;
+  // Collision pair, written straight into the uniform slots that mirror it.
+  let pair: PairState | null = null;
   let elapsed = 0;
   let pendingScatter = false;
 
@@ -530,6 +712,10 @@ export async function createWebGPUBackend(
       cursorMass = m;
     },
 
+    setPair(p) {
+      pair = p;
+    },
+
     frame(dt: number, mx: number, my: number) {
       paramData[0] = dt;
       paramData[1] = mx;
@@ -563,6 +749,22 @@ export async function createWebGPUBackend(
         paramData[10] = 0;
       }
       paramData[11] = cursorMass;
+      // Collision spans a wider field than the disc does; pull the camera back so
+      // the tails stay on screen instead of leaving the frame at their best moment.
+      paramData[23] = mode === 2 ? 0.55 : 1.0;
+      if (pair) {
+        paramData[12] = pair.x0;
+        paramData[13] = pair.y0;
+        paramData[14] = pair.vx0;
+        paramData[15] = pair.vy0;
+        paramData[16] = pair.x1;
+        paramData[17] = pair.y1;
+        paramData[18] = pair.vx1;
+        paramData[19] = pair.vy1;
+        paramData[20] = PAIR_MASS;
+        paramData[21] = pair.spin1;
+        paramData[22] = PAIR_DISC_R;
+      }
       device.queue.writeBuffer(paramBuf, 0, paramBytes);
 
       const enc = device.createCommandEncoder();

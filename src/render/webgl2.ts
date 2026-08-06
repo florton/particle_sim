@@ -7,7 +7,8 @@
  * input in the same draw.
  */
 
-import { G_CURSOR, type Sim } from '../sim/world';
+import { G_CURSOR, circularSpeed, type Sim } from '../sim/world';
+import { PAIR_DISC_R, PAIR_MASS, type PairState } from '../sim/pair';
 import type { Backend } from './backend';
 
 const SIM_VS = `#version 300 es
@@ -24,6 +25,9 @@ uniform float uTime;
 uniform float uWarp;
 uniform float uWarpM;
 uniform float uGCursor;
+uniform vec2 uC0;
+uniform vec2 uC1;
+uniform float uPMass;
 
 const float PI = 3.14159265;
 const vec2 MODES[6] = vec2[6](
@@ -37,11 +41,35 @@ float hash(vec2 s) {
 
 // Rotating bar — see webgpu.ts for the derivation and for why a fixed
 // axisymmetric potential cannot hold structure on its own.
+const float DAMP_INNER = 0.9995;
+const float DAMP_OUTER = 0.995;
 const float BAR_OMEGA = 1.6;
 const float BAR_K = 0.045;
 const float BAR_A2 = 0.1225;
 const float ESCAPE_R = 1.15;
-const float RETURN_R = 0.8;
+const float RETURN_LO = 0.04;
+const float RETURN_HI = 0.80;
+const float CORE_FRAC = 0.28;
+const float SPECIES_SPREAD = 1.6;
+
+// Home radius from species, with the bands deliberately overlapping — see
+// homeRadius() in webgpu.ts for why clean bands were the wrong fix.
+// Radial acceleration factor and the true circular speed under it — see
+// coreF()/vCirc() in webgpu.ts for why sqrt(G/r) leaves a hole in the middle.
+float coreF(float q) {
+  return 0.55 / (q * sqrt(q)) - 0.0025 / (q * q);
+}
+
+float vCirc(float r) {
+  float q = r * r + 0.004;
+  return r * sqrt(max(0.0, coreF(q)));
+}
+
+float homeRadius(float sp, float seed) {
+  float j = (hash(vec2(seed, 5.5)) - 0.5) * SPECIES_SPREAD;
+  float f = clamp((sp + 0.5 + j) / 6.0, 0.04, 1.0);
+  return RETURN_LO + (RETURN_HI - RETURN_LO) * f;
+}
 
 vec2 bar(vec2 ur, float r, float t) {
   float c2 = ur.x * ur.x - ur.y * ur.y;
@@ -84,12 +112,33 @@ void main() {
     return;
   }
 
+  // --- galaxy collision (see collide() in webgpu.ts) ---
+  if (uMode == 2) {
+    vec2 d0 = uC0 - aPos;
+    float q0 = dot(d0, d0) + 0.004;
+    vec2 d1 = uC1 - aPos;
+    float q1 = dot(d1, d1) + 0.004;
+    vec2 dmm = uMouse - aPos;
+    float qm = dot(dmm, dmm) + 0.02;
+
+    vec2 vc = aVel
+      + d0 * (uPMass / (q0 * sqrt(q0))) * uDt
+      + d1 * (uPMass / (q1 * sqrt(q1))) * uDt
+      + dmm * (uGCursor / (qm * sqrt(qm))) * uDt;
+
+    float sc = length(vc);
+    if (sc > 3.0) vc *= 3.0 / sc;
+    vPos = aPos + vc * uDt;
+    vVel = vc;
+    return;
+  }
+
   // Must stay comparable with the WGSL path — see webgpu.ts for the reasoning
   // behind an anchored primary plus a weaker cursor secondary.
   vec2 dc = -aPos;
   float dc2 = dot(dc, dc) + 0.004;
   float rc = sqrt(dc2);
-  float fc = 0.55 / (dc2 * rc) - 0.0025 / (dc2 * dc2);
+  float fc = coreF(dc2);
 
   vec2 dm = uMouse - aPos;
   float dm2 = dot(dm, dm) + 0.02;
@@ -101,20 +150,26 @@ void main() {
   // Radial-only damping — see webgpu.ts for why uniform damping collapses the disc.
   vec2 rdir = dc / rc;
   vec2 vRad = dot(v, rdir) * rdir;
-  v = ((v - vRad) + vRad * 0.995) * 0.99995;
+  float dampR = mix(DAMP_INNER, DAMP_OUTER, smoothstep(0.25, 0.6, rc));
+  v = ((v - vRad) + vRad * dampR) * 0.99995;
 
   float speed = length(v);
   if (speed > 3.0) v *= 3.0 / speed;
 
   vec2 p = aPos + v * uDt;
 
-  // Recycle escapees instead of bouncing them — see webgpu.ts.
+  // Close the disc at both ends — see respawn() in webgpu.ts.
+  // Per-particle inner bound, at half its own home radius — see webgpu.ts.
+  float home = homeRadius(floor(aSpecies + 0.5), float(gl_VertexID));
+  float floorR = max(0.05, home * CORE_FRAC);
   float pr = length(p);
-  if (pr > ESCAPE_R) {
-    vec2 u = p / pr;
+  if (pr > ESCAPE_R || pr < floorR) {
+    vec2 u = p / max(pr, 1e-6);
     float spin = (p.x * v.y - p.y * v.x) >= 0.0 ? 1.0 : -1.0;
-    p = u * RETURN_R;
-    v = vec2(-u.y, u.x) * sqrt(0.55 / RETURN_R) * spin;
+    float rr = home;
+    float vOrb = vCirc(rr) * spin;
+    p = u * rr;
+    v = vec2(-u.y, u.x) * vOrb;
   }
 
   vPos = p;
@@ -137,6 +192,7 @@ out float vSpeed;
 out vec3 vTint;
 uniform float uAspect;
 uniform float uSize;
+uniform float uScale;
 uniform int uMask;
 
 // Mirrors SPECIES_COLORS in sim/world.ts and PALETTE in webgpu.ts.
@@ -162,9 +218,12 @@ void main() {
 
   vSpeed = clamp(length(aVel) * 0.22, 0.0, 1.0);
   vTint = mix(PALETTE[sp], vec3(1.0, 0.95, 0.88), vSpeed * 0.3);
+  // Fit to the short side, position and quad alike — see webgpu.ts.
+  float fx = 1.0 / max(uAspect, 1.0);
+  float fy = min(uAspect, 1.0);
   gl_Position = vec4(
-    aPos.x + aCorner.x * uSize / uAspect,
-    aPos.y + aCorner.y * uSize,
+    (aPos.x * uScale + aCorner.x * uSize) * fx,
+    (aPos.y * uScale + aCorner.y * uSize) * fy,
     0.0, 1.0
   );
 }`;
@@ -264,6 +323,9 @@ export function createWebGL2Backend(
     uWarp: gl.getUniformLocation(simProg, 'uWarp'),
     uWarpM: gl.getUniformLocation(simProg, 'uWarpM'),
     uGCursor: gl.getUniformLocation(simProg, 'uGCursor'),
+    uC0: gl.getUniformLocation(simProg, 'uC0'),
+    uC1: gl.getUniformLocation(simProg, 'uC1'),
+    uPMass: gl.getUniformLocation(simProg, 'uPMass'),
   };
   const drawLoc = {
     aPos: gl.getAttribLocation(drawProg, 'aPos'),
@@ -272,6 +334,7 @@ export function createWebGL2Backend(
     aSpecies: gl.getAttribLocation(drawProg, 'aSpecies'),
     uAspect: gl.getUniformLocation(drawProg, 'uAspect'),
     uSize: gl.getUniformLocation(drawProg, 'uSize'),
+    uScale: gl.getUniformLocation(drawProg, 'uScale'),
     uGain: gl.getUniformLocation(drawProg, 'uGain'),
     uMask: gl.getUniformLocation(drawProg, 'uMask'),
   };
@@ -289,6 +352,7 @@ export function createWebGL2Backend(
   let mask = 0x3f;
   let mode = 0;
   let cursorMass = G_CURSOR;
+  let pair: PairState | null = null;
   let elapsed = 0;
 
   const dbg = gl.getExtension('WEBGL_debug_renderer_info');
@@ -315,6 +379,10 @@ export function createWebGL2Backend(
       cursorMass = m;
     },
 
+    setPair(p: PairState) {
+      pair = p;
+    },
+
     setMode(m: number) {
       mode = m | 0;
 
@@ -328,11 +396,30 @@ export function createWebGL2Backend(
           pos[i * 2 + 1] = Math.random() * 2 - 1;
           vel[i * 2] = 0;
           vel[i * 2 + 1] = 0;
+        } else if (mode === 2 && pair) {
+          // Collision: one disc per core, interleaved by parity — same seeding as
+          // the WGSL scatter pass, so both backends start the same encounter.
+          const g = i & 1;
+          const cx = g ? pair.x1 : pair.x0;
+          const cy = g ? pair.y1 : pair.y0;
+          const cvx = g ? pair.vx1 : pair.vx0;
+          const cvy = g ? pair.vy1 : pair.vy0;
+          const spin = g ? pair.spin1 : 1;
+          const a = Math.random() * Math.PI * 2;
+          // Filled disc, softly banded by species — see the scatter pass in webgpu.ts.
+          const j = (Math.random() - 0.5) * 1.6;
+          const f = Math.min(1, Math.max(0.02, (sim.species[i] + 0.5 + j) / 6));
+          const r = Math.max(0.05, PAIR_DISC_R * Math.sqrt(f));
+          const vOrb = Math.sqrt(PAIR_MASS / r) * spin;
+          pos[i * 2] = cx + Math.cos(a) * r;
+          pos[i * 2 + 1] = cy + Math.sin(a) * r;
+          vel[i * 2] = cvx - Math.sin(a) * vOrb;
+          vel[i * 2 + 1] = cvy + Math.cos(a) * vOrb;
         } else {
           // Galaxy: re-seed the orbital disc, or the grains just rain into the core.
           const a = Math.random() * Math.PI * 2;
-          const r = Math.sqrt(Math.random()) * 0.65;
-          const vOrb = Math.sqrt(0.55 / Math.max(r, 0.06)) * 0.94;
+          const r = Math.max(0.03, Math.sqrt(Math.random()) * 0.65);
+          const vOrb = circularSpeed(r) * 0.94;
           pos[i * 2] = Math.cos(a) * r;
           pos[i * 2 + 1] = Math.sin(a) * r;
           vel[i * 2] = -Math.sin(a) * vOrb;
@@ -363,6 +450,9 @@ export function createWebGL2Backend(
       gl.uniform1f(simLoc.uWarp, mode === 1 ? 1 + (mx * 0.5 + 0.5) * 12 + drift : 0);
       gl.uniform1f(simLoc.uWarpM, mode === 1 ? 1 + (my * 0.5 + 0.5) * 12 + drift : 0);
       gl.uniform1f(simLoc.uGCursor, cursorMass);
+      gl.uniform2f(simLoc.uC0, pair ? pair.x0 : 0, pair ? pair.y0 : 0);
+      gl.uniform2f(simLoc.uC1, pair ? pair.x1 : 0, pair ? pair.y1 : 0);
+      gl.uniform1f(simLoc.uPMass, PAIR_MASS);
 
       bindAttrib(posA, simLoc.aPos);
       bindAttrib(velA, simLoc.aVel);
@@ -391,6 +481,7 @@ export function createWebGL2Backend(
       // Same size/gain curve as the WebGPU path — see webgpu.ts for the reasoning.
       gl.uniform1f(drawLoc.uSize, Math.min(0.006, Math.max(0.0018, 0.06 / Math.sqrt(count))));
       gl.uniform1f(drawLoc.uGain, Math.min(1, Math.max(0.6, 200_000 / count)));
+      gl.uniform1f(drawLoc.uScale, mode === 2 ? 0.55 : 1.0);
       gl.uniform1i(drawLoc.uMask, mask);
 
       bindAttrib(cornerBuf, drawLoc.aCorner, 0);

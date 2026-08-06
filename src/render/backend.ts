@@ -1,3 +1,5 @@
+import type { PairState } from '../sim/pair';
+
 /** Hard cap on a single readback window, in particles. */
 export const READBACK_MAX = 4096;
 
@@ -13,8 +15,18 @@ export interface Backend {
    * test per vertex on the GPU — the CPU never walks the population to do it.
    */
   setSpeciesMask(mask: number): void;
-  /** 0 = orbital galaxy, 1 = Chladni plate. */
+  /**
+   * 0 = orbital galaxy, 1 = Chladni plate, 2 = galaxy collision. Re-seeds the
+   * population for the mode, so calling it again is also how a collision is
+   * restarted.
+   */
   setMode(mode: number): void;
+  /**
+   * The two colliding cores. Read every frame in mode 2 and at seeding time;
+   * ignored otherwise. The backend keeps the reference, so the caller may hold
+   * one object and mutate it.
+   */
+  setPair(pair: PairState): void;
   /**
    * Mass of the cursor secondary, in units of the core. Held pointer = heavy
    * enough to raise real tidal tails; released = a light perturber the disc can

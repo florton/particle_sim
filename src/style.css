@@ -218,3 +218,24 @@ html, body {
 
 #banner.gpu { border-color: color-mix(in srgb, #6cf 40%, transparent); color: var(--accent); }
 #banner.baseline { border-color: color-mix(in srgb, #ff6b5e 45%, transparent); color: var(--warn); }
+
+/* --- narrow viewports ------------------------------------------------ */
+
+/*
+ * The sidebar is 340px of a fixed overlay. On a wide monitor that is a margin;
+ * under about 820px it is most of the galaxy, and the disc ends up centred
+ * behind it. Hide it rather than reflow: the canvas is already full-window and
+ * unaware of the sidebar, so there is nothing to lay out again.
+ *
+ * display:none also stops the virtualized list doing per-frame work it cannot be
+ * seen doing — the pool is rebuilt on the next resize back up.
+ */
+@media (max-width: 820px) {
+  #sidebar { display: none; }
+  #baseline-list { display: none !important; }
+}
+
+/* Below this the HUD and the banner start colliding with each other. */
+@media (max-width: 560px) {
+  #banner { left: 8px; right: 8px; bottom: 8px; font-size: 11px; }
+}

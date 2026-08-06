@@ -14,6 +14,7 @@ import type { Backend } from './render/backend';
 import { createWebGPUBackend } from './render/webgpu';
 import { createWebGL2Backend } from './render/webgl2';
 import { BaselineArm, BASELINE_COUNT } from './baseline';
+import { createPair, resetPair, stepPair, pairSeparation } from './sim/pair';
 
 // 50k was the number the original brief asked for, but CPU integration of 50k
 // typed-array particles costs well under a millisecond — there is no bottleneck
@@ -122,12 +123,20 @@ const banner = document.createElement('div');
 banner.id = 'banner';
 document.body.appendChild(banner);
 
-const modeLabel = () => (mode === 1 ? 'Chladni plate · 6 frequencies' : 'orbital galaxy');
+const MODE_COUNT = 3;
+const modeLabel = () =>
+  mode === 1
+    ? 'Chladni plate · 6 frequencies'
+    : mode === 2
+      ? `galaxy collision · ${pair.spin1 > 0 ? 'prograde' : 'retrograde'}`
+      : 'barred galaxy';
 
 function refreshBanner() {
   banner.textContent =
     `${backend.name} compute · ${sim.count.toLocaleString()} particles · ${modeLabel()} — ` +
-    `[M] mode · [B] compare · hold to pull`;
+    (mode === 2
+      ? `[M] mode · [B] compare · [R] flip spin · hold to pull`
+      : `[M] mode · [B] compare · [R] reset · hold to pull`);
 }
 
 function setArm(next: 'gpu' | 'baseline') {
@@ -135,7 +144,7 @@ function setArm(next: 'gpu' | 'baseline') {
   if (next === 'baseline') {
     // Compare within the current mode: the naive arm runs the same force law the
     // GPU arm is running, not whichever one it happened to be written against.
-    baseline.setMode(mode);
+    baseline.setMode(mode, pair);
     baseline.start();
     canvas.style.display = 'none';
     banner.textContent =
@@ -154,24 +163,81 @@ function setArm(next: 'gpu' | 'baseline') {
 }
 
 let mode = 0;
+
+// The colliding pair. One object, mutated in place and held by reference on both
+// sides, so the per-frame cost of the whole encounter is two bodies of leapfrog.
+const pair = createPair();
+backend.setPair(pair);
+
 function setMode(next: number) {
   mode = next;
+  if (mode === 2) resetPair(pair);
   backend.setMode(mode);
   if (arm() === 'gpu') refreshBanner();
   // Switching mode while comparing should switch the thing being compared.
   else setArm('baseline');
 }
 
+/**
+ * Re-seed whatever is running. `R` means restart in every mode, not just the one
+ * that happens to have an ending.
+ */
+function restart() {
+  if (mode === 2) {
+    restartCollision();
+    return;
+  }
+  backend.setMode(mode);
+  if (arm() === 'baseline') baseline.setMode(mode, pair);
+}
+
+/**
+ * Restart the encounter, flipping the disc's spin sense each time.
+ *
+ * Prograde and retrograde are the demonstration: the same two cores on the same
+ * orbit throw a tail half the frame long one way round and barely mark the disc
+ * the other. Alternating on every restart puts the two side by side in time.
+ */
+function restartCollision(flip = true) {
+  resetPair(pair, flip ? -pair.spin1 : pair.spin1);
+  backend.setMode(2);
+  if (arm() === 'baseline') baseline.setMode(2, pair);
+  refreshBanner();
+}
+
 addEventListener('keydown', (e) => {
   if (e.key === 'b' || e.key === 'B') setArm(arm() === 'gpu' ? 'baseline' : 'gpu');
-  if (e.key === 'm' || e.key === 'M') setMode(mode === 0 ? 1 : 0);
+  if (e.key === 'm' || e.key === 'M') setMode((mode + 1) % MODE_COUNT);
+  if (e.key === 'r' || e.key === 'R') restart();
 });
+
+/**
+ * Whether the sidebar is on screen, per the media query in style.css.
+ *
+ * Read once per resize and cached, not per frame: getComputedStyle forces a
+ * style recalc, and a demo whose whole claim is that it touches the DOM 33 times
+ * would be a poor place to do that sixty times a second. `offsetParent` would be
+ * the cheap test and is wrong here — it is null for any position:fixed element,
+ * visible or not, which silently disabled the list.
+ */
+const sidebar = document.getElementById('sidebar')!;
+let sidebarVisible = true;
+function readSidebarVisible() {
+  sidebarVisible = getComputedStyle(sidebar).display !== 'none';
+}
 
 function fit() {
   const dpr = Math.min(devicePixelRatio, 2);
   backend.resize((innerWidth * dpr) | 0, (innerHeight * dpr) | 0);
 }
-addEventListener('resize', fit);
+readSidebarVisible();
+addEventListener('resize', () => {
+  fit();
+  const wasHidden = !sidebarVisible;
+  readSidebarVisible();
+  // Coming back from a hidden sidebar leaves the recycled pool stale.
+  if (wasHidden && sidebarVisible && arm() === 'gpu') list.forceRepaint();
+});
 fit();
 setArm('gpu');
 
@@ -188,9 +254,20 @@ function loop(now: number) {
   const dt = Math.min((now - prev) / 1000, 1 / 30);
   prev = now;
 
+  // The encounter is over once the cores are well separated and receding, or if
+  // they have gone quiet; loop it rather than leaving a spent remnant on screen.
+  if (mode === 2) {
+    stepPair(pair, dt);
+    if (pair.elapsed > 6 && (pairSeparation(pair) > 2.4 || pair.elapsed > 42)) {
+      restartCollision();
+    }
+  }
+
   if (arm() === 'gpu') {
     backend.frame(dt, mx, my);
-    list.update();
+    // Skip the list entirely while the sidebar is hidden — its readback and row
+    // writes are pure cost when nothing can see them.
+    if (sidebarVisible) list.update();
     counters.entities = sim.count;
     counters.domNodes = list.liveNodes;
   } else {

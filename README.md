@@ -11,11 +11,25 @@ measurement.
 - **1,000,000 particles**, integrated in a WebGPU compute shader, drawn in one
   instanced call. Particle data is uploaded once and never returns to the CPU on
   the render path.
-- **Two simulation modes**, `M` to switch:
-  - **Orbital galaxy** — a fixed primary at the origin holds the disc; the
-    cursor is a weaker secondary mass that perturbs it. Drag through the disc and
-    you raise tidal arms and a wake, then it re-forms. Spiral structure is
-    emergent, not authored.
+- **Three simulation modes**, `M` to cycle:
+  - **Barred galaxy** — a fixed primary at the origin holds the disc, and a
+    rotating m=2 quadrupole drives it. The bar is the point: without a driving
+    frequency this disc has no self-gravity to hold an arm together, so anything
+    you stir into it shears out and phase-mixes into a featureless blur within
+    seconds. With one, orbits that resonate with the pattern are herded onto
+    closed orbits and stay — rings near the Lindblad resonances, arms between
+    them — and structure becomes the resting state rather than the decay product.
+    Each of the six species keeps its own annulus, so the disc reads as six
+    coloured rings being worked on individually rather than as one grey average.
+    Hold the pointer down to make the cursor a near-core mass and tear it up.
+  - **Galaxy collision** — two cores on a parabolic encounter, solved as a
+    two-body problem on the CPU; every particle is a massless test particle in
+    the sum of their fields. This is Toomre & Toomre's 1972 restricted three-body
+    model, and the tidal tails and the bridge fall out of it for free. `R`
+    restarts with the disc spin flipped: the same encounter throws a tail half
+    the frame long prograde and barely marks the disc retrograde. Each disc is
+    seeded as six coloured rings, so the tail arrives sorted by where it came
+    from.
   - **Chladni plate** — particles descend the gradient of a standing wave onto
     its nodal lines, the way sand does on a vibrating plate. The cursor sweeps
     the base frequency across roughly 1–13 on each axis, with each species offset
@@ -80,9 +94,11 @@ template string every frame.
 npm install && npm run dev
 ```
 
-Controls: `M` switches simulation mode, `B` switches arm, click the species
-chips to filter, move the cursor to drive the field. `B` compares within
-whichever mode is active, so both arms always run the same force law.
+Controls: `M` cycles simulation mode, `B` switches arm, `R` restarts the
+collision with the spin flipped, click the species chips to filter, move the
+cursor to drive the field and hold the pointer down to make it heavy. `B`
+compares within whichever mode is active, so both arms always run the same force
+law.
 
 ## Deploying (self-hosted)
 
@@ -145,6 +161,7 @@ const after = await backend.readback(0, 4);
 | --- | --- |
 | `src/hud.ts` | Instrumentation. Allocation-free; built before anything else. |
 | `src/sim/world.ts` | Particle buffer, entity tags, CPU reference integration. |
+| `src/sim/pair.ts` | The two colliding cores — a two-body problem, and nothing else. |
 | `src/render/webgpu.ts` | Compute + instanced render over one shared buffer. |
 | `src/render/webgl2.ts` | Transform-feedback fallback, same force law. |
 | `src/ui/list.ts` | Virtualized list + bounded windowed readback. |
