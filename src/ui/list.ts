@@ -11,7 +11,7 @@
  * kilobytes for the rows a human is actually looking at, not the whole buffer.
  */
 
-import { STRIDE, SPECIES_NAMES, Species, Stat, type Sim } from '../sim/world';
+import { STRIDE, SPECIES_NAMES, SPECIES_COLORS, type Sim } from '../sim/world';
 import { speciesMask, selectedEid } from './state';
 import { READBACK_MAX, type Backend } from '../render/backend';
 
@@ -105,14 +105,20 @@ export class VirtualList {
   /** Linear pass building the filtered index. Runs on filter change only. */
   refilter() {
     const mask = speciesMask();
-    const { eids, count } = this.sim;
+    const { species, count } = this.sim;
     const out = this.filtered;
     let w = 0;
     for (let i = 0; i < count; i++) {
-      if (mask & (1 << Species.id[eids[i]])) out[w++] = i;
+      if (mask & (1 << species[i])) out[w++] = i;
     }
     this.filteredCount = w;
     this.spacer.style.height = w * ROW_H + 'px';
+    this.dirty = true;
+  }
+
+  /** Force a full row repaint — used when this arm regains the viewport. */
+  forceRepaint() {
+    this.poolIds.fill(-1);
     this.dirty = true;
   }
 
@@ -146,13 +152,21 @@ export class VirtualList {
       }
 
       const slotIdx = this.filtered[idx];
-      const eid = this.sim.eids[slotIdx];
 
-      if (this.poolIds[slot] !== eid) {
-        this.poolIds[slot] = eid;
+      // Text and colour only change when a slot is recycled onto a different
+      // entity — not every frame. Only the transform and the live value below
+      // are touched per frame.
+      if (this.poolIds[slot] !== slotIdx) {
+        this.poolIds[slot] = slotIdx;
+        const sp = this.sim.species[slotIdx];
+        const [r, g, b] = SPECIES_COLORS[sp];
+        const css = `rgb(${(r * 255) | 0} ${(g * 255) | 0} ${(b * 255) | 0})`;
+
         row.style.visibility = 'visible';
-        row.children[0].textContent = String(eid);
-        row.children[1].textContent = SPECIES_NAMES[Species.id[eid]];
+        row.children[0].textContent = String(slotIdx);
+        row.children[1].textContent = SPECIES_NAMES[sp];
+        (row.children[1] as HTMLElement).style.color = css;
+        (row.children[2] as HTMLElement).style.background = css;
       }
       // transform only — never top/left, so rows never trigger layout.
       row.style.transform = `translateY(${idx * ROW_H}px)`;
@@ -175,7 +189,7 @@ export class VirtualList {
         return Math.min(1, Math.hypot(vx, vy) * 0.7);
       }
     }
-    return Stat.value[this.sim.eids[slotIdx]];
+    return this.sim.stat[slotIdx];
   }
 
   /**

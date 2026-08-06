@@ -128,7 +128,13 @@ export class Hud {
       // Calibrate from the observed floor, but never grade on a curve: if the
       // demo never once reaches 60Hz, the budget stays 60Hz rather than quietly
       // redefining "on time" as whatever this machine happens to manage.
-      if (dt < this.fastest && dt > 1) this.fastest = dt;
+      //
+      // The >= 4ms guard matters. rAF occasionally delivers two callbacks a
+      // fraction of a millisecond apart (arm switches, tab restore). Treating
+      // that as the refresh interval sets the drop threshold near zero and every
+      // subsequent frame is reported as dropped — a 99% drop rate sitting next
+      // to a healthy 16.8ms p50, which is how this was caught.
+      if (dt < this.fastest && dt >= 4) this.fastest = dt;
       this.refreshMs = Math.min(this.fastest, 1000 / 60);
       if (dt > this.refreshMs * 1.5) this.dropped++;
     }
@@ -229,5 +235,9 @@ export class Hud {
     this.longTasks = 0;
     this.longTaskMs = 0;
     this.last = performance.now();
+    // Must reset too, or a stale floor from the previous arm silently sets the
+    // budget for the next one.
+    this.fastest = Infinity;
+    this.refreshMs = 1000 / 60;
   }
 }

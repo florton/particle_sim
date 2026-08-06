@@ -91,15 +91,21 @@ html, body {
 
 .chip {
   font: inherit;
-  color: var(--accent);
-  background: rgba(108, 204, 255, 0.1);
-  border: 1px solid var(--line);
+  color: var(--c, var(--accent));
+  background: color-mix(in srgb, var(--c, #6cf) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--c, #6cf) 35%, transparent);
   border-radius: 999px;
   padding: 2px 9px;
   cursor: pointer;
-  transition: opacity 120ms ease;
+  transition: opacity 120ms ease, background 120ms ease;
 }
-.chip.off { color: var(--dim); background: transparent; opacity: 0.45; }
+.chip:hover { background: color-mix(in srgb, var(--c, #6cf) 26%, transparent); }
+.chip.off {
+  color: var(--dim);
+  background: transparent;
+  border-color: var(--line);
+  opacity: 0.4;
+}
 
 .summary {
   flex: 1 0 100%;
@@ -144,6 +150,7 @@ html, body {
 
 .row:nth-child(even) { background: rgba(255, 255, 255, 0.018); }
 
+.row .sp { width: 84px; }
 .row .id { color: var(--dim); width: 52px; }
 .row .v { color: var(--text); width: 62px; text-align: right; font-variant-numeric: tabular-nums; }
 .row .bar {
@@ -153,3 +160,53 @@ html, body {
   transform-origin: left center;
   border-radius: 2px;
 }
+
+/* --- baseline (naive) arm -------------------------------------------- */
+
+#baseline-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  display: none;
+  /* No containment and no compositing hints on purpose: this arm exists to show
+     what the default cost looks like. */
+}
+
+.bp {
+  position: absolute;
+  width: 3px;
+  height: 3px;
+  margin: -1.5px 0 0 -1.5px;
+  border-radius: 50%;
+  opacity: 0.85;
+}
+
+#baseline-list {
+  display: none;
+  flex: 1;
+  overflow-y: auto;
+  padding-bottom: 8px;
+}
+
+#baseline-list .row {
+  position: static;
+  width: auto;
+}
+
+/* --- arm banner ------------------------------------------------------ */
+
+#banner {
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  z-index: 10;
+  padding: 7px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  backdrop-filter: blur(8px);
+  color: var(--dim);
+}
+
+#banner.gpu { border-color: color-mix(in srgb, #6cf 40%, transparent); color: var(--accent); }
+#banner.baseline { border-color: color-mix(in srgb, #ff6b5e 45%, transparent); color: var(--warn); }

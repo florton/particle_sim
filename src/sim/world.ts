@@ -1,21 +1,24 @@
 /**
  * Simulation state.
  *
- * Two stores with different jobs, deliberately:
+ * `particles` is one interleaved Float32Array (stride 4: x, y, vx, vy). It is the
+ * canonical hot data and is handed to the GPU verbatim — there is no marshalling
+ * step because the ECS storage *is* the buffer backing store.
  *
- *  1. `particles` — one interleaved Float32Array (stride 4: x, y, vx, vy). This is
- *     the canonical hot data and is handed to the GPU verbatim. No marshalling step
- *     exists because there is nothing to marshal: the ECS storage *is* the vertex
- *     buffer backing store.
+ * Per-entity tags (species, stat) live in parallel typed arrays indexed by
+ * particle slot. Entity id and slot index are the same number.
  *
- *  2. A bitecs world holding queryable per-entity tags (species, a scalar stat).
- *     This is what the sidebar filters on. bitecs earns its place here — for the
- *     position integration it would only be overhead, so it isn't used there.
+ * On the absence of bitecs: an earlier revision created one bitecs entity per
+ * particle. At 1M that cost ~650 ms of blocking startup and bought nothing —
+ * nothing here queries relationally, and the component data was already plain
+ * typed arrays. It was measured, it lost, it was removed. The data-oriented part
+ * of "data-oriented ECS" is the memory layout below, not the library.
  */
 
-import { createWorld, addEntity, addComponent, query, type World } from 'bitecs';
-
 export const STRIDE = 4; // x, y, vx, vy
+
+/** Restitution at the box walls. Shared by all three integrators. */
+export const BOUNCE = 0.45;
 export const SPECIES_COUNT = 6;
 
 export const SPECIES_NAMES = [
@@ -27,24 +30,34 @@ export const SPECIES_NAMES = [
   'fermium',
 ] as const;
 
+/**
+ * Species palette, linear RGB. Mirrored verbatim in the WGSL and GLSL shaders —
+ * keep the three in sync. Chosen to stay distinguishable under additive blending,
+ * where everything drifts toward white as density climbs.
+ */
+export const SPECIES_COLORS: readonly [number, number, number][] = [
+  [0.29, 0.62, 1.0], // argon — blue
+  [1.0, 0.45, 0.62], // boron — rose
+  [0.42, 1.0, 0.72], // cesium — mint
+  [1.0, 0.76, 0.33], // dysprosium — amber
+  [0.72, 0.55, 1.0], // erbium — violet
+  [0.35, 0.95, 1.0], // fermium — cyan
+];
+
 export interface Sim {
-  world: World;
   /** Interleaved x, y, vx, vy — length = capacity * STRIDE. */
   particles: Float32Array<ArrayBuffer>;
-  /** Entity ids, index-aligned with the particle slots. */
-  eids: Uint32Array;
+  /** Species index per slot. */
+  species: Uint8Array;
+  /** Scalar per slot, used by the sidebar. */
+  stat: Float32Array;
   capacity: number;
   count: number;
 }
 
-/** Species tag, SoA. bitecs 0.4 components are plain refs you own. */
-export let Species: { id: Uint8Array };
-/** A scalar the sidebar sorts and filters on. */
-export let Stat: { value: Float32Array };
-
 /**
- * Deterministic PRNG so a demo run is reproducible — a perf comparison between
- * two arms is meaningless if they get different starting conditions.
+ * Deterministic PRNG so a run is reproducible — comparing two arms is
+ * meaningless if they get different starting conditions.
  */
 function mulberry32(seed: number) {
   return function () {
@@ -57,46 +70,45 @@ function mulberry32(seed: number) {
 }
 
 export function createSim(capacity: number, seed = 0x9e3779b9): Sim {
-  const world = createWorld();
   const particles = new Float32Array(capacity * STRIDE);
-  const eids = new Uint32Array(capacity);
-
-  Species = { id: new Uint8Array(capacity + 1) };
-  Stat = { value: new Float32Array(capacity + 1) };
-
+  const species = new Uint8Array(capacity);
+  const stat = new Float32Array(capacity);
   const rand = mulberry32(seed);
 
   for (let i = 0; i < capacity; i++) {
     const o = i * STRIDE;
-    // Start in a disc so the initial frame reads as a structure, not noise.
+    // Start in a disc so frame one reads as a structure rather than noise.
     const a = rand() * Math.PI * 2;
     const r = Math.sqrt(rand()) * 0.65;
     particles[o] = Math.cos(a) * r;
     particles[o + 1] = Math.sin(a) * r;
-    // Tangential velocity — gives the cloud a coherent rotation on frame one.
-    particles[o + 2] = -Math.sin(a) * r * 0.35;
-    particles[o + 3] = Math.cos(a) * r * 0.35;
 
-    const eid = addEntity(world);
-    eids[i] = eid;
+    // Circular-orbit velocity for the force law below: v = sqrt(G / r).
+    //
+    // This matters more than it looks. Seeding with an arbitrary tangential
+    // speed makes every particle fall inward, slingshot, and randomize against
+    // the walls — after a minute the whole field decays to uniform noise. Seeded
+    // on-orbit, the disc is stable indefinitely. Slightly sub-orbital (0.94) so
+    // it precesses into spiral arms instead of sitting as a featureless annulus.
+    const vOrb = Math.sqrt(0.45 / Math.max(r, 0.06)) * 0.94;
+    particles[o + 2] = -Math.sin(a) * vOrb;
+    particles[o + 3] = Math.cos(a) * vOrb;
 
-    const sp = (rand() * SPECIES_COUNT) | 0;
-    Species.id[eid] = sp;
-    Stat.value[eid] = rand();
-
-    addComponent(world, eid, Species);
-    addComponent(world, eid, Stat);
+    // Species banded by radius: the galaxy reads as composed rings rather than
+    // uniform confetti, and the filter chips then carve visible structure.
+    const band = (r / 0.65) * SPECIES_COUNT;
+    const jitter = (rand() - 0.5) * 1.6;
+    species[i] = Math.max(0, Math.min(SPECIES_COUNT - 1, (band + jitter) | 0));
+    stat[i] = rand();
   }
 
-  return { world, particles, eids, capacity, count: capacity };
+  return { particles, species, stat, capacity, count: capacity };
 }
 
 /**
- * CPU reference integration. Kept as the measured baseline for the GPU path —
- * the headline number in this demo is the delta between this and the compute
- * shader, so this has to be a *fair* implementation, not a strawman.
- *
- * Allocation-free, monomorphic, single pass over contiguous memory.
+ * CPU reference integration — the measured baseline for the GPU path. It has to
+ * be a fair implementation, not a strawman: allocation-free, monomorphic, one
+ * pass over contiguous memory.
  */
 export function integrateCPU(sim: Sim, dt: number, mx: number, my: number) {
   const p = sim.particles;
@@ -115,27 +127,24 @@ export function integrateCPU(sim: Sim, dt: number, mx: number, my: number) {
     const d2 = dx * dx + dy * dy + 0.004;
     const r = Math.sqrt(d2);
     const f = 0.45 / (d2 * r) - 0.0025 / (d2 * d2);
-    const tx = -dy / r;
-    const ty = dx / r;
 
-    let vx = (p[o + 2] + dx * f * dt + tx * 0.28 * dt) * damp;
-    let vy = (p[o + 3] + dy * f * dt + ty * 0.28 * dt) * damp;
+    // No constant tangential term: it pumps energy in every frame regardless of
+    // position, which is what cooked the disc into uniform noise. Rotation comes
+    // from the orbital seed instead.
+    let vx = (p[o + 2] + dx * f * dt) * damp;
+    let vy = (p[o + 3] + dy * f * dt) * damp;
 
     let nx = x + vx * dt;
     let ny = y + vy * dt;
 
-    // Reflect at the unit box so the population stays bounded and visible.
-    if (nx < -1) { nx = -1; vx = -vx; } else if (nx > 1) { nx = 1; vx = -vx; }
-    if (ny < -1) { ny = -1; vy = -vy; } else if (ny > 1) { ny = 1; vy = -vy; }
+    // Reflect at the unit box, bleeding energy on contact. A perfectly elastic
+    // wall lets escapees accumulate speed and slowly randomize the field.
+    if (nx < -1) { nx = -1; vx = -vx * BOUNCE; } else if (nx > 1) { nx = 1; vx = -vx * BOUNCE; }
+    if (ny < -1) { ny = -1; vy = -vy * BOUNCE; } else if (ny > 1) { ny = 1; vy = -vy * BOUNCE; }
 
     p[o] = nx;
     p[o + 1] = ny;
     p[o + 2] = vx;
     p[o + 3] = vy;
   }
-}
-
-/** Entities matching the current species filter, for the sidebar. */
-export function queryBySpecies(sim: Sim): readonly number[] {
-  return query(sim.world, [Species, Stat]) as unknown as readonly number[];
 }

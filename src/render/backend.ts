@@ -8,6 +8,11 @@ export interface Backend {
   /** Adapter/renderer string, so the numbers are attributable to hardware. */
   detail: string;
   setCount(n: number): void;
+  /**
+   * Bitmask of visible species. Filtering a million particles is a uniform bit
+   * test per vertex on the GPU — the CPU never walks the population to do it.
+   */
+  setSpeciesMask(mask: number): void;
   frame(dt: number, mx: number, my: number): void;
   resize(w: number, h: number): void;
   destroy(): void;

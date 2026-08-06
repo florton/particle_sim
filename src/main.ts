@@ -1,15 +1,16 @@
 import './style.css';
 import { Hud, type HudCounters } from './hud';
-import { createSim, integrateCPU, SPECIES_NAMES } from './sim/world';
+import { createSim, integrateCPU, SPECIES_NAMES, SPECIES_COLORS } from './sim/world';
 import { VirtualList } from './ui/list';
-import { speciesMask, toggleSpecies, filterLabel, countEffect, effectRuns } from './ui/state';
+import { speciesMask, toggleSpecies, filterLabel, countEffect, effectRuns, arm } from './ui/state';
 import type { Backend } from './render/backend';
 import { createWebGPUBackend } from './render/webgpu';
 import { createWebGL2Backend } from './render/webgl2';
+import { BaselineArm, BASELINE_COUNT } from './baseline';
 
-// 50k is the number the original brief asked for, but CPU integration of 50k
+// 50k was the number the original brief asked for, but CPU integration of 50k
 // typed-array particles costs well under a millisecond — there is no bottleneck
-// to relieve at that scale. ?n= makes the crossover point measurable instead of
+// to relieve at that scale. ?n= makes the crossover measurable rather than
 // assumed. See README for the measured curve.
 const params = new URLSearchParams(location.search);
 const CAPACITY = Math.max(1, Number(params.get('n')) || 1_000_000);
@@ -26,8 +27,6 @@ const counters: HudCounters = {
   effectRuns: 0,
 };
 
-// ?backend=webgl2 forces the fallback so it can actually be verified rather
-// than assumed to work.
 const forced = params.get('backend');
 
 async function selectBackend(): Promise<Backend> {
@@ -47,36 +46,32 @@ async function selectBackend(): Promise<Backend> {
 let mx = 0;
 let my = 0;
 addEventListener('pointermove', (e) => {
-  // Normalize to the clip space the shaders work in.
   mx = (e.clientX / innerWidth) * 2 - 1;
   my = -((e.clientY / innerHeight) * 2 - 1);
 });
 
 const backend = await selectBackend();
 backend.setCount(CAPACITY);
-counters.entities = CAPACITY;
 counters.backend = `${backend.name} · ${backend.detail}`;
 
-function fit() {
-  const dpr = Math.min(devicePixelRatio, 2);
-  backend.resize((innerWidth * dpr) | 0, (innerHeight * dpr) | 0);
-}
-addEventListener('resize', fit);
-fit();
-
-const list = new VirtualList(
-  document.getElementById('list-viewport')!,
-  document.getElementById('list-spacer')!,
+const listViewport = document.getElementById('list-viewport')!;
+const list = new VirtualList(listViewport, document.getElementById('list-spacer')!, sim, backend);
+const baseline = new BaselineArm(
   sim,
-  backend,
+  document.body,
+  document.getElementById('sidebar')!,
+  listViewport,
 );
 
-// Species filter chips. This is the only thing the reactive graph drives.
+// --- filter chips ---------------------------------------------------------
+
 const head = document.getElementById('sidebar-head')!;
 const chips = SPECIES_NAMES.map((name, i) => {
   const b = document.createElement('button');
   b.className = 'chip';
   b.textContent = name;
+  const [r, g, b2] = SPECIES_COLORS[i];
+  b.style.setProperty('--c', `rgb(${(r * 255) | 0} ${(g * 255) | 0} ${(b2 * 255) | 0})`);
   b.addEventListener('click', () => toggleSpecies(i));
   head.appendChild(b);
   return b;
@@ -86,18 +81,59 @@ const summary = document.createElement('div');
 summary.className = 'summary';
 head.appendChild(summary);
 
+// The only thing the reactive graph drives. Culling the population itself is a
+// single uniform written to the GPU — not a pass over a million particles.
 countEffect(() => {
   const mask = speciesMask();
-  for (let i = 0; i < chips.length; i++) {
-    chips[i].classList.toggle('off', !(mask & (1 << i)));
-  }
+  for (let i = 0; i < chips.length; i++) chips[i].classList.toggle('off', !(mask & (1 << i)));
+  backend.setSpeciesMask(mask);
   list.refilter();
   summary.textContent = `${list.rowCount.toLocaleString()} rows · ${filterLabel()}`;
 });
 
+// --- A/B toggle -----------------------------------------------------------
+
+const banner = document.createElement('div');
+banner.id = 'banner';
+document.body.appendChild(banner);
+
+function setArm(next: 'gpu' | 'baseline') {
+  arm(next);
+  if (next === 'baseline') {
+    baseline.start();
+    canvas.style.display = 'none';
+    banner.textContent =
+      `naive DOM · ${BASELINE_COUNT.toLocaleString()} particles as elements · ` +
+      `sidebar rebuilt per frame — press [B]`;
+  } else {
+    baseline.stop();
+    canvas.style.display = 'block';
+    list.forceRepaint();
+    banner.textContent =
+      `WebGPU compute · ${sim.count.toLocaleString()} particles · ` +
+      `virtualized sidebar — press [B] to compare`;
+  }
+  banner.className = next;
+  counters.arm = next;
+  // Counters are per-arm; carrying them across would blur the comparison.
+  hud.reset();
+}
+
+addEventListener('keydown', (e) => {
+  if (e.key === 'b' || e.key === 'B') setArm(arm() === 'gpu' ? 'baseline' : 'gpu');
+});
+
+function fit() {
+  const dpr = Math.min(devicePixelRatio, 2);
+  backend.resize((innerWidth * dpr) | 0, (innerHeight * dpr) | 0);
+}
+addEventListener('resize', fit);
+fit();
+setArm('gpu');
+
 // Verification handle. Lets the sim be driven and inspected without relying on
 // rAF, so correctness is checkable independently of what the compositor is doing.
-(globalThis as any).__demo = { sim, backend, hud, counters, integrateCPU, list, effectRuns };
+(globalThis as any).__demo = { sim, backend, hud, counters, integrateCPU, list, effectRuns, setArm };
 
 let prev = performance.now();
 
@@ -108,10 +144,17 @@ function loop(now: number) {
   const dt = Math.min((now - prev) / 1000, 1 / 30);
   prev = now;
 
-  backend.frame(dt, mx, my);
-  list.update();
+  if (arm() === 'gpu') {
+    backend.frame(dt, mx, my);
+    list.update();
+    counters.entities = sim.count;
+    counters.domNodes = list.liveNodes;
+  } else {
+    baseline.frame(dt, mx, my);
+    counters.entities = baseline.count;
+    counters.domNodes = baseline.domNodes;
+  }
 
-  counters.domNodes = list.liveNodes;
   counters.effectRuns = effectRuns();
   hud.paint(now, counters);
 

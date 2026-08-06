@@ -10,7 +10,6 @@
   },
   "dependencies": {
     "alien-signals": "^3.2.1",
-    "bitecs": "^0.4.0",
     "motion": "^13.0.0"
   },
   "devDependencies": {

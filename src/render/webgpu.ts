@@ -17,9 +17,19 @@ struct Params {
   aspect : f32,
   size   : f32,
   gain   : f32,
+  mask   : u32,
   _pad0  : f32,
-  _pad1  : f32,
 };
+
+// Mirrors SPECIES_COLORS in sim/world.ts — keep in sync.
+const PALETTE = array<vec3<f32>, 6>(
+  vec3<f32>(0.29, 0.62, 1.00),
+  vec3<f32>(1.00, 0.45, 0.62),
+  vec3<f32>(0.42, 1.00, 0.72),
+  vec3<f32>(1.00, 0.76, 0.33),
+  vec3<f32>(0.72, 0.55, 1.00),
+  vec3<f32>(0.35, 0.95, 1.00)
+);
 
 @group(0) @binding(0) var<storage, read_write> parts : array<vec4<f32>>;
 @group(0) @binding(1) var<uniform> params : Params;
@@ -41,17 +51,19 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   // renders as a single white dot.
   let f = 0.45 / (d2 * r) - 0.0025 / (d2 * d2);
 
-  // Tangential component keeps the cloud in orbit rather than radially falling.
-  let tangent = vec2<f32>(-d.y, d.x) / r;
-
-  // Damping near 1.0: orbits have to survive thousands of frames.
-  var v = (p.zw + d * f * dt + tangent * 0.28 * dt) * 0.9992;
+  // No constant tangential term — rotation comes from the orbital seed in
+  // createSim. A constant push pumps energy in every frame and cooks the disc
+  // into uniform noise over a few thousand frames. Damping near 1.0 because
+  // orbits have to survive that long.
+  var v = (p.zw + d * f * dt) * 0.9992;
   var pos = p.xy + v * dt;
 
-  if (pos.x < -1.0) { pos.x = -1.0; v.x = -v.x; }
-  else if (pos.x > 1.0) { pos.x = 1.0; v.x = -v.x; }
-  if (pos.y < -1.0) { pos.y = -1.0; v.y = -v.y; }
-  else if (pos.y > 1.0) { pos.y = 1.0; v.y = -v.y; }
+  // Inelastic walls: perfectly elastic ones let escapees accumulate speed.
+  let bounce = 0.45;
+  if (pos.x < -1.0) { pos.x = -1.0; v.x = -v.x * bounce; }
+  else if (pos.x > 1.0) { pos.x = 1.0; v.x = -v.x * bounce; }
+  if (pos.y < -1.0) { pos.y = -1.0; v.y = -v.y * bounce; }
+  else if (pos.y > 1.0) { pos.y = 1.0; v.y = -v.y * bounce; }
 
   parts[i] = vec4<f32>(pos, v);
 }
@@ -60,10 +72,12 @@ struct VSOut {
   @builtin(position) pos : vec4<f32>,
   @location(0) uv : vec2<f32>,
   @location(1) speed : f32,
+  @location(2) tint : vec3<f32>,
 };
 
 @group(0) @binding(0) var<storage, read> rparts : array<vec4<f32>>;
 @group(0) @binding(1) var<uniform> rparams : Params;
+@group(0) @binding(2) var<storage, read> rspecies : array<u32>;
 
 // Two triangles per particle, expanded from vertex_index. No index buffer,
 // no per-particle vertex data — the position comes straight from storage.
@@ -77,8 +91,21 @@ fn vs(@builtin(vertex_index) vi : u32, @builtin(instance_index) ii : u32) -> VSO
   let p = rparts[ii];
   let corner = QUAD[vi];
   let size = rparams.size;
+  let sp = rspecies[ii];
 
   var out : VSOut;
+
+  // Filtering happens here, on the GPU, over the whole population. The filter
+  // chips are the only thing the reactive graph drives; culling a million
+  // particles is a single uniform bit test per vertex, not a JS pass.
+  if ((rparams.mask & (1u << sp)) == 0u) {
+    out.pos = vec4<f32>(0.0, 0.0, 0.0, 0.0); // degenerate — clipped away
+    out.uv = corner;
+    out.speed = 0.0;
+    out.tint = vec3<f32>(0.0);
+    return out;
+  }
+
   out.pos = vec4<f32>(
     p.x + corner.x * size / rparams.aspect,
     p.y + corner.y * size,
@@ -86,6 +113,9 @@ fn vs(@builtin(vertex_index) vi : u32, @builtin(instance_index) ii : u32) -> VSO
   );
   out.uv = corner;
   out.speed = clamp(length(p.zw) * 0.22, 0.0, 1.0);
+  // Shift toward white with speed so the dense hot core still reads as bright
+  // without losing species identity in the arms.
+  out.tint = mix(PALETTE[sp], vec3<f32>(1.0, 0.95, 0.88), out.speed * 0.3);
   return out;
 }
 
@@ -96,14 +126,10 @@ fn fs(in : VSOut) -> @location(0) vec4<f32> {
   if (r > 1.0) { discard; }
   let a = (1.0 - r) * (1.0 - r);
 
-  let cool = vec3<f32>(0.25, 0.62, 1.0);
-  let hot  = vec3<f32>(1.0, 0.78, 0.42);
-  let rgb = mix(cool, hot, in.speed);
-
   // Additive blending sums every overlapping particle. At a million of them the
   // core saturates to flat white unless per-particle contribution scales down
   // with population — gain is set from the live count on the CPU side.
-  return vec4<f32>(rgb * a * rparams.gain, a * rparams.gain);
+  return vec4<f32>(in.tint * a * rparams.gain, a * rparams.gain);
 }
 `;
 
@@ -141,7 +167,22 @@ export async function createWebGPUBackend(
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
   // Reused every frame; the only per-frame CPU->GPU traffic in the demo (32 bytes).
-  const paramData = new Float32Array(8);
+  // Two views over one buffer because `mask` is a u32 among f32s.
+  const paramBytes = new ArrayBuffer(32);
+  const paramData = new Float32Array(paramBytes);
+  const paramU32 = new Uint32Array(paramBytes);
+
+  // Species ids, uploaded once and never touched again. u32 rather than u8:
+  // WGSL storage arrays have no 8-bit element type.
+  const speciesData = new Uint32Array(sim.capacity);
+  for (let i = 0; i < sim.capacity; i++) speciesData[i] = sim.species[i];
+  const speciesBuf = device.createBuffer({
+    size: speciesData.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(speciesBuf, 0, speciesData);
+
+  let mask = (1 << 6) - 1;
 
   // One staging buffer + one CPU-side view, allocated once. The list pulls a
   // small window through these every frame, so allocating per call would show
@@ -170,6 +211,11 @@ export async function createWebGPUBackend(
         binding: 1,
         visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
         buffer: { type: 'uniform' },
+      },
+      {
+        binding: 2,
+        visibility: GPUShaderStage.VERTEX,
+        buffer: { type: 'read-only-storage' },
       },
     ],
   });
@@ -211,6 +257,7 @@ export async function createWebGPUBackend(
     entries: [
       { binding: 0, resource: { buffer: particleBuf } },
       { binding: 1, resource: { buffer: paramBuf } },
+      { binding: 2, resource: { buffer: speciesBuf } },
     ],
   });
 
@@ -222,6 +269,10 @@ export async function createWebGPUBackend(
 
     setCount(n: number) {
       count = Math.min(n, sim.capacity);
+    },
+
+    setSpeciesMask(m: number) {
+      mask = m >>> 0;
     },
 
     frame(dt: number, mx: number, my: number) {
@@ -237,8 +288,11 @@ export async function createWebGPUBackend(
       // size 0.0035 / gain 1.0 saturates to flat white at 1M, size 0.0013 / gain
       // 0.2 is invisible. These floors sit ~1/6 of saturation.
       paramData[4] = Math.min(0.006, Math.max(0.0018, 0.06 / Math.sqrt(count)));
-      paramData[5] = Math.min(1, Math.max(0.6, 200_000 / count));
-      device.queue.writeBuffer(paramBuf, 0, paramData);
+      // Lower than you would guess: the galaxy core reaches very high overdraw,
+      // and additive blending clips to white there long before the arms are lit.
+      paramData[5] = Math.min(1, Math.max(0.3, 120_000 / count));
+      paramU32[6] = mask;
+      device.queue.writeBuffer(paramBuf, 0, paramBytes);
 
       const enc = device.createCommandEncoder();
 
@@ -290,6 +344,7 @@ export async function createWebGPUBackend(
     destroy() {
       particleBuf.destroy();
       paramBuf.destroy();
+      speciesBuf.destroy();
       staging.destroy();
       device.destroy();
     },

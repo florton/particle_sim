@@ -31,15 +31,33 @@ CPU cost is linear; GPU submit cost is flat. **The crossover is around 250k, not
 60Hz frame. There is no bottleneck to relieve at that scale, and a demo built
 around relieving it would be theatre.
 
-### Steady state at 1,000,000
+### A/B: press `B`
 
-| metric | value |
-| --- | --- |
-| p50 frame time | 16.70 ms (vsync-locked) |
-| p99 frame time | 17.00–17.20 ms |
-| dropped frames | 0.5–1.5% |
-| live DOM nodes | 33 |
-| reactive effect runs | 1 per ~200 frames |
+Both arms run the **identical force law**. The only difference is how the result
+reaches the screen.
+
+| | GPU arm | naive DOM arm |
+| --- | --- | --- |
+| particles | **1,000,000** | 4,000 |
+| fps | **58** | 16 |
+| p50 frame time | **16.70 ms** | 66.60 ms |
+| p99 frame time | **33.40 ms** | 199.90 ms |
+| dropped frames | 3.9% | **98.9%** |
+| blocking long tasks | **0 / 0 ms** | 93 / 5,746 ms |
+| live DOM nodes | **33** | 4,400 |
+| reactive effect runs | 1 per 650 frames | 1 per 94 frames |
+
+**250× the particles at 3.6× the frame rate**, and the main thread goes from
+5.7 seconds of blocking long tasks to zero.
+
+The naive arm is not a strawman in its arithmetic — it calls the same
+`integrateCPU`. What it does differently is what most dashboards do: one DOM
+element per entity positioned with `left`/`top`, and a sidebar rebuilt from a
+template string every frame.
+
+Honest caveat: the GPU arm's p99 of 33.40 ms is a dropped frame, not a clean
+16.7. It sits at 4–10% depending on capture load. The p50 is rock solid; the tail
+is not perfect, and the HUD is built to show that rather than hide it.
 
 ## Things that turned out to be false
 
@@ -67,16 +85,24 @@ validation failures asynchronously. A render bind group that omitted
 canvas, a healthy compute pass, and total console silence. `webgpu.ts` now
 installs an `uncapturederror` listener at device creation.
 
+**"A HUD makes the demo trustworthy."** Only if the HUD is right. This one
+reported *99.4% dropped frames* next to a healthy 16.80 ms p50 — because `reset()`
+did not clear the observed-fastest-frame floor, and one sub-millisecond rAF
+delivery during an arm switch permanently redefined the refresh interval to ~1 ms.
+Instrumentation is code and has bugs like any other code. `src/hud.ts` now floors
+refresh calibration at 4 ms and clears it on reset.
+
 ## Known issues
 
-- **~650 ms long task at startup.** Creating 1M bitecs entities dominates boot.
-  The ECS layer is not earning its cost here: species and stat are already plain
-  typed arrays indexed by entity id, and nothing queries relationally. Removing
-  bitecs from the hot set is the obvious next change.
-- **The A/B baseline arm is not built yet** (see below). Until it is, the demo
-  shows good numbers without showing what they're better *than*.
+- **The particles do not interact with each other.** This is a single attractor
+  plus a repulsive core — O(n), no particle-particle forces. The structure is
+  real orbital mechanics, but it is not chemistry. Naive N-body at 1M is 10¹²
+  pairs and impossible; a GPU density-field pass (scatter into a coarse grid with
+  atomics, then sample the neighbourhood) is O(n) and would give genuine emergent
+  clustering. That is the next feature.
 - fps is vsync-capped at 60, so the GPU's actual headroom at 1M is unmeasured.
   A `timestamp-query` pass would show it.
+- p99 on the GPU arm is a dropped frame (33.40 ms), not a clean 16.7.
 
 ## Running it
 
