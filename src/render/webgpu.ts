@@ -20,20 +20,30 @@ struct Params {
   mask   : u32,
   mode   : u32,
   time   : f32,
-  warp   : f32,
+  warpN  : f32,
+  warpM  : f32,
   _pad0  : f32,
-  _pad1  : f32,
 };
 
-// Chladni mode pairs (n, m) per species. Each species settles onto the nodal
-// lines of its own standing wave, so six figures resolve at once in six colours.
+// Primary attractor strength. Fixed at the origin -- see the integrate entry
+// point. (No backticks in here: this block lives inside a JS template literal.)
+const G_CORE = 0.55;
+// Cursor mass, deliberately a fraction of the core so it perturbs, not destroys.
+const G_CURSOR = 0.10;
+// Terminal speed. Without it a close cursor pass flings grains off to infinity.
+const V_MAX = 3.0;
+
+// Per-species (n, m) offsets from the cursor-driven base frequency. Each species
+// settles onto the nodal lines of its own standing wave, so six figures resolve
+// at once in six colours. Kept small and mutually offset so they stay visibly
+// distinct at every base frequency.
 const MODES = array<vec2<f32>, 6>(
-  vec2<f32>(1.0, 2.0),
-  vec2<f32>(2.0, 3.0),
-  vec2<f32>(3.0, 4.0),
-  vec2<f32>(1.0, 4.0),
-  vec2<f32>(2.0, 5.0),
-  vec2<f32>(3.0, 5.0)
+  vec2<f32>(0.0, 1.0),
+  vec2<f32>(1.0, 0.0),
+  vec2<f32>(0.0, 2.0),
+  vec2<f32>(2.0, 0.0),
+  vec2<f32>(1.0, 3.0),
+  vec2<f32>(3.0, 1.0)
 );
 
 const PI = 3.14159265;
@@ -66,10 +76,11 @@ const PALETTE = array<vec3<f32>, 6>(
  * search: a million grains cost one evaluation each.
  */
 fn chladni(i : u32, p : vec4<f32>, dt : f32) -> vec4<f32> {
+  // Cursor drives the base frequency across a wide range; each species offsets
+  // from it, so all six figures sweep together but never coincide.
   let nm = MODES[cspecies[i]];
-  // Cursor warps the frequencies live, so the figure reorganizes under the mouse.
-  let n = nm.x + params.warp;
-  let m = nm.y + params.warp;
+  let n = params.warpN + nm.x;
+  let m = params.warpM + nm.y;
 
   let u = (p.x + 1.0) * 0.5;
   let v = (p.y + 1.0) * 0.5;
@@ -111,11 +122,24 @@ fn chladni(i : u32, p : vec4<f32>, dt : f32) -> vec4<f32> {
 fn scatter(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = gid.x;
   if (i >= arrayLength(&parts)) { return; }
-  parts[i] = vec4<f32>(
-    hash(i * 3u) * 2.0 - 1.0,
-    hash(i * 3u + 1u) * 2.0 - 1.0,
-    0.0, 0.0
-  );
+
+  if (params.mode == 1u) {
+    // Chladni: evenly spread sand.
+    parts[i] = vec4<f32>(
+      hash(i * 3u) * 2.0 - 1.0,
+      hash(i * 3u + 1u) * 2.0 - 1.0,
+      0.0, 0.0
+    );
+    return;
+  }
+
+  // Galaxy: re-seed the orbital disc. Returning from Chladni would otherwise
+  // leave a million grains sitting on nodal lines with zero angular momentum,
+  // and they would simply rain into the core.
+  let a = hash(i * 3u) * 6.2831853;
+  let r = sqrt(hash(i * 3u + 1u)) * 0.65;
+  let vOrb = sqrt(G_CORE / max(r, 0.06)) * 0.94;
+  parts[i] = vec4<f32>(cos(a) * r, sin(a) * r, -sin(a) * vOrb, cos(a) * vOrb);
 }
 
 @compute @workgroup_size(${WORKGROUP})
@@ -131,20 +155,46 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
     return;
   }
 
-  let d = vec2<f32>(params.mx - p.x, params.my - p.y);
-  let d2 = dot(d, d) + 0.004;
-  let r = sqrt(d2);
-
+  // Primary: fixed at the origin. This is what holds the disc together.
+  //
+  // An earlier revision made the *cursor* the only attractor. Moving it broke
+  // every orbit simultaneously and the disc detonated into uniform static, with
+  // nothing left to re-form it. Anchoring the primary and demoting the cursor to
+  // a weaker secondary mass turns interaction into tidal perturbation: the arms
+  // stretch and wake, then relax back.
+  let dc = -p.xy;
+  let dc2 = dot(dc, dc) + 0.004;
+  let rc = sqrt(dc2);
   // Attraction minus a short-range repulsive core. Without the second term the
-  // whole population collapses onto the cursor within a second and the demo
-  // renders as a single white dot.
-  let f = 0.45 / (d2 * r) - 0.0025 / (d2 * d2);
+  // whole population collapses to a single point.
+  let fc = G_CORE / (dc2 * rc) - 0.0025 / (dc2 * dc2);
 
-  // No constant tangential term — rotation comes from the orbital seed in
-  // createSim. A constant push pumps energy in every frame and cooks the disc
-  // into uniform noise over a few thousand frames. Damping near 1.0 because
-  // orbits have to survive that long.
-  var v = (p.zw + d * f * dt) * 0.9992;
+  // Secondary: the cursor. Softened harder so a direct hit shears rather than
+  // slingshots.
+  let dm = vec2<f32>(params.mx - p.x, params.my - p.y);
+  let dm2 = dot(dm, dm) + 0.02;
+  let fm = G_CURSOR / (dm2 * sqrt(dm2));
+
+  var v = p.zw + dc * fc * dt + dm * fm * dt;
+
+  // Damp the RADIAL component only.
+  //
+  // Uniform damping looks harmless and is not: it bleeds orbital speed, orbits
+  // shrink, and within ten seconds the whole disc has inspiralled into one dense
+  // ball. Damping only the radial component removes eccentricity while leaving
+  // angular momentum intact, which is what real accretion discs do — orbits
+  // circularize instead of decaying. The practical payoff is that the disc
+  // actively re-forms after the cursor stirs it, rather than staying wrecked.
+  let rdir = dc / rc;
+  let vRad = dot(v, rdir) * rdir;
+  v = (v - vRad) + vRad * 0.995;
+
+  // Whisper of global damping purely to bound energy the moving cursor injects.
+  v = v * 0.99995;
+
+  let speed = length(v);
+  if (speed > V_MAX) { v = v * (V_MAX / speed); }
+
   var pos = p.xy + v * dt;
 
   // Inelastic walls: perfectly elastic ones let escapees accumulate speed.
@@ -403,9 +453,18 @@ export async function createWebGPUBackend(
       paramU32[7] = mode;
       elapsed += dt;
       paramData[8] = elapsed;
-      // In Chladni mode the cursor bends the frequencies, so dragging across the
-      // plate morphs one figure into the next continuously.
-      paramData[9] = mode === 1 ? mx * 1.6 : 0;
+      if (mode === 1) {
+        // Cursor sweeps the base frequency over a wide band — x drives n, y
+        // drives m, each roughly 1..13. Combined with the per-species offsets
+        // that spans simple crosses through to dense lattices. A slow idle
+        // drift keeps it evolving when nobody is touching the mouse.
+        const drift = Math.sin(elapsed * 0.11) * 1.4;
+        paramData[9] = 1 + (mx * 0.5 + 0.5) * 12 + drift;
+        paramData[10] = 1 + (my * 0.5 + 0.5) * 12 + drift;
+      } else {
+        paramData[9] = 0;
+        paramData[10] = 0;
+      }
       device.queue.writeBuffer(paramBuf, 0, paramBytes);
 
       const enc = device.createCommandEncoder();

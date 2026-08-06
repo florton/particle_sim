@@ -22,11 +22,12 @@ uniform vec2 uMouse;
 uniform int uMode;
 uniform float uTime;
 uniform float uWarp;
+uniform float uWarpM;
 
 const float PI = 3.14159265;
 const vec2 MODES[6] = vec2[6](
-  vec2(1.0, 2.0), vec2(2.0, 3.0), vec2(3.0, 4.0),
-  vec2(1.0, 4.0), vec2(2.0, 5.0), vec2(3.0, 5.0)
+  vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(0.0, 2.0),
+  vec2(2.0, 0.0), vec2(1.0, 3.0), vec2(3.0, 1.0)
 );
 
 float hash(vec2 s) {
@@ -37,8 +38,8 @@ void main() {
   // --- Chladni plate (see webgpu.ts for the derivation) ---
   if (uMode == 1) {
     vec2 nm = MODES[int(aSpecies + 0.5)];
-    float n = nm.x + uWarp;
-    float m = nm.y + uWarp;
+    float n = uWarp + nm.x;
+    float m = uWarpM + nm.y;
 
     float u = (aPos.x + 1.0) * 0.5;
     float vv = (aPos.y + 1.0) * 0.5;
@@ -59,14 +60,27 @@ void main() {
     return;
   }
 
-  vec2 d = uMouse - aPos;
-  float d2 = dot(d, d) + 0.004;
-  float r = sqrt(d2);
+  // Must stay comparable with the WGSL path — see webgpu.ts for the reasoning
+  // behind an anchored primary plus a weaker cursor secondary.
+  vec2 dc = -aPos;
+  float dc2 = dot(dc, dc) + 0.004;
+  float rc = sqrt(dc2);
+  float fc = 0.55 / (dc2 * rc) - 0.0025 / (dc2 * dc2);
 
-  // Must stay bit-comparable with the WGSL path — see webgpu.ts.
-  float f = 0.45 / (d2 * r) - 0.0025 / (d2 * d2);
+  vec2 dm = uMouse - aPos;
+  float dm2 = dot(dm, dm) + 0.02;
+  float fm = 0.10 / (dm2 * sqrt(dm2));
 
-  vec2 v = (aVel + d * f * uDt) * 0.9992;
+  vec2 v = aVel + dc * fc * uDt + dm * fm * uDt;
+
+  // Radial-only damping — see webgpu.ts for why uniform damping collapses the disc.
+  vec2 rdir = dc / rc;
+  vec2 vRad = dot(v, rdir) * rdir;
+  v = ((v - vRad) + vRad * 0.995) * 0.99995;
+
+  float speed = length(v);
+  if (speed > 3.0) v *= 3.0 / speed;
+
   vec2 p = aPos + v * uDt;
 
   float bounce = 0.45;
@@ -119,7 +133,7 @@ void main() {
   }
 
   vSpeed = clamp(length(aVel) * 0.22, 0.0, 1.0);
-  vTint = mix(PALETTE[sp], vec3(1.0, 0.95, 0.88), vSpeed * 0.75);
+  vTint = mix(PALETTE[sp], vec3(1.0, 0.95, 0.88), vSpeed * 0.3);
   gl_Position = vec4(
     aPos.x + aCorner.x * uSize / uAspect,
     aPos.y + aCorner.y * uSize,
@@ -220,6 +234,7 @@ export function createWebGL2Backend(
     uMode: gl.getUniformLocation(simProg, 'uMode'),
     uTime: gl.getUniformLocation(simProg, 'uTime'),
     uWarp: gl.getUniformLocation(simProg, 'uWarp'),
+    uWarpM: gl.getUniformLocation(simProg, 'uWarpM'),
   };
   const drawLoc = {
     aPos: gl.getAttribLocation(drawProg, 'aPos'),
@@ -269,14 +284,26 @@ export function createWebGL2Backend(
     setMode(m: number) {
       mode = m | 0;
 
-      // Parity with the WebGPU scatter pass: the plate must start as evenly
-      // spread sand. No compute shaders here, so this is a CPU-side refill of
-      // both ping-pong buffers — a one-time cost on mode switch, not per frame.
+      // Parity with the WebGPU scatter pass. No compute shaders here, so this is
+      // a CPU-side refill of both ping-pong buffers — a one-time cost on mode
+      // switch, not per frame.
       for (let i = 0; i < n; i++) {
-        pos[i * 2] = Math.random() * 2 - 1;
-        pos[i * 2 + 1] = Math.random() * 2 - 1;
-        vel[i * 2] = 0;
-        vel[i * 2 + 1] = 0;
+        if (mode === 1) {
+          // Chladni: evenly spread sand, at rest.
+          pos[i * 2] = Math.random() * 2 - 1;
+          pos[i * 2 + 1] = Math.random() * 2 - 1;
+          vel[i * 2] = 0;
+          vel[i * 2 + 1] = 0;
+        } else {
+          // Galaxy: re-seed the orbital disc, or the grains just rain into the core.
+          const a = Math.random() * Math.PI * 2;
+          const r = Math.sqrt(Math.random()) * 0.65;
+          const vOrb = Math.sqrt(0.55 / Math.max(r, 0.06)) * 0.94;
+          pos[i * 2] = Math.cos(a) * r;
+          pos[i * 2 + 1] = Math.sin(a) * r;
+          vel[i * 2] = -Math.sin(a) * vOrb;
+          vel[i * 2 + 1] = Math.cos(a) * vOrb;
+        }
       }
       for (const [buf, data] of [
         [posA, pos],
@@ -297,7 +324,10 @@ export function createWebGL2Backend(
       gl.uniform1i(simLoc.uMode, mode);
       elapsed += dt;
       gl.uniform1f(simLoc.uTime, elapsed);
-      gl.uniform1f(simLoc.uWarp, mode === 1 ? mx * 1.6 : 0);
+      // Same wide frequency sweep as the WebGPU path — see webgpu.ts.
+      const drift = mode === 1 ? Math.sin(elapsed * 0.11) * 1.4 : 0;
+      gl.uniform1f(simLoc.uWarp, mode === 1 ? 1 + (mx * 0.5 + 0.5) * 12 + drift : 0);
+      gl.uniform1f(simLoc.uWarpM, mode === 1 ? 1 + (my * 0.5 + 0.5) * 12 + drift : 0);
 
       bindAttrib(posA, simLoc.aPos);
       bindAttrib(velA, simLoc.aVel);

@@ -19,6 +19,14 @@ export const STRIDE = 4; // x, y, vx, vy
 
 /** Restitution at the box walls. Shared by all three integrators. */
 export const BOUNCE = 0.45;
+/** Primary attractor strength, fixed at the origin. */
+export const G_CORE = 0.55;
+/** Cursor mass — a fraction of the core, so it perturbs rather than destroys. */
+export const G_CURSOR = 0.1;
+/** Terminal speed. */
+export const V_MAX = 3.0;
+/** Radial-velocity retention per step. Circularizes orbits without killing them. */
+export const RADIAL_DAMP = 0.995;
 export const SPECIES_COUNT = 6;
 
 export const SPECIES_NAMES = [
@@ -90,7 +98,7 @@ export function createSim(capacity: number, seed = 0x9e3779b9): Sim {
     // the walls — after a minute the whole field decays to uniform noise. Seeded
     // on-orbit, the disc is stable indefinitely. Slightly sub-orbital (0.94) so
     // it precesses into spiral arms instead of sitting as a featureless annulus.
-    const vOrb = Math.sqrt(0.45 / Math.max(r, 0.06)) * 0.94;
+    const vOrb = Math.sqrt(G_CORE / Math.max(r, 0.06)) * 0.94;
     particles[o + 2] = -Math.sin(a) * vOrb;
     particles[o + 3] = Math.cos(a) * vOrb;
 
@@ -113,26 +121,50 @@ export function createSim(capacity: number, seed = 0x9e3779b9): Sim {
 export function integrateCPU(sim: Sim, dt: number, mx: number, my: number) {
   const p = sim.particles;
   const n = sim.count;
-  const damp = 0.9992;
+  const damp = 0.99995;
 
   for (let i = 0; i < n; i++) {
     const o = i * STRIDE;
     const x = p[o];
     const y = p[o + 1];
 
-    const dx = mx - x;
-    const dy = my - y;
     // Identical force law to the GPU paths — a comparison between arms is only
     // meaningful if they are doing the same arithmetic.
-    const d2 = dx * dx + dy * dy + 0.004;
-    const r = Math.sqrt(d2);
-    const f = 0.45 / (d2 * r) - 0.0025 / (d2 * d2);
+    //
+    // Primary at the origin holds the disc; the cursor is a weaker secondary
+    // that perturbs it. See webgpu.ts for why the cursor is not the primary.
+    const cx = -x;
+    const cy = -y;
+    const dc2 = cx * cx + cy * cy + 0.004;
+    const rc = Math.sqrt(dc2);
+    const fc = G_CORE / (dc2 * rc) - 0.0025 / (dc2 * dc2);
+
+    const dx = mx - x;
+    const dy = my - y;
+    const dm2 = dx * dx + dy * dy + 0.02;
+    const fm = G_CURSOR / (dm2 * Math.sqrt(dm2));
 
     // No constant tangential term: it pumps energy in every frame regardless of
     // position, which is what cooked the disc into uniform noise. Rotation comes
     // from the orbital seed instead.
-    let vx = (p[o + 2] + dx * f * dt) * damp;
-    let vy = (p[o + 3] + dy * f * dt) * damp;
+    let vx = p[o + 2] + cx * fc * dt + dx * fm * dt;
+    let vy = p[o + 3] + cy * fc * dt + dy * fm * dt;
+
+    // Radial-only damping — see webgpu.ts for why uniform damping collapses the
+    // disc into a ball instead of holding it open.
+    const rdx = cx / rc;
+    const rdy = cy / rc;
+    const vr = vx * rdx + vy * rdy;
+    vx = (vx - vr * rdx) + vr * rdx * RADIAL_DAMP;
+    vy = (vy - vr * rdy) + vr * rdy * RADIAL_DAMP;
+    vx *= damp;
+    vy *= damp;
+
+    const speed = Math.hypot(vx, vy);
+    if (speed > V_MAX) {
+      vx *= V_MAX / speed;
+      vy *= V_MAX / speed;
+    }
 
     let nx = x + vx * dt;
     let ny = y + vy * dt;

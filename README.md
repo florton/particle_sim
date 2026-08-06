@@ -12,14 +12,16 @@ measurement.
   instanced call. Particle data is uploaded once and never returns to the CPU on
   the render path.
 - **Two simulation modes**, `M` to switch:
-  - **Orbital galaxy** — particles seeded at circular-orbit velocity around a
-    cursor-following attractor with a repulsive core. Spiral arms are emergent,
-    not authored.
+  - **Orbital galaxy** — a fixed primary at the origin holds the disc; the
+    cursor is a weaker secondary mass that perturbs it. Drag through the disc and
+    you raise tidal arms and a wake, then it re-forms. Spiral structure is
+    emergent, not authored.
   - **Chladni plate** — particles descend the gradient of a standing wave onto
-    its nodal lines, the way sand does on a vibrating plate. Each species gets
-    its own `(n, m)` frequency pair, so six figures resolve at once in six
-    colours, and the cursor warps the frequencies live. Analytic gradient, so
-    it stays O(n) with no neighbour search.
+    its nodal lines, the way sand does on a vibrating plate. The cursor sweeps
+    the base frequency across roughly 1–13 on each axis, with each species offset
+    from it, so six figures resolve at once in six colours — sparse sweeping
+    curves at one corner, a dense interference lattice at the other. Analytic
+    gradient, so it stays O(n) with no neighbour search.
 - **A sidebar over all 1,000,000 rows** that keeps ~33 `<div>`s alive.
 - **Six species filters** that cull on the GPU — a uniform bit test per vertex,
   not a CPU pass over the population.
@@ -95,6 +97,21 @@ validation failures asynchronously. A render bind group that omitted
 `FRAGMENT` visibility on a uniform read by the fragment stage produced a black
 canvas, a healthy compute pass, and total console silence. `webgpu.ts` now
 installs an `uncapturederror` listener at device creation.
+
+**"Make the cursor the attractor — that's the interaction."** It was, and moving
+it broke every orbit at once. The disc detonated into uniform static with nothing
+left to re-form it, so one mouse gesture permanently ruined the scene. Anchoring
+the primary at the origin and demoting the cursor to a weaker secondary mass
+turns interaction into tidal perturbation instead of demolition.
+
+**"Damping keeps the simulation stable."** Uniform damping bleeds *orbital*
+speed, so orbits shrink and the whole disc inspirals into one dense ball within
+about ten seconds — stable, and useless. Damping only the **radial** component
+removes eccentricity while leaving angular momentum intact, which is what real
+accretion discs do. Orbits circularize rather than decay, and the practical
+payoff is that the disc actively re-forms after you stir it. The retention
+constant is load-bearing: at 0.97 it circularizes so hard the spiral collapses
+into concentric rings, so it sits at 0.995 to keep the arms.
 
 **"A HUD makes the demo trustworthy."** Only if the HUD is right. This one
 reported *99.4% dropped frames* next to a healthy 16.80 ms p50 — because `reset()`
