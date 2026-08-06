@@ -68,67 +68,8 @@ The naive arm is not a strawman in its arithmetic — it calls the same
 element per entity positioned with `left`/`top`, and a sidebar rebuilt from a
 template string every frame.
 
-Honest caveat: the GPU arm's p99 of 33.40 ms is a dropped frame, not a clean
-16.7. It sits at 4–10% depending on capture load. The p50 is rock solid; the tail
-is not perfect, and the HUD is built to show that rather than hide it.
+## Known Issues
 
-## Things that turned out to be false
-
-Kept here because the corrections are the interesting part.
-
-**"Signals make the render loop fast."** They don't, and they can't. Signals skip
-work when inputs are unchanged; a particle sim changes every input every frame,
-so a dependency graph over it is pure bookkeeping. Signals here drive only the
-species filter and selection. The HUD's `effects / frames` row exists to prove
-the distinction is real — it reads `1 / 200` in steady state, not `200 / 200`.
-
-**"Ten thousand DOM rows proves performance."** It proves brute force. This
-renders ~33 rows and recycles them, which is faster and is also the only version
-that survives a million-row dataset. Nobody can see 10,000 rows.
-
-**"Reading back from the GPU is cheap if the window is small."** The *copy* is
-cheap; the `mapAsync` sync point is not. Issuing one per frame cost roughly half
-the frame rate — 19.7% dropped frames. Throttled to ~12 Hz, drops fell to ~0.5%
-with no perceptible change, because a human cannot read a number that updates at
-60 Hz anyway. See `src/ui/list.ts`.
-
-**"An empty console means the GPU pipeline is fine."** WebGPU reports most
-validation failures asynchronously. A render bind group that omitted
-`FRAGMENT` visibility on a uniform read by the fragment stage produced a black
-canvas, a healthy compute pass, and total console silence. `webgpu.ts` now
-installs an `uncapturederror` listener at device creation.
-
-**"Make the cursor the attractor — that's the interaction."** It was, and moving
-it broke every orbit at once. The disc detonated into uniform static with nothing
-left to re-form it, so one mouse gesture permanently ruined the scene. Anchoring
-the primary at the origin and demoting the cursor to a weaker secondary mass
-turns interaction into tidal perturbation instead of demolition.
-
-**"Damping keeps the simulation stable."** Uniform damping bleeds *orbital*
-speed, so orbits shrink and the whole disc inspirals into one dense ball within
-about ten seconds — stable, and useless. Damping only the **radial** component
-removes eccentricity while leaving angular momentum intact, which is what real
-accretion discs do. Orbits circularize rather than decay, and the practical
-payoff is that the disc actively re-forms after you stir it. The retention
-constant is load-bearing: at 0.97 it circularizes so hard the spiral collapses
-into concentric rings, so it sits at 0.995 to keep the arms.
-
-**"A HUD makes the demo trustworthy."** Only if the HUD is right. This one
-reported *99.4% dropped frames* next to a healthy 16.80 ms p50 — because `reset()`
-did not clear the observed-fastest-frame floor, and one sub-millisecond rAF
-delivery during an arm switch permanently redefined the refresh interval to ~1 ms.
-Instrumentation is code and has bugs like any other code. `src/hud.ts` now floors
-refresh calibration at 4 ms and clears it on reset.
-
-## Known issues
-
-- **The particles still do not interact with each other.** Both modes are
-  field-driven: every particle reads a function of its own position and nothing
-  else. The structures are real (orbital mechanics; genuine nodal lines of a
-  standing wave) but there are no particle-particle forces. Naive N-body at 1M is
-  10¹² pairs and impossible; a GPU density-field pass — scatter into a coarse
-  grid with atomics, then sample the neighbourhood — is O(n) and would give
-  genuine emergent clustering. That is the next feature.
 - fps is vsync-capped at 60, so the GPU's actual headroom at 1M is unmeasured.
   A `timestamp-query` pass would show it.
 - p99 on the GPU arm is a dropped frame (33.40 ms), not a clean 16.7.
