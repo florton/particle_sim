@@ -12,10 +12,15 @@ measurement.
   instanced call. Particle data is uploaded once and never returns to the CPU on
   the render path.
 - **Two simulation modes**, `M` to switch:
-  - **Orbital galaxy** — a fixed primary at the origin holds the disc; the
-    cursor is a weaker secondary mass that perturbs it. Drag through the disc and
-    you raise tidal arms and a wake, then it re-forms. Spiral structure is
-    emergent, not authored.
+  - **Spiral galaxy** — a self-gravitating disc. Every frame the population
+    deposits its mass into a 64x64 mesh, the mesh convolves against itself for
+    the force field, and every particle reads that field back. The arms are a
+    genuine instability of the disc responding to its own density, so they form,
+    shear, dissolve and re-form indefinitely and never twice the same. A slider
+    sets the disc cooling rate, which moves it between a cold disc with few
+    sharp arms and a hot one with many faint ones — the difference between a
+    grand-design and a flocculent spiral, which is a real distinction between
+    real galaxies.
   - **Chladni plate** — particles descend the gradient of a standing wave onto
     its nodal lines, the way sand does on a vibrating plate. The cursor sweeps
     the base frequency across roughly 1–13 on each axis, with each species offset
@@ -29,7 +34,39 @@ measurement.
 
 ## Measured results
 
-Intel Gen-9 integrated GPU, Chromium, 60Hz display, 1182×877 backbuffer.
+Intel Gen-9 integrated GPU, Chromium, 60Hz display, 1182×877 backbuffer. This
+machine throttles as it warms, so the trustworthy figures below are the
+back-to-back A/B deltas rather than absolute milliseconds across sessions.
+
+### Does the galaxy actually have structure?
+
+The honest way to ask is to measure it. A(m=2) is the normalized Fourier
+amplitude of surface density at the m=2 angular harmonic over the annulus
+0.15 < r < 0.8 — nonzero means arms, and a purely axisymmetric disc sits at the
+shot-noise floor.
+
+| | A(m=2) at t=6s | at t=20s | at t=60s | noise floor |
+| --- | --- | --- | --- | --- |
+| fixed potential (previous) | 3.4e-3 | 2.2e-3 | 1.7e-3 | 2.3e-3 |
+| self-gravitating (now) | 4.9e-2 | 7.5e-2 | 2.2e-2 | 5.6e-3 |
+
+**The previous version never left the noise floor at any point in its life.** It
+had no azimuthal structure at all — not after it settled, and not during the
+pretty opening either. What looked like spiral arms for the first two seconds
+was a *radial* breathing wave: every particle was seeded at 0.94x circular speed
+so the whole population reached apocentre simultaneously, and peak density hit
+25x the mean at t=1.0s. Epicyclic frequency varies with radius, the phases
+smeared, the radial damping removed what was left, and by t=20s the radial
+velocity dispersion had fallen 5x to a flat line. A collisionless disc in a
+static axisymmetric potential has exactly one end state and that was it.
+
+The second failure was independent and would have hidden the first even if the
+physics had been fixed. At the 1M gain floor each particle deposited ~0.196 of
+alpha into an 8-bit target and the disc averaged ~3.9 particles per pixel — so
+the *mean* of the galaxy sat at 0.77 of full white and the inner disc ran about
+eight times over it. Past that everything reads 1.0 and density stops being
+visible, so structure and no structure look identical. Hence the HDR
+accumulation buffer and the tonemap.
 
 ### Integration cost vs. entity count
 
@@ -68,11 +105,74 @@ The naive arm is not a strawman in its arithmetic — it calls the same
 element per entity positioned with `left`/`top`, and a sidebar rebuilt from a
 template string every frame.
 
+### What the disc cooling slider actually trades
+
+Cooling is radial-velocity retention per step: it is the dissipation that keeps
+Toomre Q low enough for the disc to amplify its own density contrast into arms.
+It is also, unavoidably, what lets material sink to the centre. Measured over
+40 s of headless integration:
+
+| cooling | late A(m=2) | mass drained to core | disc remaining |
+| --- | --- | --- | --- |
+| 0.985 (cold) | 2.2e-1 | 36.5% | 60% |
+| 0.990 | 8.2e-2 | 24.8% | 69% |
+| 0.995 (default) | 3.7e-2 | 8.0% | 86% |
+
+A colder disc makes arms roughly six times stronger and eats itself doing it.
+This is the same axis real galaxies sit on: few strong arms is grand-design,
+many faint ones is flocculent, and only about a tenth of observed spirals are
+the former — those nearly always have a driver, a companion or a bar. The low
+end of the slider is deliberately unsustainable, and the default is the setting
+that still looks like a galaxy several minutes in.
+
+### What the self-gravity costs
+
+Measured by A/B against Chladni mode, which runs the same population and the
+same fill rate with no mesh passes at all.
+
+| particles | with self-gravity | without | delta |
+| --- | --- | --- | --- |
+| 100,000 | 16.7 ms | 16.7 ms | vsync-capped, free |
+| 500,000 | 16.8 ms | 16.7 ms | vsync-capped, free |
+| 1,000,000 | 20.2 ms | 16.8 ms | **3.4 ms** |
+
+Up to 500k the whole solver is free. At 1M it costs 3.4 ms — and the reason that
+pushes the frame over budget is that the *base* 1M render was already sitting at
+16.8 ms on this GPU before any physics was added.
+
+Three results from tuning it, none of which were the expected one:
+
+- **Grid resolution has an optimum, and it is not as coarse as possible.**
+  Self-gravity cost 4.3 ms at 32^2, **3.4 ms at 64^2**, and 49.6 ms at 128^2. The
+  coarse grid is *slower* despite a 16x cheaper convolution.
+- **Cloud-in-cell deposition with four atomics per particle beats nearest-cell
+  with one, 3.4 ms against 8.6 ms.** The pass is bound by contention, not
+  throughput: an exponential disc aims an enormous share of the population at a
+  few central cells, and CIC divides that queue four ways. This is also why the
+  coarser grid loses.
+- **Privatizing the deposit into per-workgroup tiles — the textbook fix for
+  atomic contention — made it worse**, 4.0 ms against 3.4 ms. It does cut global
+  atomic traffic by well over an order of magnitude, but collapsing a million
+  independent threads into sixty-odd workgroups costs more than the contention
+  did. Measured, lost, removed.
+
 ## Known Issues
 
-- fps is vsync-capped at 60, so the GPU's actual headroom at 1M is unmeasured.
-  A `timestamp-query` pass would show it.
-- p99 on the GPU arm is a dropped frame (33.40 ms), not a clean 16.7.
+- **The WebGL2 fallback does not run self-gravity.** Transform feedback has no
+  atomics and no shared memory, so the mesh would have to be built by splatting
+  points into a float framebuffer and solved in a second full-screen pass. Until
+  that is written, the fallback is the old fixed-potential galaxy and decays to a
+  smooth disc as described above. Everything else — seeding profile, constants,
+  cooling control, framing — is kept in sync, so the difference is exactly the
+  one term. It also has no HDR path, so it clips.
+- At 1M the GPU arm runs ~19-20 ms on this integrated GPU rather than a clean
+  16.7. `?n=500000` is a locked 60 fps with self-gravity and looks near-identical,
+  since per-particle gain is normalized by population.
+- fps is vsync-capped at 60, so the GPU's actual headroom below 1M is unmeasured.
+  A `timestamp-query` pass would show it, and would also split the mesh passes
+  apart instead of measuring them as a block.
+- The disc slowly drains toward the centre: mass inside r<0.1 climbs from 5% to
+  about 14% over 60 s. Radius-dependent cooling would counter it.
 
 ## Running it
 
@@ -81,8 +181,10 @@ npm install && npm run dev
 ```
 
 Controls: `M` switches simulation mode, `B` switches arm, click the species
-chips to filter, move the cursor to drive the field. `B` compares within
-whichever mode is active, so both arms always run the same force law.
+chips to filter, drag the **disc cooling** slider to change how sharply the arms
+resolve, move the cursor to perturb the field. `B` compares within whichever
+mode is active, so both arms always run the same force law — including the mesh
+self-gravity, which the CPU reference implements at the same grid resolution.
 
 ## Deploying (self-hosted)
 
@@ -139,12 +241,23 @@ for (let i = 0; i < 120; i++) backend.frame(1 / 60, 0.4, 0.2);
 const after = await backend.readback(0, 4);
 ```
 
+The self-gravity solver can be checked against an independent implementation
+rather than by eye — `dumpGrid()` returns the density mesh and the force field
+solved from it. Total mass should come back as `M_DISC` exactly, and the field
+should point inward everywhere outside the core:
+
+```js
+const g = await window.__demo.backend.dumpGrid();
+let total = 0;
+for (const d of g.dens) total += d * g.massScale;   // -> 0.18
+```
+
 ## Layout
 
 | file | role |
 | --- | --- |
 | `src/hud.ts` | Instrumentation. Allocation-free; built before anything else. |
-| `src/sim/world.ts` | Particle buffer, entity tags, CPU reference integration. |
+| `src/sim/world.ts` | Particle buffer, entity tags, shared constants, CPU reference integration including the mesh solver. |
 | `src/render/webgpu.ts` | Compute + instanced render over one shared buffer. |
 | `src/render/webgl2.ts` | Transform-feedback fallback, same force law. |
 | `src/ui/list.ts` | Virtualized list + bounded windowed readback. |

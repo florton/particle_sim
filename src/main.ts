@@ -1,6 +1,8 @@
 import './style.css';
 import { Hud, type HudCounters } from './hud';
-import { createSim, integrateCPU, SPECIES_NAMES, SPECIES_COLORS } from './sim/world';
+import {
+  createSim, integrateCPU, RADIAL_DAMP, SPECIES_NAMES, SPECIES_COLORS,
+} from './sim/world';
 import { VirtualList } from './ui/list';
 import { speciesMask, toggleSpecies, filterLabel, countEffect, effectRuns, arm } from './ui/state';
 import type { Backend } from './render/backend';
@@ -81,6 +83,63 @@ const summary = document.createElement('div');
 summary.className = 'summary';
 head.appendChild(summary);
 
+// --- disc temperature -----------------------------------------------------
+//
+// Deliberately the only physical constant with a control on it. Spiral arms are
+// a self-gravitating instability, and how strongly the disc amplifies its own
+// density contrast depends on how cold it is — so this slider moves the galaxy
+// between the two kinds that actually exist. Cold is a grand-design spiral with
+// few strong arms; hot is flocculent, many faint ones that dissolve as fast as
+// they form. Not a rendering setting: it is changing the physics, live, over a
+// million particles, and the structure reorganises within a couple of seconds.
+
+// The range is measured, not guessed. Over 40 s of headless integration the
+// trade is monotone and steep in both directions at once:
+//
+//   cooling  late A(m=2)  mass drained to core  disc remaining
+//   0.985      2.2e-1           36.5%               60%
+//   0.990      8.2e-2           24.8%               69%
+//   0.995      3.7e-2            8.0%               86%   <- default
+//
+// Colder makes arms about six times stronger and eats the disc to do it: the
+// dissipation that keeps Toomre Q low enough to amplify structure is the same
+// dissipation that lets material sink to the centre. So the low end of this
+// slider is a deliberately unsustainable setting — it is the grand-design look,
+// and it costs a third of the disc in under a minute. The default is the one
+// that still resembles a galaxy several minutes in.
+const COOLING_MIN = 0.982; // strong dissipation — cold, sharply defined arms
+const COOLING_MAX = 1.0; // none at all — the disc heats up and goes smooth
+
+const coolRow = document.createElement('div');
+coolRow.className = 'control';
+const coolLabel = document.createElement('label');
+coolLabel.htmlFor = 'cooling';
+const coolInput = document.createElement('input');
+coolInput.type = 'range';
+coolInput.id = 'cooling';
+coolInput.min = '0';
+coolInput.max = '1000';
+// Slider position is nonlinear: everything interesting happens in the last
+// fraction of a percent below 1.0, so a linear mapping would put the entire
+// usable range in the last few pixels of travel.
+const coolFromSlider = (t: number) =>
+  COOLING_MAX - (COOLING_MAX - COOLING_MIN) * (1 - t / 1000) ** 2;
+const coolToSlider = (v: number) =>
+  1000 * (1 - Math.sqrt((COOLING_MAX - v) / (COOLING_MAX - COOLING_MIN)));
+
+function applyCooling(v: number) {
+  backend.setCooling?.(v);
+  baseline.setCooling(v);
+  const perSec = v ** 60;
+  coolLabel.textContent =
+    `disc cooling · ${((1 - perSec) * 100).toFixed(1)}%/s` +
+    (v >= COOLING_MAX - 1e-6 ? ' — none, disc goes smooth' : '');
+}
+coolInput.value = String(coolToSlider(RADIAL_DAMP));
+coolInput.addEventListener('input', () => applyCooling(coolFromSlider(+coolInput.value)));
+coolRow.append(coolLabel, coolInput);
+head.appendChild(coolRow);
+
 // The only thing the reactive graph drives. Culling the population itself is a
 // single uniform written to the GPU — not a pass over a million particles.
 countEffect(() => {
@@ -148,6 +207,7 @@ function fit() {
 }
 addEventListener('resize', fit);
 fit();
+applyCooling(RADIAL_DAMP);
 setArm('gpu');
 
 // Verification handle. Lets the sim be driven and inspected without relying on

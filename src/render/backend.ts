@@ -15,6 +15,17 @@ export interface Backend {
   setSpeciesMask(mask: number): void;
   /** 0 = orbital galaxy, 1 = Chladni plate. */
   setMode(mode: number): void;
+  /**
+   * Radial-velocity retention per step — how fast the disc sheds orbital
+   * eccentricity, which is the same thing as how cold it stays.
+   *
+   * Exposed because it is the one constant that visibly changes what kind of
+   * galaxy this is. A cold disc has a low Toomre Q and amplifies its own
+   * density contrast into strong, defined arms; a hot one cannot hold an arm
+   * together and goes smooth. Everything else in the force law changes how it
+   * behaves, this changes what it looks like.
+   */
+  setCooling?(retention: number): void;
   frame(dt: number, mx: number, my: number): void;
   resize(w: number, h: number): void;
   destroy(): void;
@@ -27,4 +38,17 @@ export interface Backend {
    * Returns a view over a reused staging buffer — copy it if you need to keep it.
    */
   readback?(offset: number, count: number): Promise<Float32Array>;
+  /**
+   * Dump the self-gravity density mesh and the force field solved from it.
+   *
+   * Present only on backends that run the mesh solver. Exists so the solver can
+   * be verified against an independent implementation instead of by eye — see
+   * the verification section of the README.
+   */
+  dumpGrid?(): Promise<{
+    dens: Uint32Array;
+    field: Float32Array;
+    grid: number;
+    massScale: number;
+  }>;
 }

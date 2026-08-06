@@ -5,9 +5,22 @@
  *
  * Ping-pong is required because a buffer cannot be both TF output and vertex
  * input in the same draw.
+ *
+ * KNOWN GAP: this path does not run the disc's self-gravity. Transform feedback
+ * has no atomics and no shared memory, so the density mesh would have to be
+ * built by additively splatting a million points into a float framebuffer and
+ * solved in a second full-screen pass — doable, and not done yet. Until it is,
+ * the fallback integrates the central mass and the cursor only, which means it
+ * is the *old* fixed-potential galaxy: it phase-mixes into a smooth featureless
+ * disc within a few seconds and stays there. Everything else here — the seeding
+ * profile, the constants, the cooling control, the framing — is kept in sync
+ * with the WGSL path so the difference is exactly the one term.
  */
 
-import type { Sim } from '../sim/world';
+import {
+  CURSOR_SOFT2, G_CORE, G_CURSOR, RADIAL_DAMP, SIGMA_FRAC, sampleRadius,
+  vCirc, type Sim,
+} from '../sim/world';
 import type { Backend } from './backend';
 
 const SIM_VS = `#version 300 es
@@ -23,6 +36,7 @@ uniform int uMode;
 uniform float uTime;
 uniform float uWarp;
 uniform float uWarpM;
+uniform float uCooling;
 
 const float PI = 3.14159265;
 const vec2 MODES[6] = vec2[6](
@@ -65,18 +79,18 @@ void main() {
   vec2 dc = -aPos;
   float dc2 = dot(dc, dc) + 0.004;
   float rc = sqrt(dc2);
-  float fc = 0.55 / (dc2 * rc) - 0.0025 / (dc2 * dc2);
+  float fc = ${G_CORE} / (dc2 * rc) - 0.0025 / (dc2 * dc2);
 
   vec2 dm = uMouse - aPos;
-  float dm2 = dot(dm, dm) + 0.02;
-  float fm = 0.10 / (dm2 * sqrt(dm2));
+  float dm2 = dot(dm, dm) + ${CURSOR_SOFT2};
+  float fm = ${G_CURSOR} / (dm2 * sqrt(dm2));
 
   vec2 v = aVel + dc * fc * uDt + dm * fm * uDt;
 
   // Radial-only damping — see webgpu.ts for why uniform damping collapses the disc.
   vec2 rdir = dc / rc;
   vec2 vRad = dot(v, rdir) * rdir;
-  v = ((v - vRad) + vRad * 0.995) * 0.99995;
+  v = ((v - vRad) + vRad * uCooling) * 0.99995;
 
   float speed = length(v);
   if (speed > 3.0) v *= 3.0 / speed;
@@ -110,6 +124,7 @@ out vec3 vTint;
 uniform float uAspect;
 uniform float uSize;
 uniform int uMask;
+uniform float uVScale;
 
 // Mirrors SPECIES_COLORS in sim/world.ts and PALETTE in webgpu.ts.
 const vec3 PALETTE[6] = vec3[6](
@@ -134,9 +149,13 @@ void main() {
 
   vSpeed = clamp(length(aVel) * 0.22, 0.0, 1.0);
   vTint = mix(PALETTE[sp], vec3(1.0, 0.95, 0.88), vSpeed * 0.3);
+  // Fit to the short side and zoom, exactly as the WGSL path does — see the
+  // vs() entry point in webgpu.ts for why position must be scaled too.
+  float fx = uVScale / max(uAspect, 1.0);
+  float fy = uVScale * min(uAspect, 1.0);
   gl_Position = vec4(
-    aPos.x + aCorner.x * uSize / uAspect,
-    aPos.y + aCorner.y * uSize,
+    (aPos.x + aCorner.x * uSize) * fx,
+    (aPos.y + aCorner.y * uSize) * fy,
     0.0, 1.0
   );
 }`;
@@ -235,6 +254,7 @@ export function createWebGL2Backend(
     uTime: gl.getUniformLocation(simProg, 'uTime'),
     uWarp: gl.getUniformLocation(simProg, 'uWarp'),
     uWarpM: gl.getUniformLocation(simProg, 'uWarpM'),
+    uCooling: gl.getUniformLocation(simProg, 'uCooling'),
   };
   const drawLoc = {
     aPos: gl.getAttribLocation(drawProg, 'aPos'),
@@ -245,6 +265,7 @@ export function createWebGL2Backend(
     uSize: gl.getUniformLocation(drawProg, 'uSize'),
     uGain: gl.getUniformLocation(drawProg, 'uGain'),
     uMask: gl.getUniformLocation(drawProg, 'uMask'),
+    uVScale: gl.getUniformLocation(drawProg, 'uVScale'),
   };
 
   const tf = gl.createTransformFeedback()!;
@@ -260,6 +281,7 @@ export function createWebGL2Backend(
   let mask = 0x3f;
   let mode = 0;
   let elapsed = 0;
+  let cooling = RADIAL_DAMP;
 
   const dbg = gl.getExtension('WEBGL_debug_renderer_info');
   const detail = dbg
@@ -281,6 +303,10 @@ export function createWebGL2Backend(
       mask = m >>> 0;
     },
 
+    setCooling(v: number) {
+      cooling = v;
+    },
+
     setMode(m: number) {
       mode = m | 0;
 
@@ -295,14 +321,19 @@ export function createWebGL2Backend(
           vel[i * 2] = 0;
           vel[i * 2 + 1] = 0;
         } else {
-          // Galaxy: re-seed the orbital disc, or the grains just rain into the core.
+          // Galaxy: re-seed the exponential disc, from the shared profile in
+          // sim/world.ts. Seeding a different distribution here than the one the
+          // force law expects is the fastest way to a galaxy with a hole in it.
           const a = Math.random() * Math.PI * 2;
-          const r = Math.sqrt(Math.random()) * 0.65;
-          const vOrb = Math.sqrt(0.55 / Math.max(r, 0.06)) * 0.94;
+          const r = sampleRadius(Math.random(), Math.random());
+          const vOrb = vCirc(r);
+          const sigma = vOrb * SIGMA_FRAC;
+          const g1 = Math.sqrt(-2 * Math.log(Math.max(1e-9, Math.random())));
+          const g2 = 2 * Math.PI * Math.random();
           pos[i * 2] = Math.cos(a) * r;
           pos[i * 2 + 1] = Math.sin(a) * r;
-          vel[i * 2] = -Math.sin(a) * vOrb;
-          vel[i * 2 + 1] = Math.cos(a) * vOrb;
+          vel[i * 2] = -Math.sin(a) * vOrb + g1 * Math.cos(g2) * sigma;
+          vel[i * 2 + 1] = Math.cos(a) * vOrb + g1 * Math.sin(g2) * sigma;
         }
       }
       for (const [buf, data] of [
@@ -322,6 +353,7 @@ export function createWebGL2Backend(
       gl.uniform1f(simLoc.uDt, dt);
       gl.uniform2f(simLoc.uMouse, mx, my);
       gl.uniform1i(simLoc.uMode, mode);
+      gl.uniform1f(simLoc.uCooling, cooling);
       elapsed += dt;
       gl.uniform1f(simLoc.uTime, elapsed);
       // Same wide frequency sweep as the WebGPU path — see webgpu.ts.
@@ -357,6 +389,7 @@ export function createWebGL2Backend(
       gl.uniform1f(drawLoc.uSize, Math.min(0.006, Math.max(0.0018, 0.06 / Math.sqrt(count))));
       gl.uniform1f(drawLoc.uGain, Math.min(1, Math.max(0.6, 200_000 / count)));
       gl.uniform1i(drawLoc.uMask, mask);
+      gl.uniform1f(drawLoc.uVScale, 1.42);
 
       bindAttrib(cornerBuf, drawLoc.aCorner, 0);
       bindAttrib(posB, drawLoc.aPos, 1);

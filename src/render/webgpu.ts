@@ -1,37 +1,80 @@
 /**
- * WebGPU backend: compute shader integrates, render pipeline draws, and both
- * bind the *same* storage buffer. The particle data never round-trips to JS
- * after upload — the CPU's only per-frame write is a 16-byte uniform.
+ * WebGPU backend: compute shaders integrate, render pipelines draw, and every
+ * stage binds the *same* storage buffer. The particle data never round-trips to
+ * JS after upload — the CPU's only per-frame write is a 64-byte uniform.
+ *
+ * Four compute dispatches per frame, in order:
+ *
+ *   clearGrid    zero the density mesh
+ *   depositMass  every particle CIC-splats its mass into the mesh (atomics)
+ *   solveField   the mesh convolves against itself to get the force field
+ *   integrate    every particle gathers that field and steps
+ *
+ * That middle pair is the self-gravity, and the reason it is affordable is that
+ * the particles never see each other. Direct particle-particle attraction is
+ * O(N^2) — at a million that is 10^12 interactions per frame, which is not a
+ * tuning problem but an arithmetic one. Here the particles talk to a GRID x GRID
+ * mesh and the mesh talks to itself, so the cost is O(N + GRID^4) with GRID
+ * fixed: linear in the population. Doubling the particle count doubles two cheap
+ * linear passes and leaves the expensive one untouched.
  */
 
-import type { Sim } from '../sim/world';
+import {
+  CURSOR_SOFT2, GRID, G_CORE, G_CURSOR, H_DISC, M_DISC, RADIAL_DAMP, R_DISC,
+  SIGMA_FRAC, SOFT_CELLS, type Sim,
+} from '../sim/world';
 import { READBACK_MAX, type Backend } from './backend';
 
 const WORKGROUP = 64;
+const CELLS = GRID * GRID;
+
 
 const SHADER = /* wgsl */ `
 struct Params {
-  dt     : f32,
-  mx     : f32,
-  my     : f32,
-  aspect : f32,
-  size   : f32,
-  gain   : f32,
-  mask   : u32,
-  mode   : u32,
-  time   : f32,
-  warpN  : f32,
-  warpM  : f32,
-  _pad0  : f32,
+  dt        : f32,
+  mx        : f32,
+  my        : f32,
+  aspect    : f32,
+  size      : f32,
+  gain      : f32,
+  mask      : u32,
+  mode      : u32,
+  time      : f32,
+  warpN     : f32,
+  warpM     : f32,
+  fpScale   : f32,
+  massScale : f32,
+  exposure  : f32,
+  vscale    : f32,
+  // Live particle count, so the deposit pass never walks past the live
+  // population into the unused tail of the buffer when ?n= is below capacity.
+  pcount    : f32,
+  // Radial-velocity retention per step — the disc's cooling rate, driven live
+  // from the UI. See sim/world.ts RADIAL_DAMP for what it physically is.
+  rdamp     : f32,
+  _pad0     : f32,
+  _pad1     : f32,
+  _pad2     : f32,
 };
 
-// Primary attractor strength. Fixed at the origin -- see the integrate entry
-// point. (No backticks in here: this block lives inside a JS template literal.)
-const G_CORE = 0.55;
+// Central bulge + halo. Fixed at the origin -- see the integrate entry point.
+// (No backticks in here: this block lives inside a JS template literal.)
+const G_CORE = ${G_CORE};
+// Total self-gravitating mass of the disc. Mirrors M_DISC in sim/world.ts.
+const M_DISC = ${M_DISC};
+const R_DISC = ${R_DISC};
+const H_DISC = ${H_DISC};
+const SIGMA_FRAC = ${SIGMA_FRAC};
 // Cursor mass, deliberately a fraction of the core so it perturbs, not destroys.
-const G_CURSOR = 0.10;
+// Mirrors G_CURSOR in sim/world.ts -- see there for why it is this small.
+const G_CURSOR = ${G_CURSOR};
+const CURSOR_SOFT2 = ${CURSOR_SOFT2};
 // Terminal speed. Without it a close cursor pass flings grains off to infinity.
 const V_MAX = 3.0;
+
+const GRID = ${GRID}u;
+const GRIDF = ${GRID}.0;
+const CELLS = ${CELLS}u;
 
 // Per-species (n, m) offsets from the cursor-driven base frequency. Each species
 // settles onto the nodal lines of its own standing wave, so six figures resolve
@@ -68,6 +111,49 @@ const PALETTE = array<vec3<f32>, 6>(
 @group(0) @binding(0) var<storage, read_write> parts : array<vec4<f32>>;
 @group(0) @binding(1) var<uniform> params : Params;
 @group(0) @binding(2) var<storage, read> cspecies : array<u32>;
+// Density mesh. Fixed-point u32 because WGSL has no atomic float -- see fpScale.
+@group(0) @binding(3) var<storage, read_write> dens : array<atomic<u32>>;
+// Acceleration field, one vector per cell, written by solveField.
+@group(0) @binding(4) var<storage, read_write> field : array<vec2<f32>>;
+// The same mesh as plain f32, baked once per frame -- see bakeGrid.
+@group(0) @binding(5) var<storage, read_write> cellMass : array<f32>;
+
+/** Centre of cell c in simulation space, which is the unit box [-1, 1]. */
+fn cellCentre(c : u32) -> vec2<f32> {
+  let g = vec2<f32>(f32(c % GRID), f32(c / GRID));
+  return (g + 0.5) / GRIDF * 2.0 - 1.0;
+}
+
+/** Continuous grid coordinate of a point, with cell centres on integers. */
+fn gridCoord(p : vec2<f32>) -> vec2<f32> {
+  return (p + 1.0) * 0.5 * GRIDF - 0.5;
+}
+
+/** Radial acceleration factor from the central mass. Mirrors coreF() in
+ *  sim/world.ts; used by both the integrator and the seeding below. */
+fn coreF(q : f32) -> f32 {
+  return G_CORE / (q * sqrt(q)) - 0.0025 / (q * q);
+}
+
+/**
+ * Circular-orbit speed under the force law actually integrated. Mirrors vCirc()
+ * in sim/world.ts -- see there for why this is not sqrt(G/r), and why getting it
+ * wrong punches a visible hole through the middle of the galaxy.
+ */
+fn vCirc(r : f32) -> f32 {
+  let q = r * r + 0.004;
+  let x = r / H_DISC;
+  let enclosed = M_DISC * (1.0 - (1.0 + x) * exp(-x));
+  let disc = enclosed / pow(r * r + ${(SOFT_CELLS * (2 / GRID)) ** 2}, 1.5);
+  return r * sqrt(max(0.0, coreF(q) + disc));
+}
+
+/** Exponential-disc radius from two uniforms. Mirrors sampleRadius() in
+ *  sim/world.ts -- a Gamma(2,1) is the sum of two exponentials. */
+fn sampleRadius(u1 : f32, u2 : f32) -> f32 {
+  let r = -H_DISC * (log(max(1e-9, u1)) + log(max(1e-9, u2)));
+  return clamp(r, 0.01, 1.1);
+}
 
 /**
  * Chladni plate. Particles descend |w| toward the nodal lines of a standing
@@ -111,6 +197,149 @@ fn chladni(i : u32, p : vec4<f32>, dt : f32) -> vec4<f32> {
   return vec4<f32>(pos, vel);
 }
 
+// --- self-gravity: three passes over a GRID x GRID mesh ----------------------
+
+@compute @workgroup_size(${WORKGROUP})
+fn clearGrid(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let c = gid.x;
+  if (c >= CELLS) { return; }
+  atomicStore(&dens[c], 0u);
+}
+
+/**
+ * Deposit every particle's mass into the mesh, cloud-in-cell.
+ *
+ * CIC splits each particle across the four cells nearest it, weighted by
+ * distance, rather than dropping it whole into the one it happens to sit in.
+ * That is the accurate choice — nearest-cell deposition makes a particle's force
+ * contribution jump discontinuously as it drifts over a cell boundary, and a
+ * million particles each jittering at the grid scale is a permanent noise floor
+ * under exactly the faint arm structure this exists to expose.
+ *
+ * It is also, unexpectedly, the *fast* choice. Measured at 1M on a Gen-9 iGPU,
+ * nearest-cell at one atomic per particle cost 8.6 ms; cloud-in-cell at four
+ * cost 3.4 ms. Four times the atomic operations, two and a half times faster.
+ *
+ * The reason is that this pass is bound by contention, not by throughput. An
+ * exponential disc drops an enormous share of the population into a handful of
+ * central cells, and atomics against one address serialise. Nearest-cell aims
+ * every one of those particles at a single cell; CIC spreads each across four,
+ * which divides the queue. Nothing about the instruction count predicts this,
+ * and it is why the grid resolution was chosen by measurement (see solveField).
+ *
+ * Accumulating into a private per-workgroup tile first — the textbook fix for
+ * atomic contention — was tried and reverted. It does cut global atomic traffic
+ * by well over an order of magnitude, but it also collapses a million
+ * independent threads into sixty-odd workgroups that each clear and flush a
+ * 4096-cell tile, and the lost parallelism costs more than the contention did:
+ * 4.0 ms against 3.4 ms. The contention here is apparently already being
+ * absorbed by the cache hierarchy about as well as on-chip storage would.
+ *
+ * Fixed point because WGSL has no atomic<f32>. fpScale is chosen on the CPU so
+ * that count * fpScale cannot overflow u32 even in the degenerate case where
+ * every particle lands in the same cell.
+ */
+@compute @workgroup_size(${WORKGROUP})
+fn depositMass(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= u32(params.pcount)) { return; }
+
+  let g = gridCoord(parts[i].xy);
+  let base = floor(g);
+  let f = g - base;
+
+  for (var dy = 0u; dy < 2u; dy++) {
+    let jy = clamp(i32(base.y) + i32(dy), 0, i32(GRID) - 1);
+    let wy = select(1.0 - f.y, f.y, dy == 1u);
+    for (var dx = 0u; dx < 2u; dx++) {
+      let jx = clamp(i32(base.x) + i32(dx), 0, i32(GRID) - 1);
+      let w = select(1.0 - f.x, f.x, dx == 1u) * wy;
+      atomicAdd(&dens[u32(jy) * GRID + u32(jx)], u32(w * params.fpScale + 0.5));
+    }
+  }
+}
+
+/**
+ * Convert the atomic fixed-point mesh into plain floats, once, before the
+ * convolution reads it 4096 times over.
+ *
+ * This pass looks redundant and is not. Atomic loads are not ordinary loads:
+ * on most hardware they are serviced coherently and bypass the caches that make
+ * a broadcast read of the same address across a whole wave nearly free. The
+ * convolution's inner loop reads every cell once per target cell, so doing it
+ * atomically means 16.7 million uncached reads. Baking to a normal array first
+ * costs 4096 atomic loads total and lets the hot loop hit cache.
+ */
+@compute @workgroup_size(${WORKGROUP})
+fn bakeGrid(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let c = gid.x;
+  if (c >= CELLS) { return; }
+  cellMass[c] = f32(atomicLoad(&dens[c])) * params.massScale;
+}
+
+/**
+ * Convolve the mesh against itself: the acceleration at every cell from the
+ * mass in every other cell.
+ *
+ * This is the one genuinely quadratic step, and it is quadratic in *cells*, not
+ * particles -- 4096 targets x 4096 sources, fixed forever regardless of whether
+ * the population is ten thousand or ten million. Done directly rather than
+ * through an FFT or a relaxation solver for one specific reason: boundary
+ * conditions. A galaxy sits in empty space, and both an FFT and a Jacobi/
+ * multigrid solve want a boundary condition at the edge of the box that empty
+ * space does not supply -- periodic wrapping makes the disc feel copies of
+ * itself, and a Dirichlet edge needs a multipole expansion to be honest. Summing
+ * the pairs directly has open boundaries built in, needs no solver, cannot fail
+ * to converge, and is about forty lines. At this grid size it is affordable, so
+ * it wins.
+ *
+ * The empty-cell skip is not a micro-optimisation. A galaxy occupies maybe a
+ * third of the box, and every thread in a workgroup walks the source cells in
+ * the same order, so the branch is uniform across the wave -- no divergence, and
+ * the loop simply gets shorter.
+ */
+@compute @workgroup_size(${WORKGROUP})
+fn solveField(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let t = gid.x;
+  if (t >= CELLS) { return; }
+
+  let tp = cellCentre(t);
+  var a = vec2<f32>(0.0, 0.0);
+
+  for (var s = 0u; s < CELLS; s++) {
+    let m = cellMass[s];
+    if (m == 0.0) { continue; }
+    let d = cellCentre(s) - tp;
+    // Softened, and the softening length is the reason the mesh is stable: a
+    // bare 1/r^2 between neighbouring cells would let a single dense cell fling
+    // its neighbours away rather than pull the disc together.
+    let q = dot(d, d) + ${(SOFT_CELLS * (2 / GRID)) ** 2};
+    a += d * (m / (q * sqrt(q)));
+  }
+
+  field[t] = a;
+}
+
+/** Bilinear gather of the acceleration field at an arbitrary point. Matches the
+ *  CIC deposit above, which is what makes the scheme conserve momentum. */
+fn sampleField(p : vec2<f32>) -> vec2<f32> {
+  let g = gridCoord(p);
+  let base = floor(g);
+  let f = g - base;
+
+  var a = vec2<f32>(0.0, 0.0);
+  for (var dy = 0u; dy < 2u; dy++) {
+    let jy = clamp(i32(base.y) + i32(dy), 0, i32(GRID) - 1);
+    let wy = select(1.0 - f.y, f.y, dy == 1u);
+    for (var dx = 0u; dx < 2u; dx++) {
+      let jx = clamp(i32(base.x) + i32(dx), 0, i32(GRID) - 1);
+      let w = select(1.0 - f.x, f.x, dx == 1u) * wy;
+      a += field[u32(jy) * GRID + u32(jx)] * w;
+    }
+  }
+  return a;
+}
+
 /**
  * Uniformly redistribute the population. Dispatched once when entering Chladni
  * mode: the plate has to start as evenly spread sand. Arriving from the galaxy
@@ -137,9 +366,18 @@ fn scatter(@builtin(global_invocation_id) gid : vec3<u32>) {
   // leave a million grains sitting on nodal lines with zero angular momentum,
   // and they would simply rain into the core.
   let a = hash(i * 3u) * 6.2831853;
-  let r = sqrt(hash(i * 3u + 1u)) * 0.65;
-  let vOrb = sqrt(G_CORE / max(r, 0.06)) * 0.94;
-  parts[i] = vec4<f32>(cos(a) * r, sin(a) * r, -sin(a) * vOrb, cos(a) * vOrb);
+  let r = sampleRadius(hash(i * 3u + 1u), hash(i * 5u + 17u));
+  let vOrb = vCirc(r);
+  // Box-Muller, from two more hashes. A cold disc fragments instead of forming
+  // arms -- see SIGMA_FRAC in sim/world.ts.
+  let g1 = sqrt(-2.0 * log(max(1e-9, hash(i * 3u + 2u))));
+  let g2 = 6.2831853 * hash(i * 7u + 13u);
+  parts[i] = vec4<f32>(
+    cos(a) * r,
+    sin(a) * r,
+    -sin(a) * vOrb + g1 * cos(g2) * vOrb * SIGMA_FRAC,
+    cos(a) * vOrb + g1 * sin(g2) * vOrb * SIGMA_FRAC
+  );
 }
 
 @compute @workgroup_size(${WORKGROUP})
@@ -155,7 +393,7 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
     return;
   }
 
-  // Primary: fixed at the origin. This is what holds the disc together.
+  // Central mass: bulge plus halo, fixed at the origin.
   //
   // An earlier revision made the *cursor* the only attractor. Moving it broke
   // every orbit simultaneously and the disc detonated into uniform static, with
@@ -165,17 +403,21 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   let dc = -p.xy;
   let dc2 = dot(dc, dc) + 0.004;
   let rc = sqrt(dc2);
-  // Attraction minus a short-range repulsive core. Without the second term the
-  // whole population collapses to a single point.
-  let fc = G_CORE / (dc2 * rc) - 0.0025 / (dc2 * dc2);
+  let fc = coreF(dc2);
+
+  // The disc's own gravity, gathered from the mesh the first three passes built.
+  // This is the term that makes structure possible: it is the only one that
+  // depends on where the other particles actually are this frame, so it is the
+  // only one that can respond to an overdensity and amplify it into an arm.
+  let sg = sampleField(p.xy);
 
   // Secondary: the cursor. Softened harder so a direct hit shears rather than
   // slingshots.
   let dm = vec2<f32>(params.mx - p.x, params.my - p.y);
-  let dm2 = dot(dm, dm) + 0.02;
+  let dm2 = dot(dm, dm) + CURSOR_SOFT2;
   let fm = G_CURSOR / (dm2 * sqrt(dm2));
 
-  var v = p.zw + dc * fc * dt + dm * fm * dt;
+  var v = p.zw + dc * fc * dt + sg * dt + dm * fm * dt;
 
   // Damp the RADIAL component only.
   //
@@ -187,7 +429,7 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   // actively re-forms after the cursor stirs it, rather than staying wrecked.
   let rdir = dc / rc;
   let vRad = dot(v, rdir) * rdir;
-  v = (v - vRad) + vRad * 0.995;
+  v = (v - vRad) + vRad * params.rdamp;
 
   // Whisper of global damping purely to bound energy the moving cursor injects.
   v = v * 0.99995;
@@ -245,9 +487,28 @@ fn vs(@builtin(vertex_index) vi : u32, @builtin(instance_index) ii : u32) -> VSO
     return out;
   }
 
+  // Fit the simulation to the *short* side of the viewport, and apply the same
+  // factor to the position as to the sprite.
+  //
+  // The previous version divided only the sprite by aspect and wrote the
+  // position straight to clip space, which stretches the whole simulation to
+  // fill the window: a circular orbit draws as an ellipse, and on a wide monitor
+  // the galaxy reads as something squashed rather than something seen face-on.
+  // Choosing the limiting dimension rather than always dividing by aspect
+  // matters too, or a portrait window overflows the disc off both sides instead.
+  //
+  // vscale then zooms in. Fitting the *box* to the short side is correct and
+  // looks wrong: the simulation box runs to +-1 but the disc only reaches about
+  // 0.7, so a correct fit frames the galaxy inside a wide empty margin. Zooming
+  // by the ratio between them fills the frame without reintroducing any
+  // distortion -- the few particles thrown past the edge are clipped, which is
+  // the right trade for not framing mostly-empty space.
+  let s = rparams.vscale;
+  let fx = s / max(rparams.aspect, 1.0);
+  let fy = s * min(rparams.aspect, 1.0);
   out.pos = vec4<f32>(
-    p.x + corner.x * size / rparams.aspect,
-    p.y + corner.y * size,
+    (p.x + corner.x * size) * fx,
+    (p.y + corner.y * size) * fy,
     0.0, 1.0
   );
   out.uv = corner;
@@ -265,10 +526,98 @@ fn fs(in : VSOut) -> @location(0) vec4<f32> {
   if (r > 1.0) { discard; }
   let a = (1.0 - r) * (1.0 - r);
 
-  // Additive blending sums every overlapping particle. At a million of them the
-  // core saturates to flat white unless per-particle contribution scales down
-  // with population — gain is set from the live count on the CPU side.
+  // Additive, into a 16-bit float target. The target format is the point: this
+  // sum is unbounded and genuinely reaches into the tens, so an 8-bit
+  // attachment clips it. gain now only normalises for population size, keeping
+  // total deposited light constant as the count changes; it no longer has to
+  // double as a saturation guard, which is what used to force it so low that
+  // the arms went dark before the core stopped being white.
   return vec4<f32>(in.tint * a * rparams.gain, a * rparams.gain);
+}
+
+// --- tonemap -----------------------------------------------------------------
+
+/**
+ * Fullscreen pass, HDR accumulation buffer to the swap chain.
+ *
+ * This exists because the old renderer had a hard ceiling that had nothing to do
+ * with the physics. Each particle deposited about 0.196 of alpha at the 1M gain
+ * floor, the disc averaged ~3.9 particles per pixel, so the *mean* of the galaxy
+ * sat at 0.77 of full white and the inner disc ran roughly eight times over it.
+ * Past that point every pixel reads 1.0 and density stops being visible at all:
+ * structure and no structure look identical. Fixing the simulation alone would
+ * not have made a single extra arm visible.
+ *
+ * The curve is 1 - exp(-x), which has no ceiling to hit -- it maps [0, inf) into
+ * [0, 1) and simply compresses harder as it climbs. Applied per channel, so a
+ * region bright enough to saturate one channel keeps rendering detail in the
+ * others and the core rolls off through its own hue toward white instead of
+ * clamping flat, which is also what an overexposed bright source really does.
+ */
+struct TMOut {
+  @builtin(position) pos : vec4<f32>,
+  @location(0) uv : vec2<f32>,
+};
+
+@vertex
+fn tmVs(@builtin(vertex_index) vi : u32) -> TMOut {
+  // One oversized triangle rather than two quad triangles: no seam down the
+  // diagonal, and three vertices instead of six.
+  let p = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -3.0), vec2<f32>(-1.0, 1.0), vec2<f32>( 3.0, 1.0)
+  );
+  var o : TMOut;
+  o.pos = vec4<f32>(p[vi], 0.0, 1.0);
+  o.uv = p[vi];
+  return o;
+}
+
+@group(0) @binding(0) var hdr : texture_2d<f32>;
+@group(0) @binding(1) var<uniform> tparams : Params;
+
+@fragment
+fn tmFs(in : TMOut) -> @location(0) vec4<f32> {
+  let c = textureLoad(hdr, vec2<i32>(in.pos.xy), 0).rgb;
+
+  // Tonemap the *luminance* and carry the chroma through unchanged, rather than
+  // curving each channel on its own.
+  //
+  // Per-channel is the obvious version and it quietly destroys the palette. Six
+  // species are only distinguishable by their ratios between channels, and any
+  // curve applied independently to each one compresses the largest channel
+  // hardest -- so the ratios flatten exactly where the disc is densest and every
+  // bright region converges on white regardless of what colour it started. That
+  // is most of why the old renderer had six colours and showed one. Scaling all
+  // three by a single factor moves brightness without touching hue at all.
+  let l = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+  // Reinhard, x / (1 + x), rather than 1 - exp(-x).
+  //
+  // An exponential disc spans a genuinely enormous range: the core is orders of
+  // magnitude denser than the arms, which is the whole reason it looks like a
+  // galaxy. 1 - exp(-x) is effectively saturated by x = 5, so any exposure that
+  // lifted the arms out of the noise flattened the entire core to a white disc.
+  // Reinhard never saturates -- it is still returning distinguishable values at
+  // x = 100 -- so the core keeps its internal structure while the arms stay lit.
+  let e = l * tparams.exposure;
+  let lm = e / (1.0 + e);
+  var mapped = c * (lm / max(l, 1e-6));
+
+  // One concession: at the very top the ratio-preserving form can push a channel
+  // past 1.0, which clips and shifts the hue anyway. Fading toward neutral over
+  // the last stop keeps the genuinely overexposed core rolling off to white --
+  // which is what an overexposed source does -- without touching anything below.
+  mapped = mix(mapped, vec3<f32>(lm), smoothstep(0.75, 1.0, lm));
+
+  // Background sits underneath rather than being cleared into the accumulation
+  // buffer, so it never participates in the tonemap and the darkest particle
+  // still lifts off it.
+  let bg = vec3<f32>(0.027, 0.035, 0.051);
+  let lit = bg + clamp(mapped, vec3<f32>(0.0), vec3<f32>(1.0)) * (1.0 - bg);
+
+  // The swap chain is a plain unorm format, so the sRGB transfer is ours to
+  // apply. Without it the whole image is roughly a stop and a half too dark and
+  // every mid-tone is crushed.
+  return vec4<f32>(pow(lit, vec3<f32>(1.0 / 2.2)), 1.0);
 }
 `;
 
@@ -302,14 +651,36 @@ export async function createWebGPUBackend(
   device.queue.writeBuffer(particleBuf, 0, sim.particles);
 
   const paramBuf = device.createBuffer({
-    size: 48,
+    size: 80,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  // Reused every frame; the only per-frame CPU->GPU traffic in the demo (32 bytes).
+  // Reused every frame; the only per-frame CPU->GPU traffic in the demo (80 bytes).
   // Two views over one buffer because `mask` is a u32 among f32s.
-  const paramBytes = new ArrayBuffer(48);
+  const paramBytes = new ArrayBuffer(80);
   const paramData = new Float32Array(paramBytes);
   const paramU32 = new Uint32Array(paramBytes);
+
+  // The density mesh and the force field derived from it. Both are tiny —
+  // 4096 cells is 16 kB and 32 kB — and neither is ever read by the CPU.
+  const densBuf = device.createBuffer({
+    size: CELLS * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+  const fieldBuf = device.createBuffer({
+    size: CELLS * 8,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+  const cellMassBuf = device.createBuffer({
+    size: CELLS * 4,
+    usage: GPUBufferUsage.STORAGE,
+  });
+  // Its own staging buffer, deliberately not shared with the particle readback:
+  // the sidebar holds that one mapped most of the time, and a second mapAsync
+  // against a buffer with one outstanding is an immediate OperationError.
+  const gridStaging = device.createBuffer({
+    size: CELLS * 12,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
 
   // Species ids, uploaded once and never touched again. u32 rather than u8:
   // WGSL storage arrays have no 8-bit element type.
@@ -323,6 +694,7 @@ export async function createWebGPUBackend(
 
   let mask = (1 << 6) - 1;
   let mode = 0;
+  let cooling = RADIAL_DAMP;
   let elapsed = 0;
   let pendingScatter = false;
 
@@ -337,6 +709,24 @@ export async function createWebGPUBackend(
 
   const module = device.createShaderModule({ code: SHADER });
 
+  // Surface WGSL diagnostics with line numbers.
+  //
+  // Without this a shader that fails to compile produces only
+  // "Invalid ComputePipeline ... due to a previous error" on every subsequent
+  // submit — which names neither the entry point nor the line, and buries the
+  // one message that does under a hundred frames of consequences.
+  {
+    const info = await module.getCompilationInfo();
+    for (const m of info.messages) {
+      if (m.type === 'info') continue;
+      const where = `${m.lineNum}:${m.linePos}`;
+      const line = SHADER.split('\n')[m.lineNum - 1]?.trim() ?? '';
+      (m.type === 'error' ? console.error : console.warn)(
+        `[wgsl ${where}] ${m.message}\n  ${line}`,
+      );
+    }
+  }
+
   const computeLayout = device.createBindGroupLayout({
     entries: [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
@@ -346,6 +736,9 @@ export async function createWebGPUBackend(
         visibility: GPUShaderStage.COMPUTE,
         buffer: { type: 'read-only-storage' },
       },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     ],
   });
   const renderLayout = device.createBindGroupLayout({
@@ -367,15 +760,20 @@ export async function createWebGPUBackend(
     ],
   });
 
-  const computePipeline = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [computeLayout] }),
-    compute: { module, entryPoint: 'integrate' },
-  });
+  const computeLayoutDesc = device.createPipelineLayout({ bindGroupLayouts: [computeLayout] });
+  const mkCompute = (entryPoint: string) =>
+    device.createComputePipeline({ layout: computeLayoutDesc, compute: { module, entryPoint } });
 
-  const scatterPipeline = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [computeLayout] }),
-    compute: { module, entryPoint: 'scatter' },
-  });
+  const computePipeline = mkCompute('integrate');
+  const scatterPipeline = mkCompute('scatter');
+  const clearPipeline = mkCompute('clearGrid');
+  const depositPipeline = mkCompute('depositMass');
+  const bakePipeline = mkCompute('bakeGrid');
+  const solvePipeline = mkCompute('solveField');
+
+  // Particles accumulate here, not in the swap chain. rgba16float is blendable
+  // in WebGPU and gives the additive sum somewhere to go above 1.0.
+  const HDR_FORMAT: GPUTextureFormat = 'rgba16float';
 
   const renderPipeline = device.createRenderPipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renderLayout] }),
@@ -385,7 +783,7 @@ export async function createWebGPUBackend(
       entryPoint: 'fs',
       targets: [
         {
-          format,
+          format: HDR_FORMAT,
           // Additive: overlapping particles bloom instead of occluding.
           blend: {
             color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
@@ -397,12 +795,50 @@ export async function createWebGPUBackend(
     primitive: { topology: 'triangle-list' },
   });
 
+  const tonemapLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float' } },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+    ],
+  });
+
+  const tonemapPipeline = device.createRenderPipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [tonemapLayout] }),
+    vertex: { module, entryPoint: 'tmVs' },
+    fragment: { module, entryPoint: 'tmFs', targets: [{ format }] },
+    primitive: { topology: 'triangle-list' },
+  });
+
+  // Recreated on resize; the bind group has to follow the texture it points at.
+  let hdrTex: GPUTexture | null = null;
+  let tonemapBind: GPUBindGroup | null = null;
+
+  function allocHdr(w: number, h: number) {
+    hdrTex?.destroy();
+    hdrTex = device.createTexture({
+      size: { width: Math.max(1, w), height: Math.max(1, h) },
+      format: HDR_FORMAT,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    tonemapBind = device.createBindGroup({
+      layout: tonemapLayout,
+      entries: [
+        { binding: 0, resource: hdrTex.createView() },
+        { binding: 1, resource: { buffer: paramBuf } },
+      ],
+    });
+  }
+  allocHdr(canvas.width, canvas.height);
+
   const computeBind = device.createBindGroup({
     layout: computeLayout,
     entries: [
       { binding: 0, resource: { buffer: particleBuf } },
       { binding: 1, resource: { buffer: paramBuf } },
       { binding: 2, resource: { buffer: speciesBuf } },
+      { binding: 3, resource: { buffer: densBuf } },
+      { binding: 4, resource: { buffer: fieldBuf } },
+      { binding: 5, resource: { buffer: cellMassBuf } },
     ],
   });
   const renderBind = device.createBindGroup({
@@ -433,22 +869,32 @@ export async function createWebGPUBackend(
       pendingScatter = true;
     },
 
+    setCooling(v: number) {
+      cooling = v;
+    },
+
     frame(dt: number, mx: number, my: number) {
       paramData[0] = dt;
       paramData[1] = mx;
       paramData[2] = my;
       paramData[3] = canvas.width / canvas.height;
-      // Keep total deposited energy roughly constant as count varies, so 10k and
-      // 1M are both legible rather than invisible and blown out respectively.
-      // Floor the size at roughly one physical pixel — below that the quad falls
-      // between sample points and the population renders as nothing at all.
-      // Per-particle deposited energy goes as size^2 * gain. Tuned by measurement:
-      // size 0.0035 / gain 1.0 saturates to flat white at 1M, size 0.0013 / gain
-      // 0.2 is invisible. These floors sit ~1/6 of saturation.
+      // Sprite half-width, in simulation units. Floored at roughly one physical
+      // pixel — below that the quad falls between sample points and the
+      // population renders as nothing at all.
+      //
+      // Held at 0.0018 deliberately. size is in simulation units and vscale
+      // multiplies it, so each particle covers roughly a 2.2-pixel radius and a
+      // million of them is ~13 million shaded fragments a frame — an obvious
+      // place to look for the frame budget. Measured, dropping to 0.0012
+      // returned 0.7 ms and visibly thinned the arms from ribbons to wisps.
+      // The overdraw is not where the time is going (see the notes on the mesh
+      // solver), so this stays at the value that renders arms with body to them.
       paramData[4] = Math.min(0.006, Math.max(0.0018, 0.06 / Math.sqrt(count)));
-      // Lower than you would guess: the galaxy core reaches very high overdraw,
-      // and additive blending clips to white there long before the arms are lit.
-      paramData[5] = Math.min(1, Math.max(0.3, 120_000 / count));
+      // Purely a normalisation now: total light deposited across the frame is
+      // held constant as the population changes, and the tonemap decides how
+      // bright that ends up looking. The old value was clamped at 0.3 because it
+      // also had to stop the core clipping, which it could not actually do.
+      paramData[5] = 60_000 / count;
       paramU32[6] = mask;
       paramU32[7] = mode;
       elapsed += dt;
@@ -465,28 +911,66 @@ export async function createWebGPUBackend(
         paramData[9] = 0;
         paramData[10] = 0;
       }
+      // Fixed-point scale for the atomic mass deposit, chosen so that the total
+      // cannot overflow u32 even if every particle lands in one cell.
+      const fpScale = Math.min(4096, Math.floor(3.9e9 / Math.max(1, count)));
+      paramData[11] = fpScale;
+      // Converts a raw fixed-point cell total back into simulation mass.
+      paramData[12] = M_DISC / (count * fpScale);
+      // Tonemap exposure. Set from the arithmetic rather than by eye: each
+      // particle deposits about `gain * 0.2` of light and the disc averages a
+      // few particles per pixel, which puts the mean of the image near 0.05 in
+      // the accumulation buffer. Under Reinhard that wants an exposure around 8
+      // to land the mid-disc near a third and leave the core room to climb
+      // without clipping.
+      paramData[13] = 8;
+      // Fills the frame with the disc rather than with the empty corners of the
+      // simulation box. See the vertex shader.
+      paramData[14] = 1.42;
+      paramData[15] = count;
+      paramData[16] = cooling;
       device.queue.writeBuffer(paramBuf, 0, paramBytes);
 
       const enc = device.createCommandEncoder();
 
       const groups = Math.ceil(count / WORKGROUP);
+      const cellGroups = Math.ceil(CELLS / WORKGROUP);
       const cpass = enc.beginComputePass();
+      cpass.setBindGroup(0, computeBind);
       if (pendingScatter) {
         pendingScatter = false;
         cpass.setPipeline(scatterPipeline);
-        cpass.setBindGroup(0, computeBind);
         cpass.dispatchWorkgroups(groups);
       }
+      // Self-gravity, galaxy mode only — the Chladni plate is a prescribed
+      // field and the particles there are not supposed to see each other at all.
+      //
+      // Dispatches inside one compute pass are ordered and their writes are
+      // visible to the next, so these four need no explicit barrier: the mesh
+      // is fully deposited before it is solved, and fully solved before it is
+      // sampled.
+      if (mode === 0) {
+        cpass.setPipeline(clearPipeline);
+        cpass.dispatchWorkgroups(cellGroups);
+        cpass.setPipeline(depositPipeline);
+        cpass.dispatchWorkgroups(groups);
+        cpass.setPipeline(bakePipeline);
+        cpass.dispatchWorkgroups(cellGroups);
+        cpass.setPipeline(solvePipeline);
+        cpass.dispatchWorkgroups(cellGroups);
+      }
       cpass.setPipeline(computePipeline);
-      cpass.setBindGroup(0, computeBind);
       cpass.dispatchWorkgroups(groups);
       cpass.end();
 
+      // Pass 1: accumulate into HDR. Cleared to zero, not to the background
+      // colour — the background is added after the tonemap so it does not get
+      // compressed along with the particles.
       const rpass = enc.beginRenderPass({
         colorAttachments: [
           {
-            view: ctx.getCurrentTexture().createView(),
-            clearValue: { r: 0.027, g: 0.035, b: 0.051, a: 1 },
+            view: hdrTex!.createView(),
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
             loadOp: 'clear',
             storeOp: 'store',
           },
@@ -497,12 +981,29 @@ export async function createWebGPUBackend(
       rpass.draw(6, count);
       rpass.end();
 
+      // Pass 2: tonemap to the swap chain.
+      const tpass = enc.beginRenderPass({
+        colorAttachments: [
+          {
+            view: ctx.getCurrentTexture().createView(),
+            loadOp: 'clear',
+            clearValue: { r: 0, g: 0, b: 0, a: 1 },
+            storeOp: 'store',
+          },
+        ],
+      });
+      tpass.setPipeline(tonemapPipeline);
+      tpass.setBindGroup(0, tonemapBind!);
+      tpass.draw(3);
+      tpass.end();
+
       device.queue.submit([enc.finish()]);
     },
 
     resize(w: number, h: number) {
       canvas.width = w;
       canvas.height = h;
+      allocHdr(w, h);
     },
 
     async readback(offset: number, n: number) {
@@ -521,11 +1022,37 @@ export async function createWebGPUBackend(
       return scratchView.subarray(0, want * 4);
     },
 
+    /**
+     * Dump the density mesh and the acceleration field derived from it.
+     *
+     * Not used by the demo — it exists so the self-gravity solver can be checked
+     * against an independent implementation rather than against how it looks.
+     * `dens` comes back in raw fixed-point units; multiply by `massScale`.
+     */
+    async dumpGrid() {
+      const enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(densBuf, 0, gridStaging, 0, CELLS * 4);
+      enc.copyBufferToBuffer(fieldBuf, 0, gridStaging, CELLS * 4, CELLS * 8);
+      device.queue.submit([enc.finish()]);
+
+      await gridStaging.mapAsync(GPUMapMode.READ);
+      const raw = gridStaging.getMappedRange();
+      const dens = new Uint32Array(raw.slice(0, CELLS * 4));
+      const field = new Float32Array(raw.slice(CELLS * 4, CELLS * 12));
+      gridStaging.unmap();
+      return { dens, field, grid: GRID, massScale: paramData[12] };
+    },
+
     destroy() {
       particleBuf.destroy();
       paramBuf.destroy();
       speciesBuf.destroy();
+      densBuf.destroy();
+      fieldBuf.destroy();
+      cellMassBuf.destroy();
       staging.destroy();
+      gridStaging.destroy();
+      hdrTex?.destroy();
       device.destroy();
     },
   };

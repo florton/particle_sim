@@ -16,6 +16,7 @@
 
 import {
   integrateCPU,
+  RADIAL_DAMP,
   integrateChladniCPU,
   chladniWarp,
   reseed,
@@ -30,6 +31,7 @@ export const BASELINE_COUNT = 5_000;
 const BASELINE_ROWS = 400;
 
 export class BaselineArm {
+  private cooling = RADIAL_DAMP;
   private layer: HTMLElement;
   private nodes: HTMLElement[] = [];
   private listHost: HTMLElement;
@@ -92,6 +94,11 @@ export class BaselineArm {
   }
 
   /** Re-seed for the mode being compared, so both arms start from like states. */
+  /** Mirrors the GPU arm's cooling control, so the two stay comparable. */
+  setCooling(v: number) {
+    this.cooling = v;
+  }
+
   setMode(mode: number) {
     this.mode = mode;
     this.elapsed = 0;
@@ -108,7 +115,7 @@ export class BaselineArm {
       const { n, m } = chladniWarp(mx, my, this.elapsed);
       integrateChladniCPU(this.sim, dt, n, m, this.elapsed);
     } else {
-      integrateCPU(this.sim, dt, mx, my);
+      integrateCPU(this.sim, dt, mx, my, this.cooling);
     }
     this.sim.count = saved;
 
