@@ -15,6 +15,12 @@ export interface Backend {
   setSpeciesMask(mask: number): void;
   /** 0 = orbital galaxy, 1 = Chladni plate. */
   setMode(mode: number): void;
+  /**
+   * Mass of the cursor secondary, in units of the core. Held pointer = heavy
+   * enough to raise real tidal tails; released = a light perturber the disc can
+   * recover from. Set on pointer transitions, not per frame.
+   */
+  setCursorMass(m: number): void;
   frame(dt: number, mx: number, my: number): void;
   resize(w: number, h: number): void;
   destroy(): void;

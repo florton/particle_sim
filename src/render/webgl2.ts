@@ -7,7 +7,7 @@
  * input in the same draw.
  */
 
-import type { Sim } from '../sim/world';
+import { G_CURSOR, type Sim } from '../sim/world';
 import type { Backend } from './backend';
 
 const SIM_VS = `#version 300 es
@@ -23,6 +23,7 @@ uniform int uMode;
 uniform float uTime;
 uniform float uWarp;
 uniform float uWarpM;
+uniform float uGCursor;
 
 const float PI = 3.14159265;
 const vec2 MODES[6] = vec2[6](
@@ -32,6 +33,29 @@ const vec2 MODES[6] = vec2[6](
 
 float hash(vec2 s) {
   return fract(sin(dot(s, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+// Rotating bar — see webgpu.ts for the derivation and for why a fixed
+// axisymmetric potential cannot hold structure on its own.
+const float BAR_OMEGA = 1.6;
+const float BAR_K = 0.045;
+const float BAR_A2 = 0.1225;
+const float ESCAPE_R = 1.15;
+const float RETURN_R = 0.8;
+
+vec2 bar(vec2 ur, float r, float t) {
+  float c2 = ur.x * ur.x - ur.y * ur.y;
+  float s2 = 2.0 * ur.x * ur.y;
+  float cp = cos(2.0 * BAR_OMEGA * t);
+  float sp = sin(2.0 * BAR_OMEGA * t);
+  float cos2 = c2 * cp + s2 * sp;
+  float sin2 = s2 * cp - c2 * sp;
+
+  float q = r * r + BAR_A2;
+  float a = -BAR_K * r * r / (q * q);
+  float da = -2.0 * BAR_K * r * (BAR_A2 - r * r) / (q * q * q);
+
+  return ur * (-da * cos2) + vec2(-ur.y, ur.x) * (2.0 * a * sin2 / r);
 }
 
 void main() {
@@ -69,9 +93,10 @@ void main() {
 
   vec2 dm = uMouse - aPos;
   float dm2 = dot(dm, dm) + 0.02;
-  float fm = 0.10 / (dm2 * sqrt(dm2));
+  float fm = uGCursor / (dm2 * sqrt(dm2));
 
-  vec2 v = aVel + dc * fc * uDt + dm * fm * uDt;
+  vec2 ur = -dc / rc;
+  vec2 v = aVel + dc * fc * uDt + dm * fm * uDt + bar(ur, rc, uTime) * uDt;
 
   // Radial-only damping — see webgpu.ts for why uniform damping collapses the disc.
   vec2 rdir = dc / rc;
@@ -83,11 +108,14 @@ void main() {
 
   vec2 p = aPos + v * uDt;
 
-  float bounce = 0.45;
-  if (p.x < -1.0) { p.x = -1.0; v.x = -v.x * bounce; }
-  else if (p.x > 1.0) { p.x = 1.0; v.x = -v.x * bounce; }
-  if (p.y < -1.0) { p.y = -1.0; v.y = -v.y * bounce; }
-  else if (p.y > 1.0) { p.y = 1.0; v.y = -v.y * bounce; }
+  // Recycle escapees instead of bouncing them — see webgpu.ts.
+  float pr = length(p);
+  if (pr > ESCAPE_R) {
+    vec2 u = p / pr;
+    float spin = (p.x * v.y - p.y * v.x) >= 0.0 ? 1.0 : -1.0;
+    p = u * RETURN_R;
+    v = vec2(-u.y, u.x) * sqrt(0.55 / RETURN_R) * spin;
+  }
 
   vPos = p;
   vVel = v;
@@ -235,6 +263,7 @@ export function createWebGL2Backend(
     uTime: gl.getUniformLocation(simProg, 'uTime'),
     uWarp: gl.getUniformLocation(simProg, 'uWarp'),
     uWarpM: gl.getUniformLocation(simProg, 'uWarpM'),
+    uGCursor: gl.getUniformLocation(simProg, 'uGCursor'),
   };
   const drawLoc = {
     aPos: gl.getAttribLocation(drawProg, 'aPos'),
@@ -259,6 +288,7 @@ export function createWebGL2Backend(
 
   let mask = 0x3f;
   let mode = 0;
+  let cursorMass = G_CURSOR;
   let elapsed = 0;
 
   const dbg = gl.getExtension('WEBGL_debug_renderer_info');
@@ -279,6 +309,10 @@ export function createWebGL2Backend(
 
     setSpeciesMask(m: number) {
       mask = m >>> 0;
+    },
+
+    setCursorMass(m: number) {
+      cursorMass = m;
     },
 
     setMode(m: number) {
@@ -328,6 +362,7 @@ export function createWebGL2Backend(
       const drift = mode === 1 ? Math.sin(elapsed * 0.11) * 1.4 : 0;
       gl.uniform1f(simLoc.uWarp, mode === 1 ? 1 + (mx * 0.5 + 0.5) * 12 + drift : 0);
       gl.uniform1f(simLoc.uWarpM, mode === 1 ? 1 + (my * 0.5 + 0.5) * 12 + drift : 0);
+      gl.uniform1f(simLoc.uGCursor, cursorMass);
 
       bindAttrib(posA, simLoc.aPos);
       bindAttrib(velA, simLoc.aVel);

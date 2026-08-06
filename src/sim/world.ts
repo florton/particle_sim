@@ -17,17 +17,42 @@
 
 export const STRIDE = 4; // x, y, vx, vy
 
-/** Restitution at the box walls. Shared by all three integrators. */
-export const BOUNCE = 0.45;
 /** Primary attractor strength, fixed at the origin. */
 export const G_CORE = 0.55;
-/** Cursor mass — a fraction of the core, so it perturbs rather than destroys. */
-export const G_CURSOR = 0.1;
+/**
+ * Cursor mass while the pointer is merely moving. A fraction of the core, so it
+ * perturbs rather than destroys and the disc can relax back after a pass.
+ */
+export const G_CURSOR = 0.2;
+/**
+ * Cursor mass while the pointer is held down. Comparable to the core, which is
+ * the regime where an encounter stops being a ripple and starts throwing tidal
+ * tails and a bridge — Toomre's prograde-encounter result, driven by hand.
+ */
+export const G_CURSOR_HELD = 0.6;
 /** Terminal speed. */
 export const V_MAX = 3.0;
 /** Radial-velocity retention per step. Circularizes orbits without killing them. */
 export const RADIAL_DAMP = 0.995;
 export const SPECIES_COUNT = 6;
+
+/**
+ * Rotating bar. See the derivation in `render/webgpu.ts` — these three numbers
+ * are mirrored into both shaders and must stay in sync with them.
+ *
+ * `BAR_OMEGA` is the pattern speed, chosen so corotation lands at r ≈ 0.58,
+ * inside the disc edge: that puts the inner Lindblad resonance well within the
+ * bar and the outer one near r ≈ 0.9, so both rings are on screen at once.
+ */
+export const BAR_OMEGA = 1.6;
+/** Quadrupole strength — about a 15% perturbation on the monopole at r ≈ 0.4. */
+export const BAR_K = 0.045;
+/** Bar radial scale, squared. Beyond this the perturbation falls away. */
+export const BAR_A2 = 0.35 * 0.35;
+/** Past this radius a particle is recycled rather than bounced off the box. */
+export const ESCAPE_R = 1.15;
+/** Radius it comes back at, on a circular orbit. */
+export const RETURN_R = 0.8;
 
 export const SPECIES_NAMES = [
   'argon',
@@ -118,10 +143,21 @@ export function createSim(capacity: number, seed = 0x9e3779b9): Sim {
  * be a fair implementation, not a strawman: allocation-free, monomorphic, one
  * pass over contiguous memory.
  */
-export function integrateCPU(sim: Sim, dt: number, mx: number, my: number) {
+export function integrateCPU(
+  sim: Sim,
+  dt: number,
+  mx: number,
+  my: number,
+  time = 0,
+  gCursor = G_CURSOR,
+) {
   const p = sim.particles;
   const n = sim.count;
   const damp = 0.99995;
+
+  // Bar phase, hoisted: it depends only on time, not on the particle.
+  const cp = Math.cos(2 * BAR_OMEGA * time);
+  const sp = Math.sin(2 * BAR_OMEGA * time);
 
   for (let i = 0; i < n; i++) {
     const o = i * STRIDE;
@@ -142,13 +178,30 @@ export function integrateCPU(sim: Sim, dt: number, mx: number, my: number) {
     const dx = mx - x;
     const dy = my - y;
     const dm2 = dx * dx + dy * dy + 0.02;
-    const fm = G_CURSOR / (dm2 * Math.sqrt(dm2));
+    const fm = gCursor / (dm2 * Math.sqrt(dm2));
+
+    // Rotating m=2 bar — the gradient of A(r)cos(2(th - OMEGA t)). See
+    // render/webgpu.ts for the derivation and for why the disc needs a driving
+    // frequency at all. Outward unit vector, then the double angle from it.
+    const ux = x / rc;
+    const uy = y / rc;
+    const c2 = ux * ux - uy * uy;
+    const s2 = 2 * ux * uy;
+    const cos2 = c2 * cp + s2 * sp;
+    const sin2 = s2 * cp - c2 * sp;
+    const q = rc * rc + BAR_A2;
+    const barA = -BAR_K * rc * rc / (q * q);
+    const barD = (-2 * BAR_K * rc * (BAR_A2 - rc * rc)) / (q * q * q);
+    const fbr = -barD * cos2;
+    const fbt = (2 * barA * sin2) / rc;
+    const bx = ux * fbr - uy * fbt;
+    const by = uy * fbr + ux * fbt;
 
     // No constant tangential term: it pumps energy in every frame regardless of
     // position, which is what cooked the disc into uniform noise. Rotation comes
-    // from the orbital seed instead.
-    let vx = p[o + 2] + cx * fc * dt + dx * fm * dt;
-    let vy = p[o + 3] + cy * fc * dt + dy * fm * dt;
+    // from the orbital seed and the bar instead.
+    let vx = p[o + 2] + cx * fc * dt + dx * fm * dt + bx * dt;
+    let vy = p[o + 3] + cy * fc * dt + dy * fm * dt + by * dt;
 
     // Radial-only damping — see webgpu.ts for why uniform damping collapses the
     // disc into a ball instead of holding it open.
@@ -169,10 +222,20 @@ export function integrateCPU(sim: Sim, dt: number, mx: number, my: number) {
     let nx = x + vx * dt;
     let ny = y + vy * dt;
 
-    // Reflect at the unit box, bleeding energy on contact. A perfectly elastic
-    // wall lets escapees accumulate speed and slowly randomize the field.
-    if (nx < -1) { nx = -1; vx = -vx * BOUNCE; } else if (nx > 1) { nx = 1; vx = -vx * BOUNCE; }
-    if (ny < -1) { ny = -1; vy = -vy * BOUNCE; } else if (ny > 1) { ny = 1; vy = -vy * BOUNCE; }
+    // Recycle escapees onto a circular orbit rather than reflecting them off the
+    // box — see render/webgpu.ts. Bouncing left a speckle along the edges that
+    // nothing ever cleared, and that speckle was most of what read as static.
+    const pr = Math.hypot(nx, ny);
+    if (pr > ESCAPE_R) {
+      const rx = nx / pr;
+      const ry = ny / pr;
+      const spin = nx * vy - ny * vx >= 0 ? 1 : -1;
+      const vOrb = Math.sqrt(G_CORE / RETURN_R) * spin;
+      nx = rx * RETURN_R;
+      ny = ry * RETURN_R;
+      vx = -ry * vOrb;
+      vy = rx * vOrb;
+    }
 
     p[o] = nx;
     p[o + 1] = ny;

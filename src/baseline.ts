@@ -98,7 +98,7 @@ export class BaselineArm {
     reseed(this.sim, BASELINE_COUNT, mode);
   }
 
-  frame(dt: number, mx: number, my: number) {
+  frame(dt: number, mx: number, my: number, gCursor?: number) {
     if (!this.active) return;
 
     this.elapsed += dt;
@@ -108,7 +108,9 @@ export class BaselineArm {
       const { n, m } = chladniWarp(mx, my, this.elapsed);
       integrateChladniCPU(this.sim, dt, n, m, this.elapsed);
     } else {
-      integrateCPU(this.sim, dt, mx, my);
+      // Elapsed drives the bar's phase — without it the pattern stands still and
+      // this arm runs a different force law from the one it is being compared to.
+      integrateCPU(this.sim, dt, mx, my, this.elapsed, gCursor);
     }
     this.sim.count = saved;
 

@@ -1,6 +1,13 @@
 import './style.css';
 import { Hud, type HudCounters } from './hud';
-import { createSim, integrateCPU, SPECIES_NAMES, SPECIES_COLORS } from './sim/world';
+import {
+  createSim,
+  integrateCPU,
+  SPECIES_NAMES,
+  SPECIES_COLORS,
+  G_CURSOR,
+  G_CURSOR_HELD,
+} from './sim/world';
 import { VirtualList } from './ui/list';
 import { speciesMask, toggleSpecies, filterLabel, countEffect, effectRuns, arm } from './ui/state';
 import type { Backend } from './render/backend';
@@ -45,6 +52,7 @@ async function selectBackend(): Promise<Backend> {
 
 let mx = 0;
 let my = 0;
+let held = false;
 addEventListener('pointermove', (e) => {
   mx = (e.clientX / innerWidth) * 2 - 1;
   my = -((e.clientY / innerHeight) * 2 - 1);
@@ -52,6 +60,23 @@ addEventListener('pointermove', (e) => {
 
 const backend = await selectBackend();
 backend.setCount(CAPACITY);
+
+// Hold to make the cursor heavy. A light perturber raises a wake the disc
+// recovers from; a near-core mass raises tidal tails and a bridge, and that is
+// the whole of the interaction budget — one bit, but it spans both regimes.
+// Clicks on the sidebar chips are excluded: those already mean something else.
+function setHeld(next: boolean) {
+  if (held === next) return;
+  held = next;
+  backend.setCursorMass(held ? G_CURSOR_HELD : G_CURSOR);
+}
+addEventListener('pointerdown', (e) => {
+  if (!(e.target as HTMLElement)?.closest?.('#sidebar')) setHeld(true);
+});
+addEventListener('pointerup', () => setHeld(false));
+addEventListener('pointercancel', () => setHeld(false));
+// Releasing outside the window otherwise leaves the mass stuck on.
+addEventListener('blur', () => setHeld(false));
 counters.backend = `${backend.name} · ${backend.detail}`;
 
 const listViewport = document.getElementById('list-viewport')!;
@@ -102,7 +127,7 @@ const modeLabel = () => (mode === 1 ? 'Chladni plate · 6 frequencies' : 'orbita
 function refreshBanner() {
   banner.textContent =
     `${backend.name} compute · ${sim.count.toLocaleString()} particles · ${modeLabel()} — ` +
-    `[M] mode · [B] compare`;
+    `[M] mode · [B] compare · hold to pull`;
 }
 
 function setArm(next: 'gpu' | 'baseline') {
@@ -169,7 +194,7 @@ function loop(now: number) {
     counters.entities = sim.count;
     counters.domNodes = list.liveNodes;
   } else {
-    baseline.frame(dt, mx, my);
+    baseline.frame(dt, mx, my, held ? G_CURSOR_HELD : G_CURSOR);
     counters.entities = baseline.count;
     counters.domNodes = baseline.domNodes;
   }

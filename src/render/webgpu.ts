@@ -4,7 +4,7 @@
  * after upload — the CPU's only per-frame write is a 16-byte uniform.
  */
 
-import type { Sim } from '../sim/world';
+import { G_CURSOR, type Sim } from '../sim/world';
 import { READBACK_MAX, type Backend } from './backend';
 
 const WORKGROUP = 64;
@@ -22,16 +22,29 @@ struct Params {
   time   : f32,
   warpN  : f32,
   warpM  : f32,
-  _pad0  : f32,
+  gcur   : f32,
 };
 
 // Primary attractor strength. Fixed at the origin -- see the integrate entry
 // point. (No backticks in here: this block lives inside a JS template literal.)
 const G_CORE = 0.55;
-// Cursor mass, deliberately a fraction of the core so it perturbs, not destroys.
-const G_CURSOR = 0.10;
+// Cursor mass arrives per frame in params.gcur -- light while the pointer moves,
+// near-core while it is held. See sim/world.ts for the two values.
 // Terminal speed. Without it a close cursor pass flings grains off to infinity.
 const V_MAX = 3.0;
+
+// Rotating bar -- see the bar() function for why this exists at all. Mirrored in
+// sim/world.ts and render/webgl2.ts; the three must stay in sync.
+const BAR_OMEGA = 1.6;   // pattern speed: corotation at r ~ 0.58
+const BAR_K = 0.045;     // quadrupole strength
+const BAR_A2 = 0.1225;   // (0.35)^2 -- bar radial scale, squared
+
+// Recycling bounds -- see the respawn() note. Anything past ESCAPE_R or inside
+// CORE_R rejoins the disc between RETURN_LO and RETURN_HI.
+const ESCAPE_R = 1.15;
+const CORE_R = 0.07;
+const RETURN_LO = 0.55;
+const RETURN_HI = 0.95;
 
 // Per-species (n, m) offsets from the cursor-driven base frequency. Each species
 // settles onto the nodal lines of its own standing wave, so six figures resolve
@@ -112,6 +125,78 @@ fn chladni(i : u32, p : vec4<f32>, dt : f32) -> vec4<f32> {
 }
 
 /**
+ * Put a particle back on the disc, on a circular orbit along its current ray.
+ *
+ * Both ends of the disc leak, and each leak is what the demo used to decay into.
+ *
+ * Outward: the box walls used to be inelastic reflectors, so every grain the
+ * cursor threw out ended up sliding along an edge. Enough of them tile the square
+ * with a uniform speckle that nothing ever clears -- that was the static.
+ *
+ * Inward: a bar torques angular momentum outward, which drives the material that
+ * loses it toward the centre; the radial damping then makes that one-way. Real
+ * bars do exactly this, and it is why they fuel nuclear starbursts. Measured
+ * here, the entire disc was inside r < 0.2 within thirty seconds, which is the
+ * white blob. Left alone, the honest end state of this system is a point.
+ *
+ * So the disc is closed rather than conservative: what falls through the middle
+ * comes back at the edge. This is the one piece of the force law that is a choice
+ * about the toy rather than about the physics, and it is what makes the steady
+ * state a structured disc instead of a bright dot. The return radius is spread
+ * over a band and follows the ray the particle left on, so the replenishment
+ * reads as circulation rather than as a ring appearing out of nowhere.
+ */
+fn respawn(i : u32, dir : vec2<f32>, spin : f32) -> vec4<f32> {
+  let r = RETURN_LO + hash(i * 7u + 13u) * (RETURN_HI - RETURN_LO);
+  let vOrb = sqrt(G_CORE / r) * spin;
+  return vec4<f32>(dir * r, -dir.y * vOrb, dir.x * vOrb);
+}
+
+/**
+ * Rotating bar: an m=2 quadrupole turning at a fixed pattern speed.
+ *
+ * The disc has no self-gravity — every particle is an independent test particle
+ * in a smooth potential. That has a consequence which no amount of tuning fixes:
+ * inner orbits run faster than outer ones, so any arm the cursor raises shears,
+ * winds up, and phase-mixes below pixel size within seconds. Real spiral arms are
+ * held together by the disc's own gravity responding to itself. There is nothing
+ * here to hold one, so structure could only ever decay.
+ *
+ * A rotating quadrupole replaces decay with a *driving* frequency. Orbits whose
+ * own frequency resonates with the pattern get herded onto closed orbits and stay
+ * there: a ring near the inner Lindblad resonance, another near the outer one,
+ * with the bar between them. This is why real barred galaxies have rings, and
+ * unlike a stirred arm it cannot mix away, because the driver never stops. The
+ * resting state becomes structure rather than mush.
+ *
+ *   phi(r, th) = A(r) * cos(2 * (th - OMEGA * t)),   A(r) = -K r^2 / (r^2 + a^2)^2
+ *
+ * A vanishes at the centre and falls off outside a, so the bar is confined to the
+ * disc and the core stays a clean monopole. Forces are the exact gradient of that
+ * potential, so the pattern shuffles energy between orbits without injecting any.
+ *
+ * ur is the outward radial unit vector; the double angle comes from it directly
+ * (cos 2th = ux^2 - uy^2, sin 2th = 2 ux uy), so there is no atan2 per particle.
+ */
+fn bar(ur : vec2<f32>, r : f32, t : f32) -> vec2<f32> {
+  let c2 = ur.x * ur.x - ur.y * ur.y;
+  let s2 = 2.0 * ur.x * ur.y;
+  let cp = cos(2.0 * BAR_OMEGA * t);
+  let sp = sin(2.0 * BAR_OMEGA * t);
+  // Rotate the pattern: angles relative to the bar, not to the screen.
+  let cos2 = c2 * cp + s2 * sp;
+  let sin2 = s2 * cp - c2 * sp;
+
+  let q = r * r + BAR_A2;
+  let a = -BAR_K * r * r / (q * q);
+  let da = -2.0 * BAR_K * r * (BAR_A2 - r * r) / (q * q * q);
+
+  let fr = -da * cos2;          // -dphi/dr
+  let ft = 2.0 * a * sin2 / r;  // -(1/r) dphi/dth
+  return ur * fr + vec2<f32>(-ur.y, ur.x) * ft;
+}
+
+/**
  * Uniformly redistribute the population. Dispatched once when entering Chladni
  * mode: the plate has to start as evenly spread sand. Arriving from the galaxy
  * with everything piled in the core produces one bright diagonal and nothing
@@ -173,9 +258,14 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   // slingshots.
   let dm = vec2<f32>(params.mx - p.x, params.my - p.y);
   let dm2 = dot(dm, dm) + 0.02;
-  let fm = G_CURSOR / (dm2 * sqrt(dm2));
+  let fm = params.gcur / (dm2 * sqrt(dm2));
 
-  var v = p.zw + dc * fc * dt + dm * fm * dt;
+  // Rotating pattern. Without it the disc is a decaying system with nothing to
+  // regenerate structure; with it, rings are where the disc settles.
+  let ur = -dc / rc;
+  let fb = bar(ur, rc, params.time);
+
+  var v = p.zw + dc * fc * dt + dm * fm * dt + fb * dt;
 
   // Damp the RADIAL component only.
   //
@@ -197,12 +287,14 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
 
   var pos = p.xy + v * dt;
 
-  // Inelastic walls: perfectly elastic ones let escapees accumulate speed.
-  let bounce = 0.45;
-  if (pos.x < -1.0) { pos.x = -1.0; v.x = -v.x * bounce; }
-  else if (pos.x > 1.0) { pos.x = 1.0; v.x = -v.x * bounce; }
-  if (pos.y < -1.0) { pos.y = -1.0; v.y = -v.y * bounce; }
-  else if (pos.y > 1.0) { pos.y = 1.0; v.y = -v.y * bounce; }
+  // Close the disc at both ends -- see respawn(). Sign of angular momentum is
+  // carried across, so a recycled grain rejoins moving the way the disc moves.
+  let pr = length(pos);
+  if (pr > ESCAPE_R || pr < CORE_R) {
+    let spin = select(-1.0, 1.0, (pos.x * v.y - pos.y * v.x) >= 0.0);
+    parts[i] = respawn(i, pos / max(pr, 1e-6), spin);
+    return;
+  }
 
   parts[i] = vec4<f32>(pos, v);
 }
@@ -323,6 +415,7 @@ export async function createWebGPUBackend(
 
   let mask = (1 << 6) - 1;
   let mode = 0;
+  let cursorMass = G_CURSOR;
   let elapsed = 0;
   let pendingScatter = false;
 
@@ -433,6 +526,10 @@ export async function createWebGPUBackend(
       pendingScatter = true;
     },
 
+    setCursorMass(m: number) {
+      cursorMass = m;
+    },
+
     frame(dt: number, mx: number, my: number) {
       paramData[0] = dt;
       paramData[1] = mx;
@@ -465,6 +562,7 @@ export async function createWebGPUBackend(
         paramData[9] = 0;
         paramData[10] = 0;
       }
+      paramData[11] = cursorMass;
       device.queue.writeBuffer(paramBuf, 0, paramBytes);
 
       const enc = device.createCommandEncoder();
