@@ -14,12 +14,51 @@ const SIM_VS = `#version 300 es
 precision highp float;
 in vec2 aPos;
 in vec2 aVel;
+in float aSpecies;
 out vec2 vPos;
 out vec2 vVel;
 uniform float uDt;
 uniform vec2 uMouse;
+uniform int uMode;
+uniform float uTime;
+uniform float uWarp;
+
+const float PI = 3.14159265;
+const vec2 MODES[6] = vec2[6](
+  vec2(1.0, 2.0), vec2(2.0, 3.0), vec2(3.0, 4.0),
+  vec2(1.0, 4.0), vec2(2.0, 5.0), vec2(3.0, 5.0)
+);
+
+float hash(vec2 s) {
+  return fract(sin(dot(s, vec2(12.9898, 78.233))) * 43758.5453);
+}
 
 void main() {
+  // --- Chladni plate (see webgpu.ts for the derivation) ---
+  if (uMode == 1) {
+    vec2 nm = MODES[int(aSpecies + 0.5)];
+    float n = nm.x + uWarp;
+    float m = nm.y + uWarp;
+
+    float u = (aPos.x + 1.0) * 0.5;
+    float vv = (aPos.y + 1.0) * 0.5;
+
+    float w = cos(n * PI * u) * cos(m * PI * vv) - cos(m * PI * u) * cos(n * PI * vv);
+    float dwdu = -n * PI * sin(n * PI * u) * cos(m * PI * vv)
+                 + m * PI * sin(m * PI * u) * cos(n * PI * vv);
+    float dwdv = -m * PI * cos(n * PI * u) * sin(m * PI * vv)
+                 + n * PI * cos(m * PI * u) * sin(n * PI * vv);
+
+    vec2 g = vec2(dwdu, dwdv) * sign(w) * 0.5;
+    float amp = abs(w);
+    vec2 j = vec2(hash(aPos + uTime), hash(aPos.yx - uTime)) - 0.5;
+
+    vec2 vel = (aVel - g * 2.4 * uDt + j * amp * 2.2 * uDt) * 0.86;
+    vPos = clamp(aPos + vel * uDt, vec2(-1.0), vec2(1.0));
+    vVel = vel;
+    return;
+  }
+
   vec2 d = uMouse - aPos;
   float d2 = dot(d, d) + 0.004;
   float r = sqrt(d2);
@@ -175,8 +214,12 @@ export function createWebGL2Backend(
   const simLoc = {
     aPos: gl.getAttribLocation(simProg, 'aPos'),
     aVel: gl.getAttribLocation(simProg, 'aVel'),
+    aSpecies: gl.getAttribLocation(simProg, 'aSpecies'),
     uDt: gl.getUniformLocation(simProg, 'uDt'),
     uMouse: gl.getUniformLocation(simProg, 'uMouse'),
+    uMode: gl.getUniformLocation(simProg, 'uMode'),
+    uTime: gl.getUniformLocation(simProg, 'uTime'),
+    uWarp: gl.getUniformLocation(simProg, 'uWarp'),
   };
   const drawLoc = {
     aPos: gl.getAttribLocation(drawProg, 'aPos'),
@@ -200,6 +243,8 @@ export function createWebGL2Backend(
   };
 
   let mask = 0x3f;
+  let mode = 0;
+  let elapsed = 0;
 
   const dbg = gl.getExtension('WEBGL_debug_renderer_info');
   const detail = dbg
@@ -221,14 +266,42 @@ export function createWebGL2Backend(
       mask = m >>> 0;
     },
 
+    setMode(m: number) {
+      mode = m | 0;
+
+      // Parity with the WebGPU scatter pass: the plate must start as evenly
+      // spread sand. No compute shaders here, so this is a CPU-side refill of
+      // both ping-pong buffers — a one-time cost on mode switch, not per frame.
+      for (let i = 0; i < n; i++) {
+        pos[i * 2] = Math.random() * 2 - 1;
+        pos[i * 2 + 1] = Math.random() * 2 - 1;
+        vel[i * 2] = 0;
+        vel[i * 2 + 1] = 0;
+      }
+      for (const [buf, data] of [
+        [posA, pos],
+        [posB, pos],
+        [velA, vel],
+        [velB, vel],
+      ] as const) {
+        gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, data);
+      }
+    },
+
     frame(dt: number, mx: number, my: number) {
       // --- integrate: TF pass, no rasterization ---
       gl.useProgram(simProg);
       gl.uniform1f(simLoc.uDt, dt);
       gl.uniform2f(simLoc.uMouse, mx, my);
+      gl.uniform1i(simLoc.uMode, mode);
+      elapsed += dt;
+      gl.uniform1f(simLoc.uTime, elapsed);
+      gl.uniform1f(simLoc.uWarp, mode === 1 ? mx * 1.6 : 0);
 
       bindAttrib(posA, simLoc.aPos);
       bindAttrib(velA, simLoc.aVel);
+      bindAttrib(speciesBuf, simLoc.aSpecies, 0, 1);
 
       gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, tf);
       gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, posB);

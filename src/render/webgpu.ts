@@ -18,8 +18,32 @@ struct Params {
   size   : f32,
   gain   : f32,
   mask   : u32,
+  mode   : u32,
+  time   : f32,
+  warp   : f32,
   _pad0  : f32,
+  _pad1  : f32,
 };
+
+// Chladni mode pairs (n, m) per species. Each species settles onto the nodal
+// lines of its own standing wave, so six figures resolve at once in six colours.
+const MODES = array<vec2<f32>, 6>(
+  vec2<f32>(1.0, 2.0),
+  vec2<f32>(2.0, 3.0),
+  vec2<f32>(3.0, 4.0),
+  vec2<f32>(1.0, 4.0),
+  vec2<f32>(2.0, 5.0),
+  vec2<f32>(3.0, 5.0)
+);
+
+const PI = 3.14159265;
+
+/** Cheap per-particle hash for the vibration jitter. */
+fn hash(n : u32) -> f32 {
+  var x = n * 747796405u + 2891336453u;
+  x = ((x >> ((x >> 28u) + 4u)) ^ x) * 277803737u;
+  return f32((x >> 22u) ^ x) / 4294967296.0;
+}
 
 // Mirrors SPECIES_COLORS in sim/world.ts — keep in sync.
 const PALETTE = array<vec3<f32>, 6>(
@@ -33,6 +57,66 @@ const PALETTE = array<vec3<f32>, 6>(
 
 @group(0) @binding(0) var<storage, read_write> parts : array<vec4<f32>>;
 @group(0) @binding(1) var<uniform> params : Params;
+@group(0) @binding(2) var<storage, read> cspecies : array<u32>;
+
+/**
+ * Chladni plate. Particles descend |w| toward the nodal lines of a standing
+ * wave, exactly as sand does on a vibrating plate — the sand collects where the
+ * plate is not moving. Analytic gradient, so this is O(n) with no neighbour
+ * search: a million grains cost one evaluation each.
+ */
+fn chladni(i : u32, p : vec4<f32>, dt : f32) -> vec4<f32> {
+  let nm = MODES[cspecies[i]];
+  // Cursor warps the frequencies live, so the figure reorganizes under the mouse.
+  let n = nm.x + params.warp;
+  let m = nm.y + params.warp;
+
+  let u = (p.x + 1.0) * 0.5;
+  let v = (p.y + 1.0) * 0.5;
+
+  let w = cos(n * PI * u) * cos(m * PI * v) - cos(m * PI * u) * cos(n * PI * v);
+
+  let dwdu = -n * PI * sin(n * PI * u) * cos(m * PI * v)
+             + m * PI * sin(m * PI * u) * cos(n * PI * v);
+  let dwdv = -m * PI * cos(n * PI * u) * sin(m * PI * v)
+             + n * PI * cos(m * PI * u) * sin(n * PI * v);
+
+  // Descend |w|: step against the gradient, signed by which side of the node
+  // this grain sits on.
+  let g = vec2<f32>(dwdu, dwdv) * sign(w) * 0.5;
+
+  // Vibration amplitude scales with |w| — grains far from a node keep getting
+  // kicked, grains on the node go still. That is what sharpens the figure.
+  let amp = abs(w);
+  let j = vec2<f32>(
+    hash(i * 2u + u32(params.time * 60.0)) - 0.5,
+    hash(i * 2u + 1u + u32(params.time * 60.0)) - 0.5
+  );
+
+  var vel = (p.zw - g * 2.4 * dt + j * amp * 2.2 * dt) * 0.86;
+  var pos = p.xy + vel * dt;
+
+  pos = clamp(pos, vec2<f32>(-1.0), vec2<f32>(1.0));
+  return vec4<f32>(pos, vel);
+}
+
+/**
+ * Uniformly redistribute the population. Dispatched once when entering Chladni
+ * mode: the plate has to start as evenly spread sand. Arriving from the galaxy
+ * with everything piled in the core produces one bright diagonal and nothing
+ * else, because a grain that reaches a node has zero vibration amplitude and
+ * never moves again.
+ */
+@compute @workgroup_size(${WORKGROUP})
+fn scatter(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= arrayLength(&parts)) { return; }
+  parts[i] = vec4<f32>(
+    hash(i * 3u) * 2.0 - 1.0,
+    hash(i * 3u + 1u) * 2.0 - 1.0,
+    0.0, 0.0
+  );
+}
 
 @compute @workgroup_size(${WORKGROUP})
 fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
@@ -41,6 +125,11 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
 
   var p = parts[i];
   let dt = params.dt;
+
+  if (params.mode == 1u) {
+    parts[i] = chladni(i, p, dt);
+    return;
+  }
 
   let d = vec2<f32>(params.mx - p.x, params.my - p.y);
   let d2 = dot(d, d) + 0.004;
@@ -163,12 +252,12 @@ export async function createWebGPUBackend(
   device.queue.writeBuffer(particleBuf, 0, sim.particles);
 
   const paramBuf = device.createBuffer({
-    size: 32,
+    size: 48,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
   // Reused every frame; the only per-frame CPU->GPU traffic in the demo (32 bytes).
   // Two views over one buffer because `mask` is a u32 among f32s.
-  const paramBytes = new ArrayBuffer(32);
+  const paramBytes = new ArrayBuffer(48);
   const paramData = new Float32Array(paramBytes);
   const paramU32 = new Uint32Array(paramBytes);
 
@@ -183,6 +272,9 @@ export async function createWebGPUBackend(
   device.queue.writeBuffer(speciesBuf, 0, speciesData);
 
   let mask = (1 << 6) - 1;
+  let mode = 0;
+  let elapsed = 0;
+  let pendingScatter = false;
 
   // One staging buffer + one CPU-side view, allocated once. The list pulls a
   // small window through these every frame, so allocating per call would show
@@ -199,6 +291,11 @@ export async function createWebGPUBackend(
     entries: [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+      {
+        binding: 2,
+        visibility: GPUShaderStage.COMPUTE,
+        buffer: { type: 'read-only-storage' },
+      },
     ],
   });
   const renderLayout = device.createBindGroupLayout({
@@ -223,6 +320,11 @@ export async function createWebGPUBackend(
   const computePipeline = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [computeLayout] }),
     compute: { module, entryPoint: 'integrate' },
+  });
+
+  const scatterPipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [computeLayout] }),
+    compute: { module, entryPoint: 'scatter' },
   });
 
   const renderPipeline = device.createRenderPipeline({
@@ -250,6 +352,7 @@ export async function createWebGPUBackend(
     entries: [
       { binding: 0, resource: { buffer: particleBuf } },
       { binding: 1, resource: { buffer: paramBuf } },
+      { binding: 2, resource: { buffer: speciesBuf } },
     ],
   });
   const renderBind = device.createBindGroup({
@@ -275,6 +378,11 @@ export async function createWebGPUBackend(
       mask = m >>> 0;
     },
 
+    setMode(m: number) {
+      mode = m | 0;
+      pendingScatter = true;
+    },
+
     frame(dt: number, mx: number, my: number) {
       paramData[0] = dt;
       paramData[1] = mx;
@@ -292,14 +400,27 @@ export async function createWebGPUBackend(
       // and additive blending clips to white there long before the arms are lit.
       paramData[5] = Math.min(1, Math.max(0.3, 120_000 / count));
       paramU32[6] = mask;
+      paramU32[7] = mode;
+      elapsed += dt;
+      paramData[8] = elapsed;
+      // In Chladni mode the cursor bends the frequencies, so dragging across the
+      // plate morphs one figure into the next continuously.
+      paramData[9] = mode === 1 ? mx * 1.6 : 0;
       device.queue.writeBuffer(paramBuf, 0, paramBytes);
 
       const enc = device.createCommandEncoder();
 
+      const groups = Math.ceil(count / WORKGROUP);
       const cpass = enc.beginComputePass();
+      if (pendingScatter) {
+        pendingScatter = false;
+        cpass.setPipeline(scatterPipeline);
+        cpass.setBindGroup(0, computeBind);
+        cpass.dispatchWorkgroups(groups);
+      }
       cpass.setPipeline(computePipeline);
       cpass.setBindGroup(0, computeBind);
-      cpass.dispatchWorkgroups(Math.ceil(count / WORKGROUP));
+      cpass.dispatchWorkgroups(groups);
       cpass.end();
 
       const rpass = enc.beginRenderPass({

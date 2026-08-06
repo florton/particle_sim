@@ -11,7 +11,18 @@ measurement.
 - **1,000,000 particles**, integrated in a WebGPU compute shader, drawn in one
   instanced call. Particle data is uploaded once and never returns to the CPU on
   the render path.
+- **Two simulation modes**, `M` to switch:
+  - **Orbital galaxy** — particles seeded at circular-orbit velocity around a
+    cursor-following attractor with a repulsive core. Spiral arms are emergent,
+    not authored.
+  - **Chladni plate** — particles descend the gradient of a standing wave onto
+    its nodal lines, the way sand does on a vibrating plate. Each species gets
+    its own `(n, m)` frequency pair, so six figures resolve at once in six
+    colours, and the cursor warps the frequencies live. Analytic gradient, so
+    it stays O(n) with no neighbour search.
 - **A sidebar over all 1,000,000 rows** that keeps ~33 `<div>`s alive.
+- **Six species filters** that cull on the GPU — a uniform bit test per vertex,
+  not a CPU pass over the population.
 - **A reactive graph that runs almost never** — and a HUD counter proving it.
 
 ## Measured results
@@ -94,12 +105,13 @@ refresh calibration at 4 ms and clears it on reset.
 
 ## Known issues
 
-- **The particles do not interact with each other.** This is a single attractor
-  plus a repulsive core — O(n), no particle-particle forces. The structure is
-  real orbital mechanics, but it is not chemistry. Naive N-body at 1M is 10¹²
-  pairs and impossible; a GPU density-field pass (scatter into a coarse grid with
-  atomics, then sample the neighbourhood) is O(n) and would give genuine emergent
-  clustering. That is the next feature.
+- **The particles still do not interact with each other.** Both modes are
+  field-driven: every particle reads a function of its own position and nothing
+  else. The structures are real (orbital mechanics; genuine nodal lines of a
+  standing wave) but there are no particle-particle forces. Naive N-body at 1M is
+  10¹² pairs and impossible; a GPU density-field pass — scatter into a coarse
+  grid with atomics, then sample the neighbourhood — is O(n) and would give
+  genuine emergent clustering. That is the next feature.
 - fps is vsync-capped at 60, so the GPU's actual headroom at 1M is unmeasured.
   A `timestamp-query` pass would show it.
 - p99 on the GPU arm is a dropped frame (33.40 ms), not a clean 16.7.
@@ -109,6 +121,9 @@ refresh calibration at 4 ms and clears it on reset.
 ```bash
 npm install && npm run dev
 ```
+
+Controls: `M` switches simulation mode, `B` switches arm, click the species
+chips to filter, move the cursor to drive the field.
 
 Query parameters:
 

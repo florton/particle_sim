@@ -97,6 +97,13 @@ const banner = document.createElement('div');
 banner.id = 'banner';
 document.body.appendChild(banner);
 
+function refreshBanner() {
+  const label = mode === 1 ? 'Chladni plate · 6 frequencies' : 'orbital galaxy';
+  banner.textContent =
+    `${backend.name} compute · ${sim.count.toLocaleString()} particles · ${label} — ` +
+    `[M] mode · [B] compare`;
+}
+
 function setArm(next: 'gpu' | 'baseline') {
   arm(next);
   if (next === 'baseline') {
@@ -109,9 +116,7 @@ function setArm(next: 'gpu' | 'baseline') {
     baseline.stop();
     canvas.style.display = 'block';
     list.forceRepaint();
-    banner.textContent =
-      `WebGPU compute · ${sim.count.toLocaleString()} particles · ` +
-      `virtualized sidebar — press [B] to compare`;
+    refreshBanner();
   }
   banner.className = next;
   counters.arm = next;
@@ -119,8 +124,16 @@ function setArm(next: 'gpu' | 'baseline') {
   hud.reset();
 }
 
+let mode = 0;
+function setMode(next: number) {
+  mode = next;
+  backend.setMode(mode);
+  if (arm() === 'gpu') refreshBanner();
+}
+
 addEventListener('keydown', (e) => {
   if (e.key === 'b' || e.key === 'B') setArm(arm() === 'gpu' ? 'baseline' : 'gpu');
+  if (e.key === 'm' || e.key === 'M') setMode(mode === 0 ? 1 : 0);
 });
 
 function fit() {

@@ -13,6 +13,8 @@ export interface Backend {
    * test per vertex on the GPU — the CPU never walks the population to do it.
    */
   setSpeciesMask(mask: number): void;
+  /** 0 = orbital galaxy, 1 = Chladni plate. */
+  setMode(mode: number): void;
   frame(dt: number, mx: number, my: number): void;
   resize(w: number, h: number): void;
   destroy(): void;

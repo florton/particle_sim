@@ -36,7 +36,7 @@ html, body {
   left: 12px;
   z-index: 10;
   padding: 10px 12px;
-  min-width: 264px;
+  width: 288px;
   background: var(--panel);
   backdrop-filter: blur(8px);
   border: 1px solid var(--line);
@@ -59,8 +59,16 @@ html, body {
   gap: 16px;
 }
 
-.hud-label { color: var(--dim); }
-.hud-val { color: var(--accent); font-variant-numeric: tabular-nums; }
+.hud-label { color: var(--dim); flex: none; }
+.hud-val {
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  /* ANGLE renderer strings are long enough to blow out the panel width. */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .hud-val.warn { color: var(--warn); }
 
 /* --- Sidebar --------------------------------------------------------- */
