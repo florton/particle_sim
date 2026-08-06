@@ -1,0 +1,155 @@
+:root {
+  --bg: #07090d;
+  --panel: rgba(16, 20, 28, 0.82);
+  --line: rgba(120, 200, 255, 0.14);
+  --text: #c9d6e4;
+  --dim: #5d6b7d;
+  --accent: #6cf;
+  --warn: #ff6b5e;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font: 12px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+#stage {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* --- HUD ------------------------------------------------------------- */
+
+#hud {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  z-index: 10;
+  padding: 10px 12px;
+  min-width: 264px;
+  background: var(--panel);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  /* Own layer: HUD repaints must not invalidate the stage. */
+  will-change: transform;
+  contain: layout style paint;
+}
+
+.hud-spark {
+  display: block;
+  margin-bottom: 8px;
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.3);
+}
+
+.hud-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.hud-label { color: var(--dim); }
+.hud-val { color: var(--accent); font-variant-numeric: tabular-nums; }
+.hud-val.warn { color: var(--warn); }
+
+/* --- Sidebar --------------------------------------------------------- */
+
+#sidebar {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 340px;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  backdrop-filter: blur(8px);
+  border-left: 1px solid var(--line);
+  contain: strict;
+}
+
+#sidebar-head {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  color: var(--dim);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.chip {
+  font: inherit;
+  color: var(--accent);
+  background: rgba(108, 204, 255, 0.1);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 9px;
+  cursor: pointer;
+  transition: opacity 120ms ease;
+}
+.chip.off { color: var(--dim); background: transparent; opacity: 0.45; }
+
+.summary {
+  flex: 1 0 100%;
+  margin-top: 6px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+#list-viewport {
+  position: relative;
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  /* Isolate scroll-driven repaint from the rest of the page. */
+  contain: strict;
+  will-change: transform;
+}
+
+#list-spacer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1px;
+  pointer-events: none;
+}
+
+.row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px;
+  white-space: nowrap;
+  /* Rows are recycled and moved with transform only — never top/left. */
+  will-change: transform;
+  contain: layout style paint;
+}
+
+.row:nth-child(even) { background: rgba(255, 255, 255, 0.018); }
+
+.row .id { color: var(--dim); width: 52px; }
+.row .v { color: var(--text); width: 62px; text-align: right; font-variant-numeric: tabular-nums; }
+.row .bar {
+  flex: 1;
+  height: 3px;
+  background: var(--accent);
+  transform-origin: left center;
+  border-radius: 2px;
+}
