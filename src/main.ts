@@ -185,15 +185,27 @@ coolInput.addEventListener('input', () => applyCooling(coolFromSlider(+coolInput
 coolRow.append(coolLabel, coolInput);
 head.appendChild(coolRow);
 
-// The only thing the reactive graph drives. Culling the population itself is a
-// single uniform written to the GPU — not a pass over a million particles.
-countEffect(() => {
+/**
+ * Rebuild the filtered row set and the count above it.
+ *
+ * Driven by the filter chips through the reactive graph, and *also* called on a
+ * mode switch — which is not a mask change but does replace the population's
+ * species. Each mode bands species by radius differently (see sim/modes.ts), so
+ * a filtered sidebar left alone across a switch keeps counting the previous
+ * galaxy: measured at 200k, argon read 6,763 rows against the 15,579 actually
+ * there. Culling the population itself is still a single uniform written to the
+ * GPU — this pass is over the row set, not over the particles.
+ */
+function refreshFilter() {
   const mask = speciesMask();
   for (let i = 0; i < chips.length; i++) chips[i].classList.toggle('off', !(mask & (1 << i)));
   backend.setSpeciesMask(mask);
   list.refilter();
   summary.textContent = `${list.rowCount.toLocaleString()} rows · ${filterLabel()}`;
-});
+}
+
+// The only thing the reactive graph drives.
+countEffect(refreshFilter);
 
 // --- A/B toggle -----------------------------------------------------------
 
@@ -247,6 +259,8 @@ function setMode(next: number) {
   mode = next;
   if (mode === COLLISION) resetPair(pair);
   backend.setMode(mode);
+  // The new mode brought its own species banding with it.
+  refreshFilter();
   // The slider only means something to the self-gravitating disc; every other
   // mode has a fixed dissipation law of its own.
   coolRow.style.display = MODES[mode].cooling ? '' : 'none';
