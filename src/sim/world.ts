@@ -281,7 +281,7 @@ export interface Sim {
  * Deterministic PRNG so a run is reproducible — comparing two arms is
  * meaningless if they get different starting conditions.
  */
-function mulberry32(seed: number) {
+export function mulberry32(seed: number) {
   return function () {
     seed |= 0;
     seed = (seed + 0x6d2b79f5) | 0;
@@ -622,27 +622,39 @@ export function integrateChladniCPU(
   }
 }
 
-/** Re-seed the first `n` slots for a mode. Used by the naive arm on switch. */
-export function reseed(sim: Sim, n: number, mode: number) {
+/**
+ * Spread the first `n` slots evenly over the box, at rest.
+ *
+ * The plate has to start as evenly spread sand. Arriving from a galaxy with
+ * everything piled in the core produces one bright diagonal and nothing else,
+ * because a grain that reaches a node has zero vibration amplitude and never
+ * moves again.
+ */
+export function scatterPlate(sim: Sim, n: number, rand: () => number = Math.random) {
   const p = sim.particles;
   for (let i = 0; i < n; i++) {
     const o = i * STRIDE;
-    if (mode === 1) {
-      p[o] = Math.random() * 2 - 1;
-      p[o + 1] = Math.random() * 2 - 1;
-      p[o + 2] = 0;
-      p[o + 3] = 0;
-    } else {
-      const a = Math.random() * Math.PI * 2;
-      const r = sampleRadius(Math.random(), Math.random());
-      const vOrb = vCirc(r);
-      const g1 = Math.sqrt(-2 * Math.log(Math.max(1e-9, Math.random())));
-      const g2 = 2 * Math.PI * Math.random();
-      p[o] = Math.cos(a) * r;
-      p[o + 1] = Math.sin(a) * r;
-      const sigma = vOrb * SIGMA_FRAC;
-      p[o + 2] = -Math.sin(a) * vOrb + g1 * Math.cos(g2) * sigma;
-      p[o + 3] = Math.cos(a) * vOrb + g1 * Math.sin(g2) * sigma;
-    }
+    p[o] = rand() * 2 - 1;
+    p[o + 1] = rand() * 2 - 1;
+    p[o + 2] = 0;
+    p[o + 3] = 0;
+  }
+}
+
+/** Re-seed the first `n` slots as the self-gravitating disc, positions only. */
+export function reseedGalaxy(sim: Sim, n: number, rand: () => number = Math.random) {
+  const p = sim.particles;
+  for (let i = 0; i < n; i++) {
+    const o = i * STRIDE;
+    const a = rand() * Math.PI * 2;
+    const r = sampleRadius(rand(), rand());
+    const vOrb = vCirc(r);
+    const g1 = Math.sqrt(-2 * Math.log(Math.max(1e-9, rand())));
+    const g2 = 2 * Math.PI * rand();
+    p[o] = Math.cos(a) * r;
+    p[o + 1] = Math.sin(a) * r;
+    const sigma = vOrb * SIGMA_FRAC;
+    p[o + 2] = -Math.sin(a) * vOrb + g1 * Math.cos(g2) * sigma;
+    p[o + 3] = Math.cos(a) * vOrb + g1 * Math.sin(g2) * sigma;
   }
 }

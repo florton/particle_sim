@@ -11,7 +11,7 @@ measurement.
 - **1,000,000 particles**, integrated in a WebGPU compute shader, drawn in one
   instanced call. Particle data is uploaded once and never returns to the CPU on
   the render path.
-- **Two simulation modes**, `M` to switch:
+- **Five simulation modes**, `M` to cycle:
   - **Spiral galaxy** — a self-gravitating disc. Every frame the population
     deposits its mass into a 64x64 mesh, the mesh convolves against itself for
     the force field, and every particle reads that field back. The arms are a
@@ -27,6 +27,24 @@ measurement.
     from it, so six figures resolve at once in six colors — sparse sweeping
     curves at one corner, a dense interference lattice at the other. Analytic
     gradient, so it stays O(n) with no neighbor search.
+  - **Barred galaxy** — the same disc as test particles in a fixed potential,
+    driven by a rotating m=2 quadrupole. Without self-gravity an arm shears and
+    phase-mixes away within seconds, so structure here is resonance instead:
+    orbits near the inner and outer Lindblad resonances get herded onto closed
+    orbits and hold rings open, which is why real barred galaxies have them. The
+    disc is closed rather than conservative — what falls through the middle
+    comes back at the edge, on the radius its species belongs at.
+  - **Galaxy collision** — Toomre & Toomre's restricted three-body model. Two
+    cores on their own two-body orbit, solved on the CPU as twelve lines of
+    leapfrog; every one of the million particles is a massless test particle in
+    the sum of their fields. That is enough for tidal tails and a bridge. `R`
+    flips the second disc's spin sense, which is the demonstration: the same two
+    cores on the same orbit throw a tail half the frame long prograde and barely
+    mark the disc retrograde.
+  - **Fixed-potential disc** — the original: anchored monopole, weak cursor,
+    uniform radial damping, walls. Nothing drives it and nothing responds to it,
+    so it phase-mixes into a smooth annulus within seconds and stays there. Kept
+    because it is what the other two galaxies are answers to.
 - **A sidebar over all 1,000,000 rows** that keeps ~33 `<div>`s alive.
 - **Six species filters** that cull on the GPU — a uniform bit test per vertex,
   not a CPU pass over the population.
@@ -197,7 +215,7 @@ And one that only showed up by measuring the same build twice:
 npm install && npm run dev
 ```
 
-Controls: `M` switches simulation mode, `B` switches arm, `R` restarts the
+Controls: `M` cycles simulation mode, `B` switches arm, `R` restarts the
 simulation, `C` toggles the species palette against a luminance-only render,
 click the species chips to filter, drag the **disc cooling** slider to change how
 sharply the arms resolve, move the cursor to perturb the field, and **hold the
@@ -208,9 +226,14 @@ the disc with a tidal bridge back to it, taking mass within 0.12 of the pointer
 from 1.3% to 9.1% over four seconds. It is a destructive interaction and is meant
 to be: material dragged off a circular orbit has nowhere to go but inward, so a
 four-second hold leaves ~41% of the disc inside r<0.1 twelve seconds later
-against 7% for an untouched one. `R` restarts. `B` compares within whichever
-mode is active, so both arms always run the same force law — including the mesh
-self-gravity, which the CPU reference implements at the same grid resolution.
+against 7% for an untouched one. `R` restarts — in the collision it flips the
+spin sense instead. The **disc cooling** slider belongs to the self-gravitating
+disc and is hidden in the modes that have a dissipation law of their own; in
+those, holding switches the cursor between two masses rather than ramping,
+because nothing there amplifies its own density contrast and an impulse stirs
+the disc instead of collapsing it. `B` compares within whichever mode is active,
+so both arms always run the same force law — including the mesh self-gravity,
+which the CPU reference implements at the same grid resolution.
 
 ## Deploying (self-hosted)
 

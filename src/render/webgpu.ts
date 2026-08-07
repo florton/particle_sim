@@ -21,9 +21,12 @@
 
 import {
   CAPTURE_K, CAPTURE_R2, CURSOR_SOFT2, CURSOR_SOFT2_HOLD, GRID, G_CORE,
-  G_CURSOR, G_CURSOR_HOLD, H_DISC, M_DISC, RADIAL_DAMP, R_DISC,
-  SIGMA_FRAC, SOFT_CELLS, seedGalaxy, type Sim,
+  G_CURSOR, G_CURSOR_HOLD, M_DISC, RADIAL_DAMP, SOFT_CELLS, type Sim,
 } from '../sim/world';
+import * as barred from '../sim/barred';
+import * as classic from '../sim/classic';
+import { BARRED, CHLADNI, CLASSIC, COLLISION, SELFGRAV, seedMode } from '../sim/modes';
+import { PAIR_MASS, createPair, type PairState } from '../sim/pair';
 import { READBACK_MAX, type Backend } from './backend';
 
 const WORKGROUP = 64;
@@ -60,6 +63,14 @@ struct Params {
   mono      : f32,
   // Cursor mass multiplier, ramped by the pointer being held. 1 = passive.
   grav      : f32,
+  // Cursor mass in the fixed-potential modes, switched rather than ramped.
+  gcur      : f32,
+  // Camera scale for the collision, which spans a wider field than a disc does.
+  scale     : f32,
+  // The two colliding cores, solved on the CPU -- see sim/pair.ts.
+  c0        : vec2<f32>,
+  c1        : vec2<f32>,
+  pmass     : f32,
 };
 
 // Central bulge + halo. Fixed at the origin -- see the integrate entry point.
@@ -67,9 +78,6 @@ struct Params {
 const G_CORE = ${G_CORE};
 // Total self-gravitating mass of the disc. Mirrors M_DISC in sim/world.ts.
 const M_DISC = ${M_DISC};
-const R_DISC = ${R_DISC};
-const H_DISC = ${H_DISC};
-const SIGMA_FRAC = ${SIGMA_FRAC};
 // Cursor mass, deliberately a fraction of the core so it perturbs, not destroys.
 // Mirrors G_CURSOR in sim/world.ts -- see there for why it is this small.
 const G_CURSOR = ${G_CURSOR};
@@ -146,26 +154,6 @@ fn coreF(q : f32) -> f32 {
 }
 
 /**
- * Circular-orbit speed under the force law actually integrated. Mirrors vCirc()
- * in sim/world.ts -- see there for why this is not sqrt(G/r), and why getting it
- * wrong punches a visible hole through the middle of the galaxy.
- */
-fn vCirc(r : f32) -> f32 {
-  let q = r * r + 0.004;
-  let x = r / H_DISC;
-  let enclosed = M_DISC * (1.0 - (1.0 + x) * exp(-x));
-  let disc = enclosed / pow(r * r + ${(SOFT_CELLS * (2 / GRID)) ** 2}, 1.5);
-  return r * sqrt(max(0.0, coreF(q) + disc));
-}
-
-/** Exponential-disc radius from two uniforms. Mirrors sampleRadius() in
- *  sim/world.ts -- a Gamma(2,1) is the sum of two exponentials. */
-fn sampleRadius(u1 : f32, u2 : f32) -> f32 {
-  let r = -H_DISC * (log(max(1e-9, u1)) + log(max(1e-9, u2)));
-  return clamp(r, 0.01, 1.1);
-}
-
-/**
  * Chladni plate. Particles descend |w| toward the nodal lines of a standing
  * wave, exactly as sand does on a vibrating plate — the sand collects where the
  * plate is not moving. Analytic gradient, so this is O(n) with no neighbor
@@ -205,6 +193,282 @@ fn chladni(i : u32, p : vec4<f32>, dt : f32) -> vec4<f32> {
 
   pos = clamp(pos, vec2<f32>(-1.0), vec2<f32>(1.0));
   return vec4<f32>(pos, vel);
+}
+
+// --- fixed-potential modes ---------------------------------------------------
+//
+// The barred disc, the collision and the original fixed-potential disc, kept as
+// their own force laws rather than folded into the one above. None of them sees
+// the density mesh at all: every particle here is a test particle in a
+// prescribed field, which is the whole difference between them and mode 0. The
+// constants come from sim/barred.ts and sim/classic.ts so there is one source of
+// truth per mode.
+
+const BD_G_CORE = ${barred.G_CORE};
+const BD_DAMP_INNER = ${barred.DAMP_INNER};
+const BD_DAMP_OUTER = ${barred.DAMP_OUTER};
+const BD_BAR_OMEGA = ${barred.BAR_OMEGA};
+const BD_BAR_K = ${barred.BAR_K};
+const BD_BAR_A2 = ${barred.BAR_A2};
+const BD_ESCAPE_R = ${barred.ESCAPE_R};
+const BD_RETURN_LO = ${barred.RETURN_LO};
+const BD_RETURN_HI = ${barred.RETURN_HI};
+const BD_CORE_FRAC = ${barred.CORE_FRAC};
+const BD_SPECIES_SPREAD = ${barred.SPECIES_SPREAD};
+const CL_G_CORE = ${classic.G_CORE};
+const CL_G_CURSOR = ${classic.G_CURSOR};
+const CL_RADIAL_DAMP = ${classic.RADIAL_DAMP};
+
+/**
+ * The barred disc's primary, and the circular speed under it -- attraction minus
+ * a short-range repulsive core, without which the population collapses to a
+ * point. Its own pair, because this mode's core is stronger than mode 0's and
+ * carries no disc mass beside it.
+ */
+fn bdCoreF(q : f32) -> f32 {
+  return BD_G_CORE / (q * sqrt(q)) - 0.0025 / (q * q);
+}
+
+fn bdVCirc(r : f32) -> f32 {
+  let q = r * r + 0.004;
+  return r * sqrt(max(0.0, bdCoreF(q)));
+}
+
+/**
+ * The radius a particle belongs at, from its species -- and deliberately not a
+ * clean function of it.
+ *
+ * Some species/radius correlation has to survive recycling. Returning everything
+ * to one shared band was measured to converge all six species onto the same mean
+ * radius within a minute, and additive blending over a mixed population is grey:
+ * the disc whitens and the filter chips stop carving anything.
+ *
+ * But the first fix for that -- one hard annulus per species -- traded the
+ * problem for a worse one. Six disjoint bands draw six clean concentric rings,
+ * and clean concentric rings look authored. This demo's whole claim is that its
+ * structure is emergent, and a ring you can predict from a constant is not.
+ *
+ * So the bands overlap, by more than a full species width. Each particle draws a
+ * home radius from a distribution centred on its species and wide enough to
+ * reach well into its neighbours'. Statistically the six colors still occupy six
+ * different parts of the disc. Locally, no edge between them is anywhere.
+ */
+fn bdHomeRadius(i : u32) -> f32 {
+  let j = (hash(i * 11u + 5u) - 0.5) * BD_SPECIES_SPREAD;
+  let f = clamp((f32(cspecies[i]) + 0.5 + j) / 6.0, 0.04, 1.0);
+  return BD_RETURN_LO + (BD_RETURN_HI - BD_RETURN_LO) * f;
+}
+
+/**
+ * Put a particle back on the disc, on a circular orbit along its current ray.
+ *
+ * Both ends of the disc leak, and each leak is what this mode used to decay into.
+ *
+ * Outward: the box walls used to be inelastic reflectors, so every grain the
+ * cursor threw out ended up sliding along an edge. Enough of them tile the square
+ * with a uniform speckle that nothing ever clears -- that was the static.
+ *
+ * Inward: a bar torques angular momentum outward, which drives the material that
+ * loses it toward the centre; the radial damping then makes that one-way. Real
+ * bars do exactly this, and it is why they fuel nuclear starbursts. Measured
+ * here, the entire disc was inside r < 0.2 within thirty seconds, which is the
+ * white blob. Left alone, the honest end state of this system is a point.
+ *
+ * So the disc is closed rather than conservative: what falls through the middle
+ * comes back at the edge. This is the one piece of the force law that is a choice
+ * about the toy rather than about the physics, and it is what makes the steady
+ * state a structured disc instead of a bright dot.
+ */
+fn bdRespawn(i : u32, dir : vec2<f32>, spin : f32) -> vec4<f32> {
+  let r = bdHomeRadius(i);
+  let vOrb = bdVCirc(r) * spin;
+  return vec4<f32>(dir * r, -dir.y * vOrb, dir.x * vOrb);
+}
+
+fn bdDamping(r : f32) -> f32 {
+  return mix(BD_DAMP_INNER, BD_DAMP_OUTER, smoothstep(0.25, 0.6, r));
+}
+
+/**
+ * Rotating bar: an m=2 quadrupole turning at a fixed pattern speed.
+ *
+ * This disc has no self-gravity -- every particle is an independent test particle
+ * in a smooth potential. That has a consequence which no amount of tuning fixes:
+ * inner orbits run faster than outer ones, so any arm the cursor raises shears,
+ * winds up, and phase-mixes below pixel size within seconds. Real spiral arms are
+ * held together by the disc's own gravity responding to itself, which is what
+ * mode 0 does and this one cannot.
+ *
+ * A rotating quadrupole replaces decay with a *driving* frequency. Orbits whose
+ * own frequency resonates with the pattern get herded onto closed orbits and stay
+ * there: a ring near the inner Lindblad resonance, another near the outer one,
+ * with the bar between them. This is why real barred galaxies have rings, and
+ * unlike a stirred arm it cannot mix away, because the driver never stops. The
+ * resting state becomes structure rather than mush.
+ *
+ *   phi(r, th) = A(r) * cos(2 * (th - OMEGA * t)),   A(r) = -K r^2 / (r^2 + a^2)^2
+ *
+ * A vanishes at the centre and falls off outside a, so the bar is confined to the
+ * disc and the core stays a clean monopole. Forces are the exact gradient of that
+ * potential, so the pattern shuffles energy between orbits without injecting any.
+ *
+ * ur is the outward radial unit vector; the double angle comes from it directly
+ * (cos 2th = ux^2 - uy^2, sin 2th = 2 ux uy), so there is no atan2 per particle.
+ */
+fn bdBar(ur : vec2<f32>, r : f32, t : f32) -> vec2<f32> {
+  let c2 = ur.x * ur.x - ur.y * ur.y;
+  let s2 = 2.0 * ur.x * ur.y;
+  let cp = cos(2.0 * BD_BAR_OMEGA * t);
+  let sp = sin(2.0 * BD_BAR_OMEGA * t);
+  // Rotate the pattern: angles relative to the bar, not to the screen.
+  let cos2 = c2 * cp + s2 * sp;
+  let sin2 = s2 * cp - c2 * sp;
+
+  let q = r * r + BD_BAR_A2;
+  let a = -BD_BAR_K * r * r / (q * q);
+  let da = -2.0 * BD_BAR_K * r * (BD_BAR_A2 - r * r) / (q * q * q);
+
+  let fr = -da * cos2;          // -dphi/dr
+  let ft = 2.0 * a * sin2 / r;  // -(1/r) dphi/dth
+  return ur * fr + vec2<f32>(-ur.y, ur.x) * ft;
+}
+
+fn bdIntegrate(i : u32, p : vec4<f32>, dt : f32) -> vec4<f32> {
+  // Primary: fixed at the origin. This is what holds the disc together.
+  let dc = -p.xy;
+  let dc2 = dot(dc, dc) + 0.004;
+  let rc = sqrt(dc2);
+  let fc = bdCoreF(dc2);
+
+  // Secondary: the cursor. Softened harder so a direct hit shears rather than
+  // slingshots.
+  let dm = vec2<f32>(params.mx - p.x, params.my - p.y);
+  let dm2 = dot(dm, dm) + 0.02;
+  let fm = params.gcur / (dm2 * sqrt(dm2));
+
+  // Rotating pattern. Without it the disc is a decaying system with nothing to
+  // regenerate structure; with it, rings are where the disc settles.
+  let ur = -dc / rc;
+  let fb = bdBar(ur, rc, params.time);
+
+  var v = p.zw + dc * fc * dt + dm * fm * dt + fb * dt;
+
+  // Damp the RADIAL component only -- see the integrate entry point for why
+  // uniform damping collapses a disc into a ball.
+  //
+  // The rate is a function of radius, and it has to be. Measured at a single
+  // uniform rate, the two failure modes are exclusive: damp hard enough to
+  // circularize the scattered material (which is what stops the field turning
+  // into speckle) and the bar's torque drains the disc inward until the inner
+  // annulus is fourteen times denser than everything else -- the white core.
+  // Damp gently enough to prevent that and the speckle never clears. Dissipating
+  // in the outer disc and not in the inner one separates the two.
+  let rdir = dc / rc;
+  let vRad = dot(v, rdir) * rdir;
+  v = (v - vRad) + vRad * bdDamping(rc);
+
+  // Whisper of global damping purely to bound energy the moving cursor injects.
+  v = v * 0.99995;
+
+  let speed = length(v);
+  if (speed > V_MAX) { v = v * (V_MAX / speed); }
+
+  let pos = p.xy + v * dt;
+
+  // Close the disc at both ends -- see bdRespawn(). Sign of angular momentum is
+  // carried across, so a recycled grain rejoins moving the way the disc moves.
+  //
+  // The inner bound is per particle, at a fraction of its own home radius -- so
+  // it is as ragged as bdHomeRadius() is, and the hole in the middle has no
+  // clean edge.
+  let floorR = max(0.05, bdHomeRadius(i) * BD_CORE_FRAC);
+  let pr = length(pos);
+  if (pr > BD_ESCAPE_R || pr < floorR) {
+    let spin = select(-1.0, 1.0, (pos.x * v.y - pos.y * v.x) >= 0.0);
+    return bdRespawn(i, pos / max(pr, 1e-6), spin);
+  }
+
+  return vec4<f32>(pos, v);
+}
+
+/**
+ * Galaxy collision: the restricted three-body model.
+ *
+ * Two cores on their own two-body orbit, solved on the CPU and arriving here as
+ * five floats; every particle is a massless test particle in the sum of their two
+ * fields. Toomre & Toomre showed in 1972 that this -- no self-gravity, no gas,
+ * no N-body -- is enough to produce the tidal tails and the bridge that the
+ * Antennae and the Mice are famous for. The tails are not thrown out by the
+ * collision so much as left behind by it: material on the far side of each disc
+ * is held less tightly than material on the near side, so the differential pull
+ * stretches the disc into a tail pointing away and a bridge pointing across.
+ *
+ * The disc's spin sense relative to the orbit is the whole story. A prograde
+ * encounter -- disc rotating the same way the cores swing -- keeps the outer
+ * particles in step with the perturber for a long fraction of an orbit, and that
+ * sustained pull is what throws a tail half the frame long. Flip the spin and
+ * the same encounter barely marks it. Press R to see the difference; it is the
+ * single most surprising result in the file.
+ *
+ * Nothing is recycled here and there are no walls. A tail is material genuinely
+ * leaving, and catching it would be catching the thing worth watching.
+ */
+fn collide(p : vec4<f32>, dt : f32) -> vec4<f32> {
+  let d0 = params.c0 - p.xy;
+  let q0 = dot(d0, d0) + 0.004;
+  let d1 = params.c1 - p.xy;
+  let q1 = dot(d1, d1) + 0.004;
+
+  let dm = vec2<f32>(params.mx - p.x, params.my - p.y);
+  let qm = dot(dm, dm) + 0.02;
+
+  var v = p.zw
+    + d0 * (params.pmass / (q0 * sqrt(q0))) * dt
+    + d1 * (params.pmass / (q1 * sqrt(q1))) * dt
+    + dm * (params.gcur / (qm * sqrt(qm))) * dt;
+
+  let speed = length(v);
+  if (speed > V_MAX) { v = v * (V_MAX / speed); }
+  return vec4<f32>(p.xy + v * dt, v);
+}
+
+/**
+ * The original disc: anchored monopole, weak cursor, uniform radial damping,
+ * walls. Nothing drives it and nothing responds to it, so it phase-mixes into a
+ * smooth annulus within seconds and stays there -- which is what both the bar
+ * above and the self-gravity below exist to answer. Kept so the comparison can
+ * be watched rather than described.
+ */
+fn clsIntegrate(p : vec4<f32>, dt : f32) -> vec4<f32> {
+  let dc = -p.xy;
+  let dc2 = dot(dc, dc) + 0.004;
+  let rc = sqrt(dc2);
+  let fc = CL_G_CORE / (dc2 * rc) - 0.0025 / (dc2 * dc2);
+
+  let dm = vec2<f32>(params.mx - p.x, params.my - p.y);
+  let dm2 = dot(dm, dm) + 0.02;
+  let fm = CL_G_CURSOR / (dm2 * sqrt(dm2));
+
+  var v = p.zw + dc * fc * dt + dm * fm * dt;
+
+  let rdir = dc / rc;
+  let vRad = dot(v, rdir) * rdir;
+  v = (v - vRad) + vRad * CL_RADIAL_DAMP;
+  v = v * 0.99995;
+
+  let speed = length(v);
+  if (speed > V_MAX) { v = v * (V_MAX / speed); }
+
+  var pos = p.xy + v * dt;
+
+  // Inelastic walls: perfectly elastic ones let escapees accumulate speed.
+  let bounce = 0.45;
+  if (pos.x < -1.0) { pos.x = -1.0; v.x = -v.x * bounce; }
+  else if (pos.x > 1.0) { pos.x = 1.0; v.x = -v.x * bounce; }
+  if (pos.y < -1.0) { pos.y = -1.0; v.y = -v.y * bounce; }
+  else if (pos.y > 1.0) { pos.y = 1.0; v.y = -v.y * bounce; }
+
+  return vec4<f32>(pos, v);
 }
 
 // --- self-gravity: three passes over a GRID x GRID mesh ----------------------
@@ -363,46 +627,6 @@ fn sampleField(p : vec2<f32>) -> vec2<f32> {
   return a;
 }
 
-/**
- * Uniformly redistribute the population. Dispatched once when entering Chladni
- * mode: the plate has to start as evenly spread sand. Arriving from the galaxy
- * with everything piled in the core produces one bright diagonal and nothing
- * else, because a grain that reaches a node has zero vibration amplitude and
- * never moves again.
- */
-@compute @workgroup_size(${WORKGROUP})
-fn scatter(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x;
-  if (i >= arrayLength(&parts)) { return; }
-
-  if (params.mode == 1u) {
-    // Chladni: evenly spread sand.
-    parts[i] = vec4<f32>(
-      hash(i * 3u) * 2.0 - 1.0,
-      hash(i * 3u + 1u) * 2.0 - 1.0,
-      0.0, 0.0
-    );
-    return;
-  }
-
-  // Galaxy: re-seed the orbital disc. Returning from Chladni would otherwise
-  // leave a million grains sitting on nodal lines with zero angular momentum,
-  // and they would simply rain into the core.
-  let a = hash(i * 3u) * 6.2831853;
-  let r = sampleRadius(hash(i * 3u + 1u), hash(i * 5u + 17u));
-  let vOrb = vCirc(r);
-  // Box-Muller, from two more hashes. A cold disc fragments instead of forming
-  // arms -- see SIGMA_FRAC in sim/world.ts.
-  let g1 = sqrt(-2.0 * log(max(1e-9, hash(i * 3u + 2u))));
-  let g2 = 6.2831853 * hash(i * 7u + 13u);
-  parts[i] = vec4<f32>(
-    cos(a) * r,
-    sin(a) * r,
-    -sin(a) * vOrb + g1 * cos(g2) * vOrb * SIGMA_FRAC,
-    cos(a) * vOrb + g1 * sin(g2) * vOrb * SIGMA_FRAC
-  );
-}
-
 @compute @workgroup_size(${WORKGROUP})
 fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = gid.x;
@@ -411,8 +635,20 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   var p = parts[i];
   let dt = params.dt;
 
-  if (params.mode == 1u) {
+  if (params.mode == ${CHLADNI}u) {
     parts[i] = chladni(i, p, dt);
+    return;
+  }
+  if (params.mode == ${BARRED}u) {
+    parts[i] = bdIntegrate(i, p, dt);
+    return;
+  }
+  if (params.mode == ${COLLISION}u) {
+    parts[i] = collide(p, dt);
+    return;
+  }
+  if (params.mode == ${CLASSIC}u) {
+    parts[i] = clsIntegrate(p, dt);
     return;
   }
 
@@ -543,14 +779,34 @@ fn vs(@builtin(vertex_index) vi : u32, @builtin(instance_index) ii : u32) -> VSO
   // by the ratio between them fills the frame without reintroducing any
   // distortion -- the few particles thrown past the edge are clipped, which is
   // the right trade for not framing mostly-empty space.
-  let s = rparams.vscale;
-  let fx = s / max(rparams.aspect, 1.0);
-  let fy = s * min(rparams.aspect, 1.0);
-  out.pos = vec4<f32>(
-    (p.x + corner.x * size) * fx,
-    (p.y + corner.y * size) * fy,
-    0.0, 1.0
-  );
+  //
+  // Each mode keeps the framing it was built with. The fixed-potential discs fit
+  // the box rather than the disc inside it and pull the camera back for the
+  // collision, whose tails leave the frame at their best moment otherwise; the
+  // original mode does not correct aspect at all, which is what makes its
+  // circular orbits draw as ellipses on a wide monitor.
+  let a = rparams.aspect;
+  if (rparams.mode == ${CLASSIC}u) {
+    out.pos = vec4<f32>(p.x + corner.x * size / a, p.y + corner.y * size, 0.0, 1.0);
+  } else if (rparams.mode == ${BARRED}u || rparams.mode == ${COLLISION}u) {
+    let fx = 1.0 / max(a, 1.0);
+    let fy = min(a, 1.0);
+    let sc = rparams.scale;
+    out.pos = vec4<f32>(
+      (p.x * sc + corner.x * size) * fx,
+      (p.y * sc + corner.y * size) * fy,
+      0.0, 1.0
+    );
+  } else {
+    let s = rparams.vscale;
+    let fx = s / max(a, 1.0);
+    let fy = s * min(a, 1.0);
+    out.pos = vec4<f32>(
+      (p.x + corner.x * size) * fx,
+      (p.y + corner.y * size) * fy,
+      0.0, 1.0
+    );
+  }
   out.uv = corner;
   out.speed = clamp(length(p.zw) * 0.22, 0.0, 1.0);
   // Shift toward white with speed so the dense hot core still reads as bright
@@ -696,13 +952,16 @@ export async function createWebGPUBackend(
   });
   device.queue.writeBuffer(particleBuf, 0, sim.particles);
 
+  // 112 bytes: 22 scalars, then the two collision cores and their mass. Must
+  // match the Params struct exactly, vec2 alignment included.
+  const PARAM_BYTES = 112;
   const paramBuf = device.createBuffer({
-    size: 80,
+    size: PARAM_BYTES,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  // Reused every frame; the only per-frame CPU->GPU traffic in the demo (80 bytes).
+  // Reused every frame; the only per-frame CPU->GPU traffic in the demo.
   // Two views over one buffer because `mask` is a u32 among f32s.
-  const paramBytes = new ArrayBuffer(80);
+  const paramBytes = new ArrayBuffer(PARAM_BYTES);
   const paramData = new Float32Array(paramBytes);
   const paramU32 = new Uint32Array(paramBytes);
 
@@ -728,22 +987,29 @@ export async function createWebGPUBackend(
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
   });
 
-  // Species ids, uploaded once and never touched again. u32 rather than u8:
-  // WGSL storage arrays have no 8-bit element type.
+  // Species ids. u32 rather than u8: WGSL storage arrays have no 8-bit element
+  // type. Re-uploaded on a mode switch, because each family bands species by
+  // radius differently — see seedMode() in sim/modes.ts.
   const speciesData = new Uint32Array(sim.capacity);
-  for (let i = 0; i < sim.capacity; i++) speciesData[i] = sim.species[i];
   const speciesBuf = device.createBuffer({
     size: speciesData.byteLength,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   });
-  device.queue.writeBuffer(speciesBuf, 0, speciesData);
+  const uploadSpecies = () => {
+    for (let i = 0; i < sim.capacity; i++) speciesData[i] = sim.species[i];
+    device.queue.writeBuffer(speciesBuf, 0, speciesData);
+  };
+  uploadSpecies();
 
   let mask = (1 << 6) - 1;
-  let mode = 0;
+  let mode = SELFGRAV;
   let cooling = RADIAL_DAMP;
   let mono = false;
   let elapsed = 0;
-  let pendingScatter = false;
+  let cursorMass = barred.G_CURSOR;
+  // Replaced by setPair() before collision mode is ever entered; seeded here so
+  // the uniform is never read uninitialized.
+  let pair: PairState = createPair();
 
   // One staging buffer + one CPU-side view, allocated once. The list pulls a
   // small window through these every frame, so allocating per call would show
@@ -812,7 +1078,6 @@ export async function createWebGPUBackend(
     device.createComputePipeline({ layout: computeLayoutDesc, compute: { module, entryPoint } });
 
   const computePipeline = mkCompute('integrate');
-  const scatterPipeline = mkCompute('scatter');
   const clearPipeline = mkCompute('clearGrid');
   const depositPipeline = mkCompute('depositMass');
   const bakePipeline = mkCompute('bakeGrid');
@@ -822,25 +1087,38 @@ export async function createWebGPUBackend(
   // in WebGPU and gives the additive sum somewhere to go above 1.0.
   const HDR_FORMAT: GPUTextureFormat = 'rgba16float';
 
-  const renderPipeline = device.createRenderPipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [renderLayout] }),
-    vertex: { module, entryPoint: 'vs' },
-    fragment: {
-      module,
-      entryPoint: 'fs',
-      targets: [
-        {
-          format: HDR_FORMAT,
-          // Additive: overlapping particles bloom instead of occluding.
-          blend: {
-            color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
-            alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+  /**
+   * The same particle pass, once per target format.
+   *
+   * The self-gravitating disc and the plate accumulate into the HDR texture and
+   * are tonemapped; the fixed-potential modes draw straight to the swap chain
+   * and clip at 1.0, which is the renderer they were built against and part of
+   * how they look. A pipeline is bound to one target format, so this is two
+   * objects rather than a flag.
+   */
+  const mkRender = (target: GPUTextureFormat) =>
+    device.createRenderPipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [renderLayout] }),
+      vertex: { module, entryPoint: 'vs' },
+      fragment: {
+        module,
+        entryPoint: 'fs',
+        targets: [
+          {
+            format: target,
+            // Additive: overlapping particles bloom instead of occluding.
+            blend: {
+              color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+              alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+            },
           },
-        },
-      ],
-    },
-    primitive: { topology: 'triangle-list' },
-  });
+        ],
+      },
+      primitive: { topology: 'triangle-list' },
+    });
+
+  const renderPipeline = mkRender(HDR_FORMAT);
+  const directPipeline = mkRender(format);
 
   const tonemapLayout = device.createBindGroupLayout({
     entries: [
@@ -899,6 +1177,22 @@ export async function createWebGPUBackend(
 
   let count = sim.count;
 
+  /**
+   * Re-seed the population for the current mode.
+   *
+   * Deterministic CPU seeding and one upload, rather than a GPU kernel that
+   * redraws radius from a hash: species is assigned *from* radius, and the
+   * species buffer is the CPU's, so redrawing radii on the GPU independently of
+   * it returns a disc with no color bands at all. It also keeps every mode's
+   * initial conditions in one readable place — see seedMode() in sim/modes.ts.
+   * One 16 MB upload on a keypress is a fine price for both.
+   */
+  function seed() {
+    seedMode(sim, mode, pair);
+    uploadSpecies();
+    device.queue.writeBuffer(particleBuf, 0, sim.particles);
+  }
+
   return {
     name: 'webgpu',
     detail: `${adapter.info?.vendor ?? 'gpu'} ${adapter.info?.architecture ?? ''}`.trim(),
@@ -913,14 +1207,7 @@ export async function createWebGPUBackend(
 
     setMode(m: number) {
       mode = m | 0;
-      if (mode === 0) {
-        // See reset(): the GPU scatter kernel cannot restore the color bands.
-        seedGalaxy(sim);
-        device.queue.writeBuffer(particleBuf, 0, sim.particles);
-        pendingScatter = false;
-      } else {
-        pendingScatter = true;
-      }
+      seed();
     },
 
     setCooling(v: number) {
@@ -931,23 +1218,25 @@ export async function createWebGPUBackend(
       mono = v;
     },
 
+    setCursorMass(m: number) {
+      cursorMass = m;
+    },
+
+    setPair(p: PairState) {
+      pair = p;
+    },
+
     reset() {
       elapsed = 0;
-      if (mode === 0) {
-        // Re-run the deterministic CPU seeding and re-upload, so restarting
-        // reproduces the load state exactly — including the species/radius
-        // correlation that the color bands depend on. The GPU scatter kernel
-        // cannot do this: it redraws radius from a hash, and species was
-        // assigned from radius, so it would return a disc with no bands. One
-        // 16 MB upload on a keypress is a fine price for that.
-        seedGalaxy(sim);
-        device.queue.writeBuffer(particleBuf, 0, sim.particles);
-      } else {
-        pendingScatter = true;
-      }
+      seed();
     },
 
     frame(dt: number, mx: number, my: number, grav = 1) {
+      // The self-gravitating disc and the plate are tonemapped out of an HDR
+      // buffer; the fixed-potential modes draw straight to the swap chain, which
+      // is the renderer each of them was tuned against.
+      const hdr = mode === SELFGRAV || mode === CHLADNI;
+
       paramData[0] = dt;
       paramData[1] = mx;
       paramData[2] = my;
@@ -964,16 +1253,18 @@ export async function createWebGPUBackend(
       // The overdraw is not where the time is going (see the notes on the mesh
       // solver), so this stays at the value that renders arms with body to them.
       paramData[4] = Math.min(0.006, Math.max(0.0018, 0.06 / Math.sqrt(count)));
-      // Purely a normalization now: total light deposited across the frame is
-      // held constant as the population changes, and the tonemap decides how
-      // bright that ends up looking. The old value was clamped at 0.3 because it
-      // also had to stop the core clipping, which it could not actually do.
-      paramData[5] = 60_000 / count;
+      // Under the tonemap this is purely a normalization: total light deposited
+      // across the frame is held constant as the population changes, and the
+      // tonemap decides how bright that ends up looking. Drawing direct to the
+      // swap chain it has to double as the saturation guard again, clamped low
+      // because the core reaches very high overdraw and additive blending clips
+      // to white there long before the arms are lit.
+      paramData[5] = hdr ? 60_000 / count : Math.min(1, Math.max(0.3, 120_000 / count));
       paramU32[6] = mask;
       paramU32[7] = mode;
       elapsed += dt;
       paramData[8] = elapsed;
-      if (mode === 1) {
+      if (mode === CHLADNI) {
         // Cursor sweeps the base frequency over a wide band — x drives n, y
         // drives m, each roughly 1..13. Combined with the per-species offsets
         // that spans simple crosses through to dense lattices. A slow idle
@@ -1007,6 +1298,16 @@ export async function createWebGPUBackend(
       paramData[17] = (M_DISC / CELLS) * 1e-3;
       paramData[18] = mono ? 1 : 0;
       paramData[19] = grav;
+      paramData[20] = cursorMass;
+      // The collision spans a wider field than a disc does; pull the camera back
+      // so the tails stay on screen instead of leaving the frame at their best
+      // moment. Every other fixed-potential mode is framed at 1:1.
+      paramData[21] = mode === COLLISION ? 0.55 : 1;
+      paramData[22] = pair.x0;
+      paramData[23] = pair.y0;
+      paramData[24] = pair.x1;
+      paramData[25] = pair.y1;
+      paramData[26] = PAIR_MASS;
       device.queue.writeBuffer(paramBuf, 0, paramBytes);
 
       const enc = device.createCommandEncoder();
@@ -1015,19 +1316,14 @@ export async function createWebGPUBackend(
       const cellGroups = Math.ceil(CELLS / WORKGROUP);
       const cpass = enc.beginComputePass();
       cpass.setBindGroup(0, computeBind);
-      if (pendingScatter) {
-        pendingScatter = false;
-        cpass.setPipeline(scatterPipeline);
-        cpass.dispatchWorkgroups(groups);
-      }
-      // Self-gravity, galaxy mode only — the Chladni plate is a prescribed
-      // field and the particles there are not supposed to see each other at all.
+      // Self-gravity, mode 0 only — every other mode is a prescribed field and
+      // the particles in them are not supposed to see each other at all.
       //
       // Dispatches inside one compute pass are ordered and their writes are
       // visible to the next, so these four need no explicit barrier: the mesh
       // is fully deposited before it is solved, and fully solved before it is
       // sampled.
-      if (mode === 0) {
+      if (mode === SELFGRAV) {
         cpass.setPipeline(clearPipeline);
         cpass.dispatchWorkgroups(cellGroups);
         cpass.setPipeline(depositPipeline);
@@ -1041,39 +1337,48 @@ export async function createWebGPUBackend(
       cpass.dispatchWorkgroups(groups);
       cpass.end();
 
-      // Pass 1: accumulate into HDR. Cleared to zero, not to the background
-      // color — the background is added after the tonemap so it does not get
-      // compressed along with the particles.
+      // Accumulate the particles. Into HDR when there is a tonemap to follow,
+      // cleared to zero rather than to the background color so the background
+      // does not get compressed along with them; otherwise straight to the swap
+      // chain, over the background, which is what the fixed-potential modes did.
       const rpass = enc.beginRenderPass({
         colorAttachments: [
-          {
-            view: hdrTex!.createView(),
-            clearValue: { r: 0, g: 0, b: 0, a: 0 },
-            loadOp: 'clear',
-            storeOp: 'store',
-          },
+          hdr
+            ? {
+                view: hdrTex!.createView(),
+                clearValue: { r: 0, g: 0, b: 0, a: 0 },
+                loadOp: 'clear',
+                storeOp: 'store',
+              }
+            : {
+                view: ctx.getCurrentTexture().createView(),
+                clearValue: { r: 0.027, g: 0.035, b: 0.051, a: 1 },
+                loadOp: 'clear',
+                storeOp: 'store',
+              },
         ],
       });
-      rpass.setPipeline(renderPipeline);
+      rpass.setPipeline(hdr ? renderPipeline : directPipeline);
       rpass.setBindGroup(0, renderBind);
       rpass.draw(6, count);
       rpass.end();
 
-      // Pass 2: tonemap to the swap chain.
-      const tpass = enc.beginRenderPass({
-        colorAttachments: [
-          {
-            view: ctx.getCurrentTexture().createView(),
-            loadOp: 'clear',
-            clearValue: { r: 0, g: 0, b: 0, a: 1 },
-            storeOp: 'store',
-          },
-        ],
-      });
-      tpass.setPipeline(tonemapPipeline);
-      tpass.setBindGroup(0, tonemapBind!);
-      tpass.draw(3);
-      tpass.end();
+      if (hdr) {
+        const tpass = enc.beginRenderPass({
+          colorAttachments: [
+            {
+              view: ctx.getCurrentTexture().createView(),
+              loadOp: 'clear',
+              clearValue: { r: 0, g: 0, b: 0, a: 1 },
+              storeOp: 'store',
+            },
+          ],
+        });
+        tpass.setPipeline(tonemapPipeline);
+        tpass.setBindGroup(0, tonemapBind!);
+        tpass.draw(3);
+        tpass.end();
+      }
 
       device.queue.submit([enc.finish()]);
     },

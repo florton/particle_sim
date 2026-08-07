@@ -19,12 +19,17 @@ import {
   RADIAL_DAMP,
   integrateChladniCPU,
   chladniWarp,
-  reseed,
+  reseedGalaxy,
+  scatterPlate,
   STRIDE,
   SPECIES_NAMES,
   SPECIES_COLORS,
   type Sim,
 } from './sim/world';
+import * as barred from './sim/barred';
+import * as classic from './sim/classic';
+import { BARRED, CHLADNI, CLASSIC, COLLISION } from './sim/modes';
+import { createPair, type PairState } from './sim/pair';
 
 /** Even this is generous — 5000 absolutely-positioned nodes is already a lot. */
 export const BASELINE_COUNT = 5_000;
@@ -39,6 +44,8 @@ export class BaselineArm {
   private active = false;
   private mode = 0;
   private elapsed = 0;
+  /** Replaced by setMode() before the collision is ever compared. */
+  private pair: PairState = createPair();
 
   constructor(
     private sim: Sim,
@@ -113,27 +120,53 @@ export class BaselineArm {
   }
 
   /** Re-seed for the mode being compared, so both arms start from like states. */
-  setMode(mode: number) {
+  setMode(mode: number, pair: PairState) {
     this.mode = mode;
+    this.pair = pair;
     this.reset();
   }
 
   reset() {
     this.elapsed = 0;
-    reseed(this.sim, BASELINE_COUNT, this.mode);
+    // Species is left alone: it belongs to the GPU arm's population, which is
+    // still the one the sidebar and the chips are reading.
+    switch (this.mode) {
+      case CHLADNI: scatterPlate(this.sim, BASELINE_COUNT); break;
+      case BARRED: barred.reseedDisc(this.sim, BASELINE_COUNT); break;
+      case COLLISION: barred.reseedCollision(this.sim, BASELINE_COUNT, this.pair); break;
+      case CLASSIC: classic.reseed(this.sim, BASELINE_COUNT); break;
+      default: reseedGalaxy(this.sim, BASELINE_COUNT);
+    }
   }
 
-  frame(dt: number, mx: number, my: number, grav = 1) {
+  /**
+   * `grav` is the self-gravitating disc's ramped cursor multiplier; `cursorMass`
+   * is the fixed-potential modes' switched cursor mass. Each mode reads the one
+   * that belongs to it — see sim/modes.ts.
+   */
+  frame(dt: number, mx: number, my: number, grav = 1, cursorMass = barred.G_CURSOR) {
     if (!this.active) return;
 
     this.elapsed += dt;
     const saved = this.sim.count;
     this.sim.count = BASELINE_COUNT;
-    if (this.mode === 1) {
-      const { n, m } = chladniWarp(mx, my, this.elapsed);
-      integrateChladniCPU(this.sim, dt, n, m, this.elapsed);
-    } else {
-      integrateCPU(this.sim, dt, mx, my, this.cooling, grav);
+    switch (this.mode) {
+      case CHLADNI: {
+        const { n, m } = chladniWarp(mx, my, this.elapsed);
+        integrateChladniCPU(this.sim, dt, n, m, this.elapsed);
+        break;
+      }
+      case BARRED:
+        barred.integrateCPU(this.sim, dt, mx, my, this.elapsed, cursorMass);
+        break;
+      case COLLISION:
+        barred.integrateCollisionCPU(this.sim, dt, mx, my, this.pair, cursorMass);
+        break;
+      case CLASSIC:
+        classic.integrateCPU(this.sim, dt, mx, my);
+        break;
+      default:
+        integrateCPU(this.sim, dt, mx, my, this.cooling, grav);
     }
     this.sim.count = saved;
 

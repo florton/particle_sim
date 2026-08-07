@@ -3,6 +3,9 @@ import { Hud, type HudCounters } from './hud';
 import {
   createSim, integrateCPU, RADIAL_DAMP, SPECIES_NAMES, SPECIES_COLORS, G_CURSOR_HOLD,
 } from './sim/world';
+import * as barred from './sim/barred';
+import { COLLISION, MODES, MODE_COUNT, SELFGRAV } from './sim/modes';
+import { createPair, pairSeparation, resetPair, stepPair } from './sim/pair';
 import { VirtualList } from './ui/list';
 import { speciesMask, toggleSpecies, filterLabel, countEffect, effectRuns, arm } from './ui/state';
 import type { Backend } from './render/backend';
@@ -52,19 +55,28 @@ addEventListener('pointermove', (e) => {
   my = -((e.clientY / innerHeight) * 2 - 1);
 });
 
+const backend = await selectBackend();
+backend.setCount(CAPACITY);
+counters.backend = `${backend.name} · ${backend.detail}`;
+
 // --- hold to pull ---------------------------------------------------------
 //
-// Holding the pointer down ramps the cursor's mass toward G_CURSOR_HOLD instead
-// of switching it there. The ramp is the whole reason this is usable: the force
-// law is integrated explicitly, so a step change in a term that big arrives as
-// an impulse — every particle near the cursor gets a full frame of the new
-// acceleration at its old position, and the disc shatters rather than gathers.
-// Ramped over a few hundred milliseconds the orbits track it and you get the
-// intended thing: a well that deepens under your finger, material falling in
-// along an arm, and the disc re-forming once you let go.
+// In the self-gravitating disc, holding the pointer down ramps the cursor's mass
+// toward G_CURSOR_HOLD instead of switching it there. The ramp is the whole
+// reason this is usable: the force law is integrated explicitly, so a step
+// change in a term that big arrives as an impulse — every particle near the
+// cursor gets a full frame of the new acceleration at its old position, and the
+// disc shatters rather than gathers. Ramped over a few hundred milliseconds the
+// orbits track it and you get the intended thing: a well that deepens under your
+// finger, material falling in along an arm, and the disc re-forming once you let
+// go.
 //
 // Release is faster than the ramp. Building the well is the interaction and
 // wants to feel deliberate; letting go should just let go.
+//
+// The fixed-potential modes switch between two cursor masses instead, and can:
+// nothing there amplifies its own density contrast, so an impulse stirs the disc
+// rather than collapsing it. See sim/modes.ts.
 const GRAV_RAMP = 3.5; // e-folds per second, held
 const GRAV_RELEASE = 8; // e-folds per second, released
 let holding = false;
@@ -75,17 +87,19 @@ let grav = 1;
 const overUI = (t: EventTarget | null) =>
   t instanceof Element && !!t.closest('#sidebar, #hud, #banner');
 
-addEventListener('pointerdown', (e) => {
-  if (e.button === 0 && !overUI(e.target)) holding = true;
-});
-addEventListener('pointerup', () => { holding = false; });
-addEventListener('pointercancel', () => { holding = false; });
-// A pointer released outside the window never reports up.
-addEventListener('blur', () => { holding = false; });
+function setHolding(next: boolean) {
+  if (holding === next) return;
+  holding = next;
+  backend.setCursorMass(holding ? barred.G_CURSOR_HELD : barred.G_CURSOR);
+}
 
-const backend = await selectBackend();
-backend.setCount(CAPACITY);
-counters.backend = `${backend.name} · ${backend.detail}`;
+addEventListener('pointerdown', (e) => {
+  if (e.button === 0 && !overUI(e.target)) setHolding(true);
+});
+addEventListener('pointerup', () => setHolding(false));
+addEventListener('pointercancel', () => setHolding(false));
+// A pointer released outside the window never reports up.
+addEventListener('blur', () => setHolding(false));
 
 const listViewport = document.getElementById('list-viewport')!;
 const list = new VirtualList(listViewport, document.getElementById('list-spacer')!, sim, backend);
@@ -187,12 +201,16 @@ const banner = document.createElement('div');
 banner.id = 'banner';
 document.body.appendChild(banner);
 
-const modeLabel = () => (mode === 1 ? 'Chladni plate · 6 frequencies' : 'orbital galaxy');
+const modeLabel = () =>
+  mode === COLLISION
+    ? `${MODES[mode].label} · ${pair.spin1 > 0 ? 'prograde' : 'retrograde'}`
+    : MODES[mode].label;
 
 function refreshBanner() {
   banner.textContent =
     `${backend.name} compute · ${sim.count.toLocaleString()} particles · ${modeLabel()} — ` +
-    `hold to pull · [M] mode · [B] compare · [R] restart · [C] ${mono ? 'color' : 'mono'}`;
+    (MODES[mode].hold === 'none' ? '' : 'hold to pull · ') +
+    `[M] mode · [B] compare · [R] ${MODES[mode].restart} · [C] ${mono ? 'color' : 'mono'}`;
 }
 
 function setArm(next: 'gpu' | 'baseline') {
@@ -200,7 +218,7 @@ function setArm(next: 'gpu' | 'baseline') {
   if (next === 'baseline') {
     // Compare within the current mode: the naive arm runs the same force law the
     // GPU arm is running, not whichever one it happened to be written against.
-    baseline.setMode(mode);
+    baseline.setMode(mode, pair);
     baseline.start();
     canvas.style.display = 'none';
     banner.textContent =
@@ -218,10 +236,20 @@ function setArm(next: 'gpu' | 'baseline') {
   hud.reset();
 }
 
-let mode = 0;
+let mode = SELFGRAV;
+
+// The colliding pair. One object, mutated in place and held by reference on all
+// sides, so the per-frame cost of the whole encounter is two bodies of leapfrog.
+const pair = createPair();
+backend.setPair(pair);
+
 function setMode(next: number) {
   mode = next;
+  if (mode === COLLISION) resetPair(pair);
   backend.setMode(mode);
+  // The slider only means something to the self-gravitating disc; every other
+  // mode has a fixed dissipation law of its own.
+  coolRow.style.display = MODES[mode].cooling ? '' : 'none';
   if (arm() === 'gpu') refreshBanner();
   // Switching mode while comparing should switch the thing being compared.
   else setArm('baseline');
@@ -236,14 +264,33 @@ function setMono(next: boolean) {
 }
 
 function restart() {
+  if (mode === COLLISION) {
+    restartCollision();
+    return;
+  }
   backend.reset();
   baseline.reset();
   hud.reset();
 }
 
+/**
+ * Restart the encounter, flipping the disc's spin sense each time.
+ *
+ * Prograde and retrograde are the demonstration: the same two cores on the same
+ * orbit throw a tail half the frame long one way round and barely mark the disc
+ * the other. Alternating on every restart puts the two side by side in time.
+ */
+function restartCollision(flip = true) {
+  resetPair(pair, flip ? -pair.spin1 : pair.spin1);
+  backend.setMode(COLLISION);
+  if (arm() === 'baseline') baseline.setMode(COLLISION, pair);
+  else refreshBanner();
+  hud.reset();
+}
+
 addEventListener('keydown', (e) => {
   if (e.key === 'b' || e.key === 'B') setArm(arm() === 'gpu' ? 'baseline' : 'gpu');
-  if (e.key === 'm' || e.key === 'M') setMode(mode === 0 ? 1 : 0);
+  if (e.key === 'm' || e.key === 'M') setMode((mode + 1) % MODE_COUNT);
   if (e.key === 'r' || e.key === 'R') restart();
   if (e.key === 'c' || e.key === 'C') setMono(!mono);
 });
@@ -259,7 +306,9 @@ setArm('gpu');
 
 // Verification handle. Lets the sim be driven and inspected without relying on
 // rAF, so correctness is checkable independently of what the compositor is doing.
-(globalThis as any).__demo = { sim, backend, hud, counters, integrateCPU, list, effectRuns, setArm };
+(globalThis as any).__demo = {
+  sim, backend, baseline, hud, counters, integrateCPU, list, effectRuns, setArm,
+};
 
 let prev = performance.now();
 
@@ -270,8 +319,23 @@ function loop(now: number) {
   const dt = Math.min((now - prev) / 1000, 1 / 30);
   prev = now;
 
+  // The encounter is over once the cores are well separated and receding, or if
+  // they have gone quiet; loop it rather than leaving a spent remnant on screen.
+  if (mode === COLLISION) {
+    stepPair(pair, dt);
+    if (pair.elapsed > 6 && (pairSeparation(pair) > 2.4 || pair.elapsed > 42)) {
+      restartCollision();
+    }
+  }
+
   const target = holding ? G_CURSOR_HOLD : 1;
   grav += (target - grav) * (1 - Math.exp(-(holding ? GRAV_RAMP : GRAV_RELEASE) * dt));
+  // Snap, because the decay is asymptotic and never actually arrives. Every term
+  // the hold adds is gated on grav being above 1, and they are all written to
+  // vanish exactly at 1 — so leaving it resting at 1.0000001 would keep a dead
+  // capture-drag and a hair of extra cursor mass in the force law forever. Idle
+  // should be the same arithmetic it was before hold-to-pull existed.
+  if (!holding && grav < 1.001) grav = 1;
 
   if (arm() === 'gpu') {
     backend.frame(dt, mx, my, grav);
@@ -279,7 +343,7 @@ function loop(now: number) {
     counters.entities = sim.count;
     counters.domNodes = list.liveNodes;
   } else {
-    baseline.frame(dt, mx, my, grav);
+    baseline.frame(dt, mx, my, grav, holding ? barred.G_CURSOR_HELD : barred.G_CURSOR);
     counters.entities = baseline.count;
     counters.domNodes = baseline.domNodes;
   }

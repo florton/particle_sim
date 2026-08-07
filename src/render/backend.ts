@@ -1,3 +1,5 @@
+import type { PairState } from '../sim/pair';
+
 /** Hard cap on a single readback window, in particles. */
 export const READBACK_MAX = 4096;
 
@@ -13,8 +15,29 @@ export interface Backend {
    * test per vertex on the GPU — the CPU never walks the population to do it.
    */
   setSpeciesMask(mask: number): void;
-  /** 0 = orbital galaxy, 1 = Chladni plate. */
+  /**
+   * Switch simulation. The mode ids are the ones in sim/modes.ts, and the
+   * shaders switch on the same integers.
+   *
+   * Re-seeds the population for the mode, so calling it again is also how a
+   * collision is restarted.
+   */
   setMode(mode: number): void;
+  /**
+   * The two colliding cores. Read every frame in collision mode and at seeding
+   * time; ignored otherwise. The backend keeps the reference, so the caller may
+   * hold one object and mutate it.
+   */
+  setPair(pair: PairState): void;
+  /**
+   * Cursor mass for the fixed-potential modes, in their own units — held
+   * pointer is heavy enough to raise tidal tails, released is a light perturber
+   * the disc recovers from. Set on pointer transitions, not per frame.
+   *
+   * The self-gravitating disc does not use this: its hold ramps continuously
+   * and arrives as `grav` on frame(). See sim/modes.ts for why the two differ.
+   */
+  setCursorMass(m: number): void;
   /**
    * Radial-velocity retention per step — how fast the disc sheds orbital
    * eccentricity, which is the same thing as how cold it stays.
