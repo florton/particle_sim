@@ -12,7 +12,7 @@ checked. All figures below are measured, not estimated.
 | Build | Vite 6 — static output, no server or API |
 | Primary backend | WebGPU: one compute shader for integration, one instanced draw call |
 | Fallback backend | WebGL2 transform feedback, same force law |
-| Reactivity | `alien-signals`, scoped to interaction state only |
+| Reactivity | `alien-signals` — one signal, one effect, deliberately kept out of the frame loop |
 | Animation | `motion` for UI transitions |
 | Dependencies | 2 runtime packages; ~45 kB built, 15 kB gzipped JS |
 
@@ -277,7 +277,7 @@ Bash on Windows, MSYS mangles a leading-slash value into a Windows path — use
 | `src/render/webgpu.ts` | Compute + instanced render over one shared buffer. |
 | `src/render/webgl2.ts` | Transform-feedback fallback, same force law. |
 | `src/ui/list.ts` | Virtualized list + bounded windowed readback. |
-| `src/ui/state.ts` | Signals, scoped to interaction-driven state only. |
+| `src/ui/state.ts` | Signals, scoped to interaction-driven state only — the species filter and the active arm. |
 
 ## Known issues
 

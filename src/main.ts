@@ -7,7 +7,7 @@ import * as barred from './sim/barred';
 import { COLLISION, MODES, MODE_COUNT, SELFGRAV } from './sim/modes';
 import { createPair, pairSeparation, resetPair, stepPair } from './sim/pair';
 import { VirtualList } from './ui/list';
-import { speciesMask, toggleSpecies, filterLabel, countEffect, effectRuns, arm } from './ui/state';
+import { speciesMask, toggleSpecies, filterLabel, countEffect, effectRuns } from './ui/state';
 import type { Backend } from './render/backend';
 import { createWebGPUBackend } from './render/webgpu';
 import { createWebGL2Backend } from './render/webgl2';
@@ -225,8 +225,12 @@ function refreshBanner() {
     `[M] mode · [B] compare · [R] ${MODES[mode].restart} · [C] ${mono ? 'color' : 'mono'}`;
 }
 
+// Plain state, like `mode` and `mono` below: read imperatively at the few points
+// that branch on it, never subscribed to.
+let arm: 'gpu' | 'baseline' = 'gpu';
+
 function setArm(next: 'gpu' | 'baseline') {
-  arm(next);
+  arm = next;
   if (next === 'baseline') {
     // Compare within the current mode: the naive arm runs the same force law the
     // GPU arm is running, not whichever one it happened to be written against.
@@ -264,7 +268,7 @@ function setMode(next: number) {
   // The slider only means something to the self-gravitating disc; every other
   // mode has a fixed dissipation law of its own.
   coolRow.style.display = MODES[mode].cooling ? '' : 'none';
-  if (arm() === 'gpu') refreshBanner();
+  if (arm === 'gpu') refreshBanner();
   // Switching mode while comparing should switch the thing being compared.
   else setArm('baseline');
 }
@@ -274,7 +278,7 @@ function setMono(next: boolean) {
   mono = next;
   backend.setMono?.(mono);
   baseline.setMono(mono);
-  if (arm() === 'gpu') refreshBanner();
+  if (arm === 'gpu') refreshBanner();
 }
 
 function restart() {
@@ -297,13 +301,13 @@ function restart() {
 function restartCollision(flip = true) {
   resetPair(pair, flip ? -pair.spin1 : pair.spin1);
   backend.setMode(COLLISION);
-  if (arm() === 'baseline') baseline.setMode(COLLISION, pair);
+  if (arm === 'baseline') baseline.setMode(COLLISION, pair);
   else refreshBanner();
   hud.reset();
 }
 
 addEventListener('keydown', (e) => {
-  if (e.key === 'b' || e.key === 'B') setArm(arm() === 'gpu' ? 'baseline' : 'gpu');
+  if (e.key === 'b' || e.key === 'B') setArm(arm === 'gpu' ? 'baseline' : 'gpu');
   if (e.key === 'm' || e.key === 'M') setMode((mode + 1) % MODE_COUNT);
   if (e.key === 'r' || e.key === 'R') restart();
   if (e.key === 'c' || e.key === 'C') setMono(!mono);
@@ -351,7 +355,7 @@ function loop(now: number) {
   // should be the same arithmetic it was before hold-to-pull existed.
   if (!holding && grav < 1.001) grav = 1;
 
-  if (arm() === 'gpu') {
+  if (arm === 'gpu') {
     backend.frame(dt, mx, my, grav);
     list.update();
     counters.entities = sim.count;

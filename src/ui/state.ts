@@ -1,9 +1,11 @@
 /**
  * UI state via alien-signals.
  *
- * Scope note: signals are used *only* for state that changes on interaction —
- * filters, selection, the active arm. The particle simulation deliberately does
- * not go through here. Signals exist to skip work when nothing changed; a
+ * Scope note: exactly one thing is reactive here — the species filter, which
+ * fans out to three consumers on a change a human makes a few times a minute.
+ * State nothing subscribes to (the active arm, the mode) is a plain variable in
+ * main.ts instead. The particle simulation deliberately does not go through here
+ * either: signals exist to skip work when nothing changed, and a
  * per-frame simulation changes everything every frame, so routing it through a
  * dependency graph would add bookkeeping and remove nothing. `effectRuns` below
  * exists to prove that claim at runtime rather than assert it.
@@ -14,9 +16,6 @@ import { SPECIES_COUNT, SPECIES_NAMES } from '../sim/world';
 
 /** Bitmask of enabled species; all on by default. */
 export const speciesMask = signal((1 << SPECIES_COUNT) - 1);
-export const selectedEid = signal(-1);
-export const arm = signal<'gpu' | 'baseline'>('gpu');
-export const entityCount = signal(0);
 
 export const activeSpecies = computed(() => {
   const m = speciesMask();

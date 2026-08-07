@@ -12,7 +12,7 @@
  */
 
 import { STRIDE, SPECIES_NAMES, SPECIES_COLORS, type Sim } from '../sim/world';
-import { speciesMask, selectedEid } from './state';
+import { speciesMask } from './state';
 import { READBACK_MAX, type Backend } from '../render/backend';
 
 const ROW_H = 24;
@@ -85,12 +85,6 @@ export class VirtualList {
       const v = document.createElement('span');
       v.className = 'v';
       row.append(id, sp, bar, v);
-
-      const slot = this.pool.length;
-      row.addEventListener('click', () => {
-        const eid = this.poolIds[slot];
-        if (eid >= 0) selectedEid(eid);
-      });
 
       this.viewport.appendChild(row);
       this.pool.push(row);
