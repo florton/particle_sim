@@ -20,8 +20,9 @@
  */
 
 import {
-  CURSOR_SOFT2, GRID, G_CORE, G_CURSOR, H_DISC, M_DISC, RADIAL_DAMP, R_DISC,
-  SIGMA_FRAC, SOFT_CELLS, type Sim,
+  CAPTURE_K, CAPTURE_R2, CURSOR_SOFT2, CURSOR_SOFT2_HOLD, GRID, G_CORE,
+  G_CURSOR, G_CURSOR_HOLD, H_DISC, M_DISC, RADIAL_DAMP, R_DISC,
+  SIGMA_FRAC, SOFT_CELLS, seedGalaxy, type Sim,
 } from '../sim/world';
 import { READBACK_MAX, type Backend } from './backend';
 
@@ -52,9 +53,13 @@ struct Params {
   // Radial-velocity retention per step — the disc's cooling rate, driven live
   // from the UI. See sim/world.ts RADIAL_DAMP for what it physically is.
   rdamp     : f32,
-  _pad0     : f32,
-  _pad1     : f32,
-  _pad2     : f32,
+  // Cells lighter than this contribute nothing and are skipped by the
+  // convolution — see solveField for why this is not simply "is it empty".
+  massFloor : f32,
+  // 1 = render luminance only, discarding the species palette.
+  mono      : f32,
+  // Cursor mass multiplier, ramped by the pointer being held. 1 = passive.
+  grav      : f32,
 };
 
 // Central bulge + halo. Fixed at the origin -- see the integrate entry point.
@@ -69,6 +74,11 @@ const SIGMA_FRAC = ${SIGMA_FRAC};
 // Mirrors G_CURSOR in sim/world.ts -- see there for why it is this small.
 const G_CURSOR = ${G_CURSOR};
 const CURSOR_SOFT2 = ${CURSOR_SOFT2};
+// Held softening and the mass ceiling it ramps against -- see sim/world.ts.
+const CURSOR_SOFT2_HOLD = ${CURSOR_SOFT2_HOLD};
+const G_CURSOR_HOLD = f32(${G_CURSOR_HOLD});
+const CAPTURE_R2 = ${CAPTURE_R2};
+const CAPTURE_K = f32(${CAPTURE_K});
 // Terminal speed. Without it a close cursor pass flings grains off to infinity.
 const V_MAX = 3.0;
 
@@ -78,7 +88,7 @@ const CELLS = ${CELLS}u;
 
 // Per-species (n, m) offsets from the cursor-driven base frequency. Each species
 // settles onto the nodal lines of its own standing wave, so six figures resolve
-// at once in six colours. Kept small and mutually offset so they stay visibly
+// at once in six colors. Kept small and mutually offset so they stay visibly
 // distinct at every base frequency.
 const MODES = array<vec2<f32>, 6>(
   vec2<f32>(0.0, 1.0),
@@ -118,13 +128,13 @@ const PALETTE = array<vec3<f32>, 6>(
 // The same mesh as plain f32, baked once per frame -- see bakeGrid.
 @group(0) @binding(5) var<storage, read_write> cellMass : array<f32>;
 
-/** Centre of cell c in simulation space, which is the unit box [-1, 1]. */
-fn cellCentre(c : u32) -> vec2<f32> {
+/** Center of cell c in simulation space, which is the unit box [-1, 1]. */
+fn cellCenter(c : u32) -> vec2<f32> {
   let g = vec2<f32>(f32(c % GRID), f32(c / GRID));
   return (g + 0.5) / GRIDF * 2.0 - 1.0;
 }
 
-/** Continuous grid coordinate of a point, with cell centres on integers. */
+/** Continuous grid coordinate of a point, with cell centers on integers. */
 fn gridCoord(p : vec2<f32>) -> vec2<f32> {
   return (p + 1.0) * 0.5 * GRIDF - 0.5;
 }
@@ -158,7 +168,7 @@ fn sampleRadius(u1 : f32, u2 : f32) -> f32 {
 /**
  * Chladni plate. Particles descend |w| toward the nodal lines of a standing
  * wave, exactly as sand does on a vibrating plate — the sand collects where the
- * plate is not moving. Analytic gradient, so this is O(n) with no neighbour
+ * plate is not moving. Analytic gradient, so this is O(n) with no neighbor
  * search: a million grains cost one evaluation each.
  */
 fn chladni(i : u32, p : vec4<f32>, dt : f32) -> vec4<f32> {
@@ -293,7 +303,7 @@ fn bakeGrid(@builtin(global_invocation_id) gid : vec3<u32>) {
  * to converge, and is about forty lines. At this grid size it is affordable, so
  * it wins.
  *
- * The empty-cell skip is not a micro-optimisation. A galaxy occupies maybe a
+ * The empty-cell skip is not a micro-optimization. A galaxy occupies maybe a
  * third of the box, and every thread in a workgroup walks the source cells in
  * the same order, so the branch is uniform across the wave -- no divergence, and
  * the loop simply gets shorter.
@@ -303,16 +313,29 @@ fn solveField(@builtin(global_invocation_id) gid : vec3<u32>) {
   let t = gid.x;
   if (t >= CELLS) { return; }
 
-  let tp = cellCentre(t);
+  let tp = cellCenter(t);
   var a = vec2<f32>(0.0, 0.0);
 
   for (var s = 0u; s < CELLS; s++) {
     let m = cellMass[s];
-    if (m == 0.0) { continue; }
-    let d = cellCentre(s) - tp;
+    // Skip by mass, not by emptiness.
+    //
+    // Testing for exact zero looks equivalent and quietly makes the cost a
+    // function of how long the simulation has been running. A compact disc
+    // occupies about a third of the grid; give it a minute and a thin spray of
+    // escapees has touched roughly 80% of it, and every one of those cells costs
+    // a full row of this loop while carrying a millionth of the mass. Measured
+    // at 1M, self-gravity cost 3.4 ms on a fresh disc and 9.7 ms on a settled
+    // one — the same code, three times slower, purely from where the stragglers
+    // had got to.
+    //
+    // The floor is five orders of magnitude below a typical occupied cell, so
+    // what it discards is far beneath the force noise the mesh already carries.
+    if (m <= params.massFloor) { continue; }
+    let d = cellCenter(s) - tp;
     // Softened, and the softening length is the reason the mesh is stable: a
-    // bare 1/r^2 between neighbouring cells would let a single dense cell fling
-    // its neighbours away rather than pull the disc together.
+    // bare 1/r^2 between neighboring cells would let a single dense cell fling
+    // its neighbors away rather than pull the disc together.
     let q = dot(d, d) + ${(SOFT_CELLS * (2 / GRID)) ** 2};
     a += d * (m / (q * sqrt(q)));
   }
@@ -414,8 +437,12 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   // Secondary: the cursor. Softened harder so a direct hit shears rather than
   // slingshots.
   let dm = vec2<f32>(params.mx - p.x, params.my - p.y);
-  let dm2 = dot(dm, dm) + CURSOR_SOFT2;
-  let fm = G_CURSOR / (dm2 * sqrt(dm2));
+  // Mass and softening ramp together: the well deepens *and* narrows, so a hold
+  // captures what is near the pointer instead of tugging on the whole disc.
+  let ht = clamp((params.grav - 1.0) / (G_CURSOR_HOLD - 1.0), 0.0, 1.0);
+  let soft = mix(CURSOR_SOFT2, CURSOR_SOFT2_HOLD, ht);
+  let dm2 = dot(dm, dm) + soft;
+  let fm = G_CURSOR * params.grav / (dm2 * sqrt(dm2));
 
   var v = p.zw + dc * fc * dt + sg * dt + dm * fm * dt;
 
@@ -433,6 +460,19 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
 
   // Whisper of global damping purely to bound energy the moving cursor injects.
   v = v * 0.99995;
+
+  // Capture drag, held only. Weighted by proximity so it is a local well of
+  // friction rather than a global brake -- see CAPTURE_R2 in sim/world.ts.
+  //
+  // Damps only the component along the line to the cursor, for exactly the
+  // reason the disc's own cooling is radial-only: braking the full velocity
+  // vector leaves the captured material with no angular momentum about anything,
+  // and the knot drops straight down the core's potential the moment you let go.
+  // Bleeding the approach component instead circularizes material into orbit
+  // around the pointer, which both looks like capture and survives release.
+  let cw = ht * exp(-dm2 / CAPTURE_R2);
+  let mdir = dm / max(1e-4, length(dm));
+  v = v - dot(v, mdir) * mdir * min(0.9, CAPTURE_K * cw * dt);
 
   let speed = length(v);
   if (speed > V_MAX) { v = v * (V_MAX / speed); }
@@ -515,7 +555,13 @@ fn vs(@builtin(vertex_index) vi : u32, @builtin(instance_index) ii : u32) -> VSO
   out.speed = clamp(length(p.zw) * 0.22, 0.0, 1.0);
   // Shift toward white with speed so the dense hot core still reads as bright
   // without losing species identity in the arms.
-  out.tint = mix(PALETTE[sp], vec3<f32>(1.0, 0.95, 0.88), out.speed * 0.3);
+  //
+  // In mono the palette is dropped for a single faintly warm white. Structure in
+  // this image is carried almost entirely by density rather than by hue, so
+  // removing color costs nothing legible and the arms actually read *harder* —
+  // which is why deep-sky astrophotography is usually luminance first.
+  let base = select(PALETTE[sp], vec3<f32>(0.86, 0.89, 1.0), rparams.mono > 0.5);
+  out.tint = mix(base, vec3<f32>(1.0, 0.95, 0.88), out.speed * 0.3);
   return out;
 }
 
@@ -528,7 +574,7 @@ fn fs(in : VSOut) -> @location(0) vec4<f32> {
 
   // Additive, into a 16-bit float target. The target format is the point: this
   // sum is unbounded and genuinely reaches into the tens, so an 8-bit
-  // attachment clips it. gain now only normalises for population size, keeping
+  // attachment clips it. gain now only normalizes for population size, keeping
   // total deposited light constant as the count changes; it no longer has to
   // double as a saturation guard, which is what used to force it so low that
   // the arms went dark before the core stopped being white.
@@ -586,8 +632,8 @@ fn tmFs(in : TMOut) -> @location(0) vec4<f32> {
   // species are only distinguishable by their ratios between channels, and any
   // curve applied independently to each one compresses the largest channel
   // hardest -- so the ratios flatten exactly where the disc is densest and every
-  // bright region converges on white regardless of what colour it started. That
-  // is most of why the old renderer had six colours and showed one. Scaling all
+  // bright region converges on white regardless of what color it started. That
+  // is most of why the old renderer had six colors and showed one. Scaling all
   // three by a single factor moves brightness without touching hue at all.
   let l = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
   // Reinhard, x / (1 + x), rather than 1 - exp(-x).
@@ -695,6 +741,7 @@ export async function createWebGPUBackend(
   let mask = (1 << 6) - 1;
   let mode = 0;
   let cooling = RADIAL_DAMP;
+  let mono = false;
   let elapsed = 0;
   let pendingScatter = false;
 
@@ -866,14 +913,41 @@ export async function createWebGPUBackend(
 
     setMode(m: number) {
       mode = m | 0;
-      pendingScatter = true;
+      if (mode === 0) {
+        // See reset(): the GPU scatter kernel cannot restore the color bands.
+        seedGalaxy(sim);
+        device.queue.writeBuffer(particleBuf, 0, sim.particles);
+        pendingScatter = false;
+      } else {
+        pendingScatter = true;
+      }
     },
 
     setCooling(v: number) {
       cooling = v;
     },
 
-    frame(dt: number, mx: number, my: number) {
+    setMono(v: boolean) {
+      mono = v;
+    },
+
+    reset() {
+      elapsed = 0;
+      if (mode === 0) {
+        // Re-run the deterministic CPU seeding and re-upload, so restarting
+        // reproduces the load state exactly — including the species/radius
+        // correlation that the color bands depend on. The GPU scatter kernel
+        // cannot do this: it redraws radius from a hash, and species was
+        // assigned from radius, so it would return a disc with no bands. One
+        // 16 MB upload on a keypress is a fine price for that.
+        seedGalaxy(sim);
+        device.queue.writeBuffer(particleBuf, 0, sim.particles);
+      } else {
+        pendingScatter = true;
+      }
+    },
+
+    frame(dt: number, mx: number, my: number, grav = 1) {
       paramData[0] = dt;
       paramData[1] = mx;
       paramData[2] = my;
@@ -890,7 +964,7 @@ export async function createWebGPUBackend(
       // The overdraw is not where the time is going (see the notes on the mesh
       // solver), so this stays at the value that renders arms with body to them.
       paramData[4] = Math.min(0.006, Math.max(0.0018, 0.06 / Math.sqrt(count)));
-      // Purely a normalisation now: total light deposited across the frame is
+      // Purely a normalization now: total light deposited across the frame is
       // held constant as the population changes, and the tonemap decides how
       // bright that ends up looking. The old value was clamped at 0.3 because it
       // also had to stop the core clipping, which it could not actually do.
@@ -929,6 +1003,10 @@ export async function createWebGPUBackend(
       paramData[14] = 1.42;
       paramData[15] = count;
       paramData[16] = cooling;
+      // Five orders of magnitude below a typical occupied cell.
+      paramData[17] = (M_DISC / CELLS) * 1e-3;
+      paramData[18] = mono ? 1 : 0;
+      paramData[19] = grav;
       device.queue.writeBuffer(paramBuf, 0, paramBytes);
 
       const enc = device.createCommandEncoder();
@@ -964,7 +1042,7 @@ export async function createWebGPUBackend(
       cpass.end();
 
       // Pass 1: accumulate into HDR. Cleared to zero, not to the background
-      // colour — the background is added after the tonemap so it does not get
+      // color — the background is added after the tonemap so it does not get
       // compressed along with the particles.
       const rpass = enc.beginRenderPass({
         colorAttachments: [

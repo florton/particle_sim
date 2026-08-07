@@ -1,7 +1,7 @@
 import './style.css';
 import { Hud, type HudCounters } from './hud';
 import {
-  createSim, integrateCPU, RADIAL_DAMP, SPECIES_NAMES, SPECIES_COLORS,
+  createSim, integrateCPU, RADIAL_DAMP, SPECIES_NAMES, SPECIES_COLORS, G_CURSOR_HOLD,
 } from './sim/world';
 import { VirtualList } from './ui/list';
 import { speciesMask, toggleSpecies, filterLabel, countEffect, effectRuns, arm } from './ui/state';
@@ -52,6 +52,37 @@ addEventListener('pointermove', (e) => {
   my = -((e.clientY / innerHeight) * 2 - 1);
 });
 
+// --- hold to pull ---------------------------------------------------------
+//
+// Holding the pointer down ramps the cursor's mass toward G_CURSOR_HOLD instead
+// of switching it there. The ramp is the whole reason this is usable: the force
+// law is integrated explicitly, so a step change in a term that big arrives as
+// an impulse — every particle near the cursor gets a full frame of the new
+// acceleration at its old position, and the disc shatters rather than gathers.
+// Ramped over a few hundred milliseconds the orbits track it and you get the
+// intended thing: a well that deepens under your finger, material falling in
+// along an arm, and the disc re-forming once you let go.
+//
+// Release is faster than the ramp. Building the well is the interaction and
+// wants to feel deliberate; letting go should just let go.
+const GRAV_RAMP = 3.5; // e-folds per second, held
+const GRAV_RELEASE = 8; // e-folds per second, released
+let holding = false;
+let grav = 1;
+
+// The sidebar and HUD are interactive — dragging the cooling slider must not
+// also drop a well into the middle of the galaxy.
+const overUI = (t: EventTarget | null) =>
+  t instanceof Element && !!t.closest('#sidebar, #hud, #banner');
+
+addEventListener('pointerdown', (e) => {
+  if (e.button === 0 && !overUI(e.target)) holding = true;
+});
+addEventListener('pointerup', () => { holding = false; });
+addEventListener('pointercancel', () => { holding = false; });
+// A pointer released outside the window never reports up.
+addEventListener('blur', () => { holding = false; });
+
 const backend = await selectBackend();
 backend.setCount(CAPACITY);
 counters.backend = `${backend.name} · ${backend.detail}`;
@@ -91,7 +122,7 @@ head.appendChild(summary);
 // between the two kinds that actually exist. Cold is a grand-design spiral with
 // few strong arms; hot is flocculent, many faint ones that dissolve as fast as
 // they form. Not a rendering setting: it is changing the physics, live, over a
-// million particles, and the structure reorganises within a couple of seconds.
+// million particles, and the structure reorganizes within a couple of seconds.
 
 // The range is measured, not guessed. Over 40 s of headless integration the
 // trade is monotone and steep in both directions at once:
@@ -103,7 +134,7 @@ head.appendChild(summary);
 //
 // Colder makes arms about six times stronger and eats the disc to do it: the
 // dissipation that keeps Toomre Q low enough to amplify structure is the same
-// dissipation that lets material sink to the centre. So the low end of this
+// dissipation that lets material sink to the center. So the low end of this
 // slider is a deliberately unsustainable setting — it is the grand-design look,
 // and it costs a third of the disc in under a minute. The default is the one
 // that still resembles a galaxy several minutes in.
@@ -161,7 +192,7 @@ const modeLabel = () => (mode === 1 ? 'Chladni plate · 6 frequencies' : 'orbita
 function refreshBanner() {
   banner.textContent =
     `${backend.name} compute · ${sim.count.toLocaleString()} particles · ${modeLabel()} — ` +
-    `[M] mode · [B] compare`;
+    `hold to pull · [M] mode · [B] compare · [R] restart · [C] ${mono ? 'color' : 'mono'}`;
 }
 
 function setArm(next: 'gpu' | 'baseline') {
@@ -174,7 +205,7 @@ function setArm(next: 'gpu' | 'baseline') {
     canvas.style.display = 'none';
     banner.textContent =
       `naive DOM · ${BASELINE_COUNT.toLocaleString()} particles as elements · ` +
-      `${modeLabel()} · sidebar rebuilt per frame — press [B]`;
+      `${modeLabel()} · sidebar rebuilt per frame — [B] compare · [R] restart`;
   } else {
     baseline.stop();
     canvas.style.display = 'block';
@@ -196,9 +227,25 @@ function setMode(next: number) {
   else setArm('baseline');
 }
 
+let mono = false;
+function setMono(next: boolean) {
+  mono = next;
+  backend.setMono?.(mono);
+  baseline.setMono(mono);
+  if (arm() === 'gpu') refreshBanner();
+}
+
+function restart() {
+  backend.reset();
+  baseline.reset();
+  hud.reset();
+}
+
 addEventListener('keydown', (e) => {
   if (e.key === 'b' || e.key === 'B') setArm(arm() === 'gpu' ? 'baseline' : 'gpu');
   if (e.key === 'm' || e.key === 'M') setMode(mode === 0 ? 1 : 0);
+  if (e.key === 'r' || e.key === 'R') restart();
+  if (e.key === 'c' || e.key === 'C') setMono(!mono);
 });
 
 function fit() {
@@ -223,13 +270,16 @@ function loop(now: number) {
   const dt = Math.min((now - prev) / 1000, 1 / 30);
   prev = now;
 
+  const target = holding ? G_CURSOR_HOLD : 1;
+  grav += (target - grav) * (1 - Math.exp(-(holding ? GRAV_RAMP : GRAV_RELEASE) * dt));
+
   if (arm() === 'gpu') {
-    backend.frame(dt, mx, my);
+    backend.frame(dt, mx, my, grav);
     list.update();
     counters.entities = sim.count;
     counters.domNodes = list.liveNodes;
   } else {
-    baseline.frame(dt, mx, my);
+    baseline.frame(dt, mx, my, grav);
     counters.entities = baseline.count;
     counters.domNodes = baseline.domNodes;
   }

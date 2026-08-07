@@ -63,7 +63,7 @@ export const R_DISC = 0.65;
  * mismatch between the seeded circular speed and the softened mesh force showed
  * up there as a visible hole rather than being buried under a dense core.
  * Measured on the uniform profile, the inner 0.08 held 0.83% of the population
- * against 1.51% predicted: half the centre left within a fifth of a second.
+ * against 1.51% predicted: half the center left within a fifth of a second.
  *
  * The sampling is exact and costs two logarithms. Surface density
  * exp(-r/h) integrates to the mass profile 1 - (1 + r/h) e^(-r/h), which is
@@ -81,7 +81,7 @@ export const H_DISC = R_DISC / 3;
  * Q ~ 1.3 skips that.
  *
  * A *fraction* rather than an absolute speed, because circular speed falls to
- * zero at the centre and an absolute dispersion does not. At r = 0.01 the
+ * zero at the center and an absolute dispersion does not. At r = 0.01 the
  * orbital speed is 0.39, so a flat sigma of 0.17 is a 44% kick — enough to
  * scatter the innermost particles straight out and leave a dark pinhole in the
  * middle of an otherwise convincing galaxy.
@@ -110,6 +110,74 @@ export const SOFT_CELLS = 1.5;
 export const G_CURSOR = 0.035;
 /** Softening of the cursor's field. Wider than the core's, deliberately. */
 export const CURSOR_SOFT2 = 0.05;
+/**
+ * Cursor softening at full hold. Tightened from CURSOR_SOFT2, and this is what
+ * actually makes holding feel like grabbing.
+ *
+ * Mass alone does not work. 0.05 softening spreads the cursor's pull over a
+ * radius of ~0.22 — a quarter of the disc — so scaling G_CURSOR up just adds a
+ * broad tide competing with a 0.42 core that always wins. Measured: at 5x mass
+ * with the wide softening a four-second hold drained the core fraction from 3.8%
+ * to 21.8% and left A(m=2) at 0.014, i.e. it heated the disc to mush without
+ * ever visibly grabbing anything.
+ *
+ * Narrowing the well concentrates the same force where the pointer is instead of
+ * smearing it across the disc: peak acceleration goes up by (0.05/0.012)^1.5,
+ * about 27x, inside a radius of ~0.11 and essentially unchanged outside it. Not
+ * sufficient on its own either — see CAPTURE_R2 — but it is what makes the
+ * capture term local instead of a brake applied to a quarter of the galaxy.
+ */
+export const CURSOR_SOFT2_HOLD = 0.012;
+/**
+ * Capture radius (squared) and strength of the held cursor's drag term.
+ *
+ * Gravity alone cannot make a hold feel like grabbing, and the measurements say
+ * why. Disc material at r = 0.5 is moving at roughly the local circular speed,
+ * so it crosses a 0.1-radius well in about a fifth of a second: deepening the
+ * well past that point stops capturing anything and starts delivering impulses.
+ * Measured over a four-second hold at 4x with the tightened softening, mass
+ * within 0.12 of the pointer went 2.32% -> 1.80% while the core went 3.88% ->
+ * 15.25%. Against a no-hold control (core flat at ~3-4%, arms forming normally)
+ * that is unambiguous: the pull was real, it just threw material at the core
+ * instead of holding it, and the disc went smooth as a side effect.
+ *
+ * So the hold also bleeds velocity along the line to the pointer inside the
+ * capture radius. That is dynamical friction rather than a new force: it removes
+ * energy where the pointer is instead of injecting it, and material circularizes
+ * into orbit around the cursor. With it, the same four-second hold takes mass
+ * near the pointer from 1.3% to 9.1% and renders as a bright companion with a
+ * tidal bridge back to the disc. That is the whole effect.
+ *
+ * Both numbers are load-bearing and were found by bisection, not derivation.
+ * Doubling them (K=6 over a 0.02 radius) collects 45% of the galaxy into one
+ * clump that detonates into uniform static on release; halving them (K=2 over
+ * 0.008) captures 2% and reads as nothing at all.
+ *
+ * What none of this buys is a free lunch on the disc: a four-second hold puts
+ * ~12% of the mass inside r<0.1 while held and ~41% twelve seconds after release,
+ * against 7% for an untouched disc over the same 25 seconds. That cost is
+ * remarkably insensitive to every constant here — it measured 12-15% for every
+ * variant tried, including ones with no visible effect at all — because it comes
+ * from taking material off circular orbits at all, not from how hard. Given the
+ * price is fixed, these are set for the strongest effect rather than the
+ * gentlest. [R] restarts.
+ */
+export const CAPTURE_R2 = 0.014;
+/** Fraction of relative velocity the capture region removes per second. */
+export const CAPTURE_K = 9;
+/**
+ * Cursor mass multiplier while the pointer is held down.
+ *
+ * One of three terms that ramp together; the other two are above. Mass is what
+ * pulls material into reach, the tightened softening keeps that pull local, and
+ * the capture drag is what holds onto what arrives. Dropping this to 2x with the
+ * other two unchanged takes capture from 9.1% to 1.6% — the drag has nothing to
+ * work on if nothing gets close — so it is not the small term it looks like.
+ *
+ * The ramp (see main.ts) matters as much as the ceiling: applied instantly this
+ * is a step change in the force law and the disc detonates instead of gathering.
+ */
+export const G_CURSOR_HOLD = 4;
 /** Terminal speed. */
 export const V_MAX = 3.0;
 /**
@@ -223,10 +291,18 @@ function mulberry32(seed: number) {
   };
 }
 
-export function createSim(capacity: number, seed = 0x9e3779b9): Sim {
-  const particles = new Float32Array(capacity * STRIDE);
-  const species = new Uint8Array(capacity);
-  const stat = new Float32Array(capacity);
+/**
+ * Fill a simulation with the initial galaxy, deterministically.
+ *
+ * Split out from createSim so that restarting is *exactly* reloading. The
+ * alternative — re-deriving each particle's radius on the GPU from a hash, which
+ * is what the mode-switch kernel does — quietly destroys the color banding,
+ * because species is assigned *from* radius here and the species buffer is
+ * uploaded once and never changed. Redraw the radii independently and every
+ * species ends up spread over the whole disc: six colors, one gray ring.
+ */
+export function seedGalaxy(sim: Sim, seed = 0x9e3779b9) {
+  const { particles, species, stat, capacity } = sim;
   const rand = mulberry32(seed);
 
   // Box-Muller, drawing from the same deterministic stream as everything else.
@@ -262,8 +338,18 @@ export function createSim(capacity: number, seed = 0x9e3779b9): Sim {
     species[i] = Math.max(0, Math.min(SPECIES_COUNT - 1, (band + jitter) | 0));
     stat[i] = rand();
   }
+}
 
-  return { particles, species, stat, capacity, count: capacity };
+export function createSim(capacity: number, seed = 0x9e3779b9): Sim {
+  const sim: Sim = {
+    particles: new Float32Array(capacity * STRIDE),
+    species: new Uint8Array(capacity),
+    stat: new Float32Array(capacity),
+    capacity,
+    count: capacity,
+  };
+  seedGalaxy(sim, seed);
+  return sim;
 }
 
 // --- CPU-side particle mesh --------------------------------------------------
@@ -320,8 +406,12 @@ function solveMesh(sim: Sim, n: number) {
     }
   }
 
+  // Compact by mass rather than by occupancy — see solveField in webgpu.ts.
+  // A cell holding a millionth of the disc costs a full row of the convolution
+  // and contributes nothing, and a settled disc accumulates thousands of them.
+  const floor = (M_DISC / CELLS) * 1e-3;
   let nOcc = 0;
-  for (let c = 0; c < CELLS; c++) if (meshMass[c] > 0) meshOcc[nOcc++] = c;
+  for (let c = 0; c < CELLS; c++) if (meshMass[c] > floor) meshOcc[nOcc++] = c;
 
   for (let t = 0; t < CELLS; t++) {
     const tx = cellCx[t];
@@ -353,10 +443,16 @@ export function integrateCPU(
   mx: number,
   my: number,
   cooling = RADIAL_DAMP,
+  grav = 1,
 ) {
   const p = sim.particles;
   const n = sim.count;
   const damp = 0.99995;
+
+  // Cursor softening tightens as the hold ramps in — see CURSOR_SOFT2_HOLD.
+  // Loop-invariant, so it stays out of the per-particle body.
+  const ht = Math.min(1, Math.max(0, (grav - 1) / (G_CURSOR_HOLD - 1)));
+  const cursorSoft = CURSOR_SOFT2 + (CURSOR_SOFT2_HOLD - CURSOR_SOFT2) * ht;
 
   solveMesh(sim, n);
 
@@ -399,8 +495,8 @@ export function integrateCPU(
 
     const dx = mx - x;
     const dy = my - y;
-    const dm2 = dx * dx + dy * dy + CURSOR_SOFT2;
-    const fm = G_CURSOR / (dm2 * Math.sqrt(dm2));
+    const dm2 = dx * dx + dy * dy + cursorSoft;
+    const fm = (G_CURSOR * grav) / (dm2 * Math.sqrt(dm2));
 
     // No constant tangential term: it pumps energy in every frame regardless of
     // position, which is what cooked the disc into uniform noise. Rotation comes
@@ -417,6 +513,18 @@ export function integrateCPU(
     vy = (vy - vr * rdy) + vr * rdy * cooling;
     vx *= damp;
     vy *= damp;
+
+    // Capture drag along the cursor line only — see webgpu.ts for why not the
+    // full velocity vector.
+    if (ht > 0) {
+      const cd = Math.min(0.9, CAPTURE_K * ht * Math.exp(-dm2 / CAPTURE_R2) * dt);
+      const dmLen = Math.max(1e-4, Math.hypot(dx, dy));
+      const mdx = dx / dmLen;
+      const mdy = dy / dmLen;
+      const va = (vx * mdx + vy * mdy) * cd;
+      vx -= va * mdx;
+      vy -= va * mdy;
+    }
 
     const speed = Math.hypot(vx, vy);
     if (speed > V_MAX) {
@@ -463,7 +571,7 @@ export function chladniWarp(mx: number, my: number, elapsed: number) {
 
 /**
  * CPU reference for the Chladni plate — same math as the WGSL chladni function.
- * Without this the naive arm ran galaxy physics behind a plate-labelled banner,
+ * Without this the naive arm ran galaxy physics behind a plate-labeled banner,
  * which would have made the comparison a lie in one of the two modes.
  */
 export function integrateChladniCPU(

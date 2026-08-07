@@ -153,7 +153,7 @@ export class VirtualList {
 
       const slotIdx = this.filtered[idx];
 
-      // Text and colour only change when a slot is recycled onto a different
+      // Text and color only change when a slot is recycled onto a different
       // entity — not every frame. Only the transform and the live value below
       // are touched per frame.
       if (this.poolIds[slot] !== slotIdx) {

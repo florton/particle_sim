@@ -24,9 +24,9 @@ measurement.
   - **Chladni plate** — particles descend the gradient of a standing wave onto
     its nodal lines, the way sand does on a vibrating plate. The cursor sweeps
     the base frequency across roughly 1–13 on each axis, with each species offset
-    from it, so six figures resolve at once in six colours — sparse sweeping
+    from it, so six figures resolve at once in six colors — sparse sweeping
     curves at one corner, a dense interference lattice at the other. Analytic
-    gradient, so it stays O(n) with no neighbour search.
+    gradient, so it stays O(n) with no neighbor search.
 - **A sidebar over all 1,000,000 rows** that keeps ~33 `<div>`s alive.
 - **Six species filters** that cull on the GPU — a uniform bit test per vertex,
   not a CPU pass over the population.
@@ -54,7 +54,7 @@ shot-noise floor.
 had no azimuthal structure at all — not after it settled, and not during the
 pretty opening either. What looked like spiral arms for the first two seconds
 was a *radial* breathing wave: every particle was seeded at 0.94x circular speed
-so the whole population reached apocentre simultaneously, and peak density hit
+so the whole population reached apocenter simultaneously, and peak density hit
 25x the mean at t=1.0s. Epicyclic frequency varies with radius, the phases
 smeared, the radial damping removed what was left, and by t=20s the radial
 velocity dispersion had fallen 5x to a flat line. A collisionless disc in a
@@ -109,7 +109,7 @@ template string every frame.
 
 Cooling is radial-velocity retention per step: it is the dissipation that keeps
 Toomre Q low enough for the disc to amplify its own density contrast into arms.
-It is also, unavoidably, what lets material sink to the centre. Measured over
+It is also, unavoidably, what lets material sink to the center. Measured over
 40 s of headless integration:
 
 | cooling | late A(m=2) | mass drained to core | disc remaining |
@@ -156,6 +156,19 @@ Three results from tuning it, none of which were the expected one:
   independent threads into sixty-odd workgroups costs more than the contention
   did. Measured, lost, removed.
 
+And one that only showed up by measuring the same build twice:
+
+- **The convolution's cost is a function of how long the simulation has been
+  running.** It skips cells with no mass in them, and a freshly seeded disc
+  occupies about a third of the grid — but after a minute a thin spray of
+  escapees has touched roughly 80% of it, and each of those cells costs a full
+  row of the loop while carrying about a millionth of the mass. Measured at 1M,
+  the identical code cost 3.4 ms on a fresh disc and **9.7 ms** on a settled one.
+  Skipping by a mass floor rather than by exact zero brings the settled case back
+  to 5.4 ms, and mass conservation is unaffected — `dumpGrid()` still sums to
+  0.18 exactly. This is the one that actually explained the dropped frames; it
+  looked like thermal throttling and was not.
+
 ## Known Issues
 
 - **The WebGL2 fallback does not run self-gravity.** Transform feedback has no
@@ -171,8 +184,12 @@ Three results from tuning it, none of which were the expected one:
 - fps is vsync-capped at 60, so the GPU's actual headroom below 1M is unmeasured.
   A `timestamp-query` pass would show it, and would also split the mesh passes
   apart instead of measuring them as a block.
-- The disc slowly drains toward the centre: mass inside r<0.1 climbs from 5% to
-  about 14% over 60 s. Radius-dependent cooling would counter it.
+- The disc slowly drains toward the center: mass inside r<0.1 climbs from 5% to
+  about 14% over 60 s, and left alone long enough it will always end up more
+  concentrated than it started. This is correct physics for a dissipative disc
+  rather than a defect — angular momentum moves outward and mass moves in — but
+  it does mean the simulation has no true steady state, which is why `R` exists.
+  Radius-dependent cooling would slow it.
 
 ## Running it
 
@@ -180,9 +197,18 @@ Three results from tuning it, none of which were the expected one:
 npm install && npm run dev
 ```
 
-Controls: `M` switches simulation mode, `B` switches arm, click the species
-chips to filter, drag the **disc cooling** slider to change how sharply the arms
-resolve, move the cursor to perturb the field. `B` compares within whichever
+Controls: `M` switches simulation mode, `B` switches arm, `R` restarts the
+simulation, `C` toggles the species palette against a luminance-only render,
+click the species chips to filter, drag the **disc cooling** slider to change how
+sharply the arms resolve, move the cursor to perturb the field, and **hold the
+pointer down** to grab it. Holding ramps three things together over a few hundred
+milliseconds — the cursor's mass to 4x, its softening down to a tenth, and a
+local drag that bleeds approach velocity — which pulls a bright companion out of
+the disc with a tidal bridge back to it, taking mass within 0.12 of the pointer
+from 1.3% to 9.1% over four seconds. It is a destructive interaction and is meant
+to be: material dragged off a circular orbit has nowhere to go but inward, so a
+four-second hold leaves ~41% of the disc inside r<0.1 twelve seconds later
+against 7% for an untouched one. `R` restarts. `B` compares within whichever
 mode is active, so both arms always run the same force law — including the mesh
 self-gravity, which the CPU reference implements at the same grid resolution.
 

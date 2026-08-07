@@ -26,7 +26,25 @@ export interface Backend {
    * behaves, this changes what it looks like.
    */
   setCooling?(retention: number): void;
-  frame(dt: number, mx: number, my: number): void;
+  /**
+   * Re-seed the population for the current mode, without rebuilding anything.
+   *
+   * A self-gravitating disc has no steady state to return to — it slowly
+   * transfers angular momentum outward and drains mass toward the center, and
+   * left alone for long enough it will always end up more concentrated than it
+   * started. That is correct physics rather than a defect, which is exactly why
+   * there has to be a way to start it over.
+   */
+  /** Drop the species palette and render luminance only. */
+  setMono?(mono: boolean): void;
+  reset(): void;
+  /**
+   * Advance one step. `grav` scales the cursor's mass — 1 is the passive
+   * perturber, up to G_CURSOR_HOLD while the pointer is held down. It is a
+   * per-frame argument rather than a setter because the caller ramps it
+   * continuously; see main.ts.
+   */
+  frame(dt: number, mx: number, my: number, grav?: number): void;
   resize(w: number, h: number): void;
   destroy(): void;
   /**

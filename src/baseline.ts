@@ -32,6 +32,7 @@ const BASELINE_ROWS = 400;
 
 export class BaselineArm {
   private cooling = RADIAL_DAMP;
+  private mono = false;
   private layer: HTMLElement;
   private nodes: HTMLElement[] = [];
   private listHost: HTMLElement;
@@ -71,8 +72,7 @@ export class BaselineArm {
     for (let i = 0; i < BASELINE_COUNT; i++) {
       const d = document.createElement('div');
       d.className = 'bp';
-      const [r, g, b] = SPECIES_COLORS[this.sim.species[i]];
-      d.style.background = `rgb(${(r * 255) | 0} ${(g * 255) | 0} ${(b * 255) | 0})`;
+      d.style.background = this.nodeColor(i);
       this.layer.appendChild(d);
       this.nodes.push(d);
     }
@@ -93,19 +93,37 @@ export class BaselineArm {
     return this.active ? this.nodes.length + BASELINE_ROWS : 0;
   }
 
-  /** Re-seed for the mode being compared, so both arms start from like states. */
   /** Mirrors the GPU arm's cooling control, so the two stay comparable. */
   setCooling(v: number) {
     this.cooling = v;
   }
 
-  setMode(mode: number) {
-    this.mode = mode;
-    this.elapsed = 0;
-    reseed(this.sim, BASELINE_COUNT, mode);
+  /** Mirrors the GPU arm's palette toggle. */
+  setMono(v: boolean) {
+    this.mono = v;
+    for (let i = 0; i < this.nodes.length; i++) {
+      this.nodes[i].style.background = this.nodeColor(i);
+    }
   }
 
-  frame(dt: number, mx: number, my: number) {
+  private nodeColor(i: number) {
+    if (this.mono) return 'rgb(219 227 255)';
+    const [r, g, b] = SPECIES_COLORS[this.sim.species[i]];
+    return `rgb(${(r * 255) | 0} ${(g * 255) | 0} ${(b * 255) | 0})`;
+  }
+
+  /** Re-seed for the mode being compared, so both arms start from like states. */
+  setMode(mode: number) {
+    this.mode = mode;
+    this.reset();
+  }
+
+  reset() {
+    this.elapsed = 0;
+    reseed(this.sim, BASELINE_COUNT, this.mode);
+  }
+
+  frame(dt: number, mx: number, my: number, grav = 1) {
     if (!this.active) return;
 
     this.elapsed += dt;
@@ -115,7 +133,7 @@ export class BaselineArm {
       const { n, m } = chladniWarp(mx, my, this.elapsed);
       integrateChladniCPU(this.sim, dt, n, m, this.elapsed);
     } else {
-      integrateCPU(this.sim, dt, mx, my, this.cooling);
+      integrateCPU(this.sim, dt, mx, my, this.cooling, grav);
     }
     this.sim.count = saved;
 
