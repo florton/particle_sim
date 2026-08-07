@@ -3,6 +3,59 @@ import type { PairState } from '../sim/pair';
 /** Hard cap on a single readback window, in particles. */
 export const READBACK_MAX = 4096;
 
+/**
+ * Camera framing, indexed by the mode ids in sim/modes.ts.
+ *
+ * `r` is the half-extent the mode wants on screen, in simulation units: fit it
+ * to the short side of the window and the mode is framed the way it was tuned.
+ * The self-gravitating disc asks for less than the simulation box because the
+ * box runs to 1 and the disc only reaches about 0.7, so framing the box would
+ * center the galaxy inside a wide empty margin; the collision asks for more than
+ * the box because its tails leave the frame otherwise.
+ *
+ * `cover` is how far past that fit to zoom, as a fraction of the way to a cover
+ * fit -- 0 fits `r` inside the window and letterboxes the long side, 1 fills the
+ * long side and clips the short one down to 1/aspect of `r`.
+ *
+ * The galaxies take 0. Filling a wide window with a round subject means zooming
+ * until it overruns the short side, and there is no version of that which is not
+ * a much closer view of the disc -- there are no particles out past r ~ 1 to fill
+ * the corners with, so the only way to put light at the left and right edges is
+ * to bring the middle of the galaxy up to meet them. At 0.72 the disc reached
+ * every edge and read as far too close. So these keep the framing they were
+ * tuned at and accept a margin on an ultrawide window.
+ *
+ * The plate takes 1, and can afford to: it is a square, so a cover fit costs it
+ * the outer band of a lattice that repeats anyway, and it has a hard boundary,
+ * so anything less shows an actual dark border rather than a fade.
+ */
+export const FRAME = [
+  { r: 0.70, cover: 0.0 }, // SELFGRAV  -- disc light is inside r = 0.7
+  { r: 1.0,  cover: 1.0 }, // CHLADNI   -- square plate; fills the window
+  { r: 1.0,  cover: 0.0 }, // BARRED    -- recycled at the box edge, so the box
+  { r: 1.82, cover: 0.0 }, // COLLISION -- pulled back to hold both tails
+  { r: 1.0,  cover: 0.0 }, // CLASSIC   -- framed on the box, like the barred disc
+] as const;
+
+/**
+ * Camera zoom for a mode in a window of this aspect ratio, in clip units per
+ * simulation unit along the *short* axis.
+ *
+ * The only thing that varies is the aspect ratio, so the framing is identical at
+ * every resolution with the same window shape -- a 1280x720 laptop and a 4K
+ * panel compose the same picture. Both backends call this and hand the result to
+ * their vertex shader as a single number; see the entry points there for how the
+ * two axes divide it up.
+ */
+export function cameraZoom(mode: number, aspect: number): number {
+  const { r, cover } = FRAME[mode] ?? FRAME[0];
+  // max(a, 1/a) is the zoom that takes a short-side fit to a cover fit, and it is
+  // written this way so a portrait window is handled by the same expression as a
+  // landscape one rather than by a second branch.
+  const fill = 1 + cover * (Math.max(aspect, 1 / aspect) - 1);
+  return fill / r;
+}
+
 /** Uniform surface over the WebGPU and WebGL2 paths. */
 export interface Backend {
   /** Short id shown in the HUD: 'webgpu' | 'webgl2'. */

@@ -20,14 +20,14 @@
  */
 
 import {
-  CAPTURE_K, CAPTURE_R2, CURSOR_SOFT2, CURSOR_SOFT2_HOLD, G_CORE, G_CURSOR,
-  G_CURSOR_HOLD, RADIAL_DAMP, type Sim,
+  CAPTURE_K, CAPTURE_R2, CURSOR_SOFT2, CURSOR_SOFT2_HOLD, DOMAIN, G_CORE,
+  G_CURSOR, G_CURSOR_HOLD, MESH_R, M_DISC, RADIAL_DAMP, type Sim,
 } from '../sim/world';
 import * as barred from '../sim/barred';
 import * as classic from '../sim/classic';
 import { BARRED, CHLADNI, CLASSIC, COLLISION, SELFGRAV, seedMode } from '../sim/modes';
 import { PAIR_MASS, createPair, type PairState } from '../sim/pair';
-import type { Backend } from './backend';
+import { cameraZoom, type Backend } from './backend';
 
 const SIM_VS = `#version 300 es
 precision highp float;
@@ -246,29 +246,46 @@ void main() {
   float dm2 = dot(dm, dm) + mix(${CURSOR_SOFT2}, ${CURSOR_SOFT2_HOLD}, ht);
   float fm = ${G_CURSOR} * uGrav / (dm2 * sqrt(dm2));
 
-  vec2 v = aVel + dc * fc * uDt + dm * fm * uDt;
+  // Outside the mesh box, the disc as a point mass. This path has no mesh at all
+  // (see the header), so this is the *only* place the disc's own mass appears in
+  // it — and it has to, because the outer field is seeded from vCirc(), which
+  // includes that mass. Leave it out and the field is seeded 20% fast at r = 1.5
+  // and spirals outward onto the wall instead of holding station.
+  bool outer = max(abs(aPos.x), abs(aPos.y)) >= float(${MESH_R.toFixed(3)});
+  vec2 sg = outer ? dc * (float(${M_DISC}) / (dc2 * rc)) : vec2(0.0);
 
-  // Radial-only damping — see webgpu.ts for why uniform damping collapses the disc.
-  vec2 rdir = dc / rc;
-  vec2 vRad = dot(v, rdir) * rdir;
-  v = ((v - vRad) + vRad * uCooling) * 0.99995;
+  vec2 v = aVel + dc * fc * uDt + sg * uDt + dm * fm * uDt;
 
-  // Capture drag along the cursor line only — see webgpu.ts for why not the
-  // full velocity vector.
-  float cw = ht * exp(-dm2 / float(${CAPTURE_R2}));
-  vec2 mdir = dm / max(1e-4, length(dm));
-  v -= dot(v, mdir) * mdir * min(0.9, float(${CAPTURE_K}) * cw * uDt);
+  // All dissipation is disc physics; the outer field orbits frictionless. See
+  // webgpu.ts for the measurement — with the global bleed applied out there the
+  // field inspirals out of frame over about a minute.
+  if (!outer) {
+    // Radial-only damping — see webgpu.ts for why uniform damping collapses the disc.
+    vec2 rdir = dc / rc;
+    vec2 vRad = dot(v, rdir) * rdir;
+    v = ((v - vRad) + vRad * uCooling) * 0.99995;
+
+    // Capture drag along the cursor line only — see webgpu.ts for why not the
+    // full velocity vector.
+    float cw = ht * exp(-dm2 / float(${CAPTURE_R2}));
+    vec2 mdir = dm / max(1e-4, length(dm));
+    v -= dot(v, mdir) * mdir * min(0.9, float(${CAPTURE_K}) * cw * uDt);
+  }
 
   float speed = length(v);
   if (speed > 3.0) v *= 3.0 / speed;
 
   vec2 p = aPos + v * uDt;
 
+  // Walls at DOMAIN, matching webgpu.ts: the outer field that fills a wide
+  // frame lives outside the unit box, so a unit-box wall would flatten it
+  // against the edge of the disc on the first frame.
   float bounce = 0.45;
-  if (p.x < -1.0) { p.x = -1.0; v.x = -v.x * bounce; }
-  else if (p.x > 1.0) { p.x = 1.0; v.x = -v.x * bounce; }
-  if (p.y < -1.0) { p.y = -1.0; v.y = -v.y * bounce; }
-  else if (p.y > 1.0) { p.y = 1.0; v.y = -v.y * bounce; }
+  float W = float(${DOMAIN.toFixed(3)});
+  if (p.x < -W) { p.x = -W; v.x = -v.x * bounce; }
+  else if (p.x > W) { p.x = W; v.x = -v.x * bounce; }
+  if (p.y < -W) { p.y = -W; v.y = -v.y * bounce; }
+  else if (p.y > W) { p.y = W; v.y = -v.y * bounce; }
 
   vPos = p;
   vVel = v;
@@ -294,7 +311,6 @@ uniform int uMask;
 uniform float uVScale;
 uniform float uMono;
 uniform int uMode;
-uniform float uScale;
 
 // Mirrors SPECIES_COLORS in sim/world.ts and PALETTE in webgpu.ts.
 const vec3 PALETTE[6] = vec3[6](
@@ -321,27 +337,16 @@ void main() {
   // See webgpu.ts: mono drops the palette for a single faintly warm white.
   vec3 base = uMono > 0.5 ? vec3(0.86, 0.89, 1.0) : PALETTE[sp];
   vTint = mix(base, vec3(1.0, 0.95, 0.88), vSpeed * 0.3);
-  // Each mode keeps the framing it was built with — see the vs() entry point in
-  // webgpu.ts, which makes the same three choices.
-  if (uMode == ${CLASSIC}) {
-    gl_Position = vec4(aPos.x + aCorner.x * uSize / uAspect, aPos.y + aCorner.y * uSize, 0.0, 1.0);
-  } else if (uMode == ${BARRED} || uMode == ${COLLISION}) {
-    float fx = 1.0 / max(uAspect, 1.0);
-    float fy = min(uAspect, 1.0);
-    gl_Position = vec4(
-      (aPos.x * uScale + aCorner.x * uSize) * fx,
-      (aPos.y * uScale + aCorner.y * uSize) * fy,
-      0.0, 1.0
-    );
-  } else {
-    float fx = uVScale / max(uAspect, 1.0);
-    float fy = uVScale * min(uAspect, 1.0);
-    gl_Position = vec4(
-      (aPos.x + aCorner.x * uSize) * fx,
-      (aPos.y + aCorner.y * uSize) * fy,
-      0.0, 1.0
-    );
-  }
+  // One camera for all five modes, solved on the CPU by cameraZoom() in
+  // backend.ts — see the vs() entry point in webgpu.ts, which splits the same
+  // number across the two axes the same way.
+  float fx = uVScale / max(uAspect, 1.0);
+  float fy = uVScale * min(uAspect, 1.0);
+  gl_Position = vec4(
+    (aPos.x + aCorner.x * uSize) * fx,
+    (aPos.y + aCorner.y * uSize) * fy,
+    0.0, 1.0
+  );
 }`;
 
 const DRAW_FS = `#version 300 es
@@ -458,7 +463,6 @@ export function createWebGL2Backend(
     uVScale: gl.getUniformLocation(drawProg, 'uVScale'),
     uMono: gl.getUniformLocation(drawProg, 'uMono'),
     uMode: gl.getUniformLocation(drawProg, 'uMode'),
-    uScale: gl.getUniformLocation(drawProg, 'uScale'),
   };
 
   const tf = gl.createTransformFeedback()!;
@@ -606,11 +610,10 @@ export function createWebGL2Backend(
       gl.uniform1f(drawLoc.uSize, Math.min(0.006, Math.max(0.0018, 0.06 / Math.sqrt(count))));
       gl.uniform1f(drawLoc.uGain, Math.min(1, Math.max(0.6, 200_000 / count)));
       gl.uniform1i(drawLoc.uMask, mask);
-      gl.uniform1f(drawLoc.uVScale, 1.42);
+      // The whole camera, in one number — see cameraZoom() in backend.ts.
+      gl.uniform1f(drawLoc.uVScale, cameraZoom(mode, canvas.width / canvas.height));
       gl.uniform1f(drawLoc.uMono, mono ? 1 : 0);
       gl.uniform1i(drawLoc.uMode, mode);
-      // The collision spans a wider field than a disc does — see webgpu.ts.
-      gl.uniform1f(drawLoc.uScale, mode === COLLISION ? 0.55 : 1);
 
       bindAttrib(cornerBuf, drawLoc.aCorner, 0);
       bindAttrib(posB, drawLoc.aPos, 1);

@@ -20,14 +20,15 @@
  */
 
 import {
-  CAPTURE_K, CAPTURE_R2, CURSOR_SOFT2, CURSOR_SOFT2_HOLD, GRID, G_CORE,
-  G_CURSOR, G_CURSOR_HOLD, M_DISC, RADIAL_DAMP, SOFT_CELLS, type Sim,
+  CAPTURE_K, CAPTURE_R2, CURSOR_SOFT2, CURSOR_SOFT2_HOLD, DISC_SHARE, DOMAIN,
+  GRID, G_CORE, G_CURSOR, G_CURSOR_HOLD, MESH_R, M_DISC, RADIAL_DAMP,
+  SOFT_CELLS, type Sim,
 } from '../sim/world';
 import * as barred from '../sim/barred';
 import * as classic from '../sim/classic';
 import { BARRED, CHLADNI, CLASSIC, COLLISION, SELFGRAV, seedMode } from '../sim/modes';
 import { PAIR_MASS, createPair, type PairState } from '../sim/pair';
-import { READBACK_MAX, type Backend } from './backend';
+import { READBACK_MAX, cameraZoom, type Backend } from './backend';
 
 const WORKGROUP = 64;
 const CELLS = GRID * GRID;
@@ -65,8 +66,9 @@ struct Params {
   grav      : f32,
   // Cursor mass in the fixed-potential modes, switched rather than ramped.
   gcur      : f32,
-  // Camera scale for the collision, which spans a wider field than a disc does.
-  scale     : f32,
+  // 4 bytes of padding here, reserved by c0's 8-byte alignment. Camera framing
+  // rides on vscale above -- see FIT in backend.ts.
+  //
   // The two colliding cores, solved on the CPU -- see sim/pair.ts.
   c0        : vec2<f32>,
   c1        : vec2<f32>,
@@ -523,6 +525,18 @@ fn depositMass(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = gid.x;
   if (i >= u32(params.pcount)) { return; }
 
+  // Outside the mesh box this is outer-field material, and the mesh has nothing
+  // to say about it: the box does not cover where it is. Depositing it anyway
+  // would not merely be wasted work -- the clamps below would file every one of
+  // these particles into an edge cell, welding an eighth of the population into
+  // a fake rim of mass around the boundary that the disc would then feel.
+  //
+  // This is what makes a domain larger than the solver cheap. The field is a
+  // full participant in the force law and contributes nothing to its cost:
+  // GRID stays at 64 and the O(GRID^4) convolution is untouched.
+  let q = parts[i].xy;
+  if (max(abs(q.x), abs(q.y)) >= ${MESH_R.toFixed(3)}) { return; }
+
   let g = gridCoord(parts[i].xy);
   let base = floor(g);
   let f = g - base;
@@ -673,7 +687,25 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   // This is the term that makes structure possible: it is the only one that
   // depends on where the other particles actually are this frame, so it is the
   // only one that can respond to an overdensity and amplify it into an arm.
-  let sg = sampleField(p.xy);
+  //
+  // Outside the mesh box the disc is a point mass instead, and that is an
+  // approximation only in name. Out there the whole disc subtends a small angle
+  // -- at r = 1.5 it is a 0.65-radius object 1.5 away -- so its field is
+  // M_DISC/r^2 to within its own flattening. It is also the *same* field the
+  // outer particles were seeded on: vCirc() in sim/world.ts uses discEnclosed(),
+  // which has already saturated to M_DISC by r = 1, so the field is stepped
+  // along exactly the orbit it was placed on and does not drift.
+  //
+  // Cost: one reciprocal, against the alternative of growing the mesh to cover
+  // the domain, which at the same cell size is GRID 64 -> 128 and 16x the
+  // convolution.
+  let outer = max(abs(p.x), abs(p.y)) >= ${MESH_R.toFixed(3)};
+  var sg : vec2<f32>;
+  if (outer) {
+    sg = dc * (${M_DISC} / (dc2 * rc));
+  } else {
+    sg = sampleField(p.xy);
+  }
 
   // Secondary: the cursor. Softened harder so a direct hit shears rather than
   // slingshots.
@@ -687,33 +719,53 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
 
   var v = p.zw + dc * fc * dt + sg * dt + dm * fm * dt;
 
-  // Damp the RADIAL component only.
+  // Every dissipative term below belongs to the disc, so the outer field skips
+  // all of them and orbits without friction of any kind.
   //
-  // Uniform damping looks harmless and is not: it bleeds orbital speed, orbits
-  // shrink, and within ten seconds the whole disc has inspiralled into one dense
-  // ball. Damping only the radial component removes eccentricity while leaving
-  // angular momentum intact, which is what real accretion discs do — orbits
-  // circularize instead of decaying. The practical payoff is that the disc
-  // actively re-forms after the cursor stirs it, rather than staying wrecked.
-  let rdir = dc / rc;
-  let vRad = dot(v, rdir) * rdir;
-  v = (v - vRad) + vRad * params.rdamp;
-
-  // Whisper of global damping purely to bound energy the moving cursor injects.
-  v = v * 0.99995;
-
-  // Capture drag, held only. Weighted by proximity so it is a local well of
-  // friction rather than a global brake -- see CAPTURE_R2 in sim/world.ts.
+  // Not a shortcut -- applying them out there was measurably wrong. The field
+  // is seeded on exactly circular orbits, so radial damping has nothing to
+  // remove, but the 0.99995 global bleed does: for a Keplerian orbit r goes as
+  // L^2, so shaving 3% off the speed costs 6% of the radius, permanently and
+  // every minute. Measured with the disc's damping applied to the field, the
+  // 90th-percentile field radius fell from 1.79 to 1.42 over sixty seconds and
+  // was still falling -- the margins the field exists to fill were emptying
+  // again while you watched. The disc over the same run held at 0.75-0.83,
+  // because a disc-dominated rotation curve is much flatter than r^-1/2 and
+  // because the mesh keeps re-circularizing it.
   //
-  // Damps only the component along the line to the cursor, for exactly the
-  // reason the disc's own cooling is radial-only: braking the full velocity
-  // vector leaves the captured material with no angular momentum about anything,
-  // and the knot drops straight down the core's potential the moment you let go.
-  // Bleeding the approach component instead circularizes material into orbit
-  // around the pointer, which both looks like capture and survives release.
-  let cw = ht * exp(-dm2 / CAPTURE_R2);
-  let mdir = dm / max(1e-4, length(dm));
-  v = v - dot(v, mdir) * mdir * min(0.9, CAPTURE_K * cw * dt);
+  // The physical reading is the honest one too. Radial damping stands in for
+  // gas radiating away the heat that spiral structure generates, and the global
+  // bleed bounds the energy a moving cursor injects. The field has no gas, makes
+  // no structure, and sits far outside the cursor's reach.
+  if (!outer) {
+    // Damp the RADIAL component only.
+    //
+    // Uniform damping looks harmless and is not: it bleeds orbital speed, orbits
+    // shrink, and within ten seconds the whole disc has inspiralled into one dense
+    // ball. Damping only the radial component removes eccentricity while leaving
+    // angular momentum intact, which is what real accretion discs do — orbits
+    // circularize instead of decaying. The practical payoff is that the disc
+    // actively re-forms after the cursor stirs it, rather than staying wrecked.
+    let rdir = dc / rc;
+    let vRad = dot(v, rdir) * rdir;
+    v = (v - vRad) + vRad * params.rdamp;
+
+    // Whisper of global damping purely to bound energy the moving cursor injects.
+    v = v * 0.99995;
+
+    // Capture drag, held only. Weighted by proximity so it is a local well of
+    // friction rather than a global brake -- see CAPTURE_R2 in sim/world.ts.
+    //
+    // Damps only the component along the line to the cursor, for exactly the
+    // reason the disc's own cooling is radial-only: braking the full velocity
+    // vector leaves the captured material with no angular momentum about anything,
+    // and the knot drops straight down the core's potential the moment you let go.
+    // Bleeding the approach component instead circularizes material into orbit
+    // around the pointer, which both looks like capture and survives release.
+    let cw = ht * exp(-dm2 / CAPTURE_R2);
+    let mdir = dm / max(1e-4, length(dm));
+    v = v - dot(v, mdir) * mdir * min(0.9, CAPTURE_K * cw * dt);
+  }
 
   let speed = length(v);
   if (speed > V_MAX) { v = v * (V_MAX / speed); }
@@ -721,11 +773,15 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   var pos = p.xy + v * dt;
 
   // Inelastic walls: perfectly elastic ones let escapees accumulate speed.
+  // At DOMAIN rather than at the mesh box -- the outer field lives between the
+  // two, and bouncing it off the edge of the solver would be bouncing it off
+  // nothing.
   let bounce = 0.45;
-  if (pos.x < -1.0) { pos.x = -1.0; v.x = -v.x * bounce; }
-  else if (pos.x > 1.0) { pos.x = 1.0; v.x = -v.x * bounce; }
-  if (pos.y < -1.0) { pos.y = -1.0; v.y = -v.y * bounce; }
-  else if (pos.y > 1.0) { pos.y = 1.0; v.y = -v.y * bounce; }
+  let W = ${DOMAIN.toFixed(3)};
+  if (pos.x < -W) { pos.x = -W; v.x = -v.x * bounce; }
+  else if (pos.x > W) { pos.x = W; v.x = -v.x * bounce; }
+  if (pos.y < -W) { pos.y = -W; v.y = -v.y * bounce; }
+  else if (pos.y > W) { pos.y = W; v.y = -v.y * bounce; }
 
   parts[i] = vec4<f32>(pos, v);
 }
@@ -768,50 +824,33 @@ fn vs(@builtin(vertex_index) vi : u32, @builtin(instance_index) ii : u32) -> VSO
     return out;
   }
 
-  // Fit the simulation to the *short* side of the viewport, and apply the same
-  // factor to the position as to the sprite.
+  // Fit the simulation to the viewport, applying the same factor to the position
+  // as to the sprite.
   //
-  // The previous version divided only the sprite by aspect and wrote the
-  // position straight to clip space, which stretches the whole simulation to
-  // fill the window: a circular orbit draws as an ellipse, and on a wide monitor
-  // the galaxy reads as something squashed rather than something seen face-on.
-  // Choosing the limiting dimension rather than always dividing by aspect
-  // matters too, or a portrait window overflows the disc off both sides instead.
+  // One camera for all five modes. vscale is the whole of it -- how much clip
+  // space one simulation unit spans along the short axis -- and it is solved on
+  // the CPU by cameraZoom() in backend.ts, which is where the framing decisions
+  // live. Nothing here is per-mode, so a mode cannot drift into its own framing.
   //
-  // vscale then zooms in. Fitting the *box* to the short side is correct and
-  // looks wrong: the simulation box runs to +-1 but the disc only reaches about
-  // 0.7, so a correct fit frames the galaxy inside a wide empty margin. Zooming
-  // by the ratio between them fills the frame without reintroducing any
-  // distortion -- the few particles thrown past the edge are clipped, which is
-  // the right trade for not framing mostly-empty space.
+  // What is left is splitting that one number across the two axes, and both axes
+  // take the same factor. Scaling them independently is what stretches the box to
+  // fill the window, and it draws a circular orbit as an ellipse -- the galaxy
+  // reads as something squashed rather than something seen face-on. Dividing by
+  // max(a, 1) rather than always by a matters for the same reason in the other
+  // direction, or a portrait window overflows the subject off the sides instead
+  // of the top.
   //
-  // Each mode keeps the framing it was built with. The fixed-potential discs fit
-  // the box rather than the disc inside it and pull the camera back for the
-  // collision, whose tails leave the frame at their best moment otherwise; the
-  // original mode does not correct aspect at all, which is what makes its
-  // circular orbits draw as ellipses on a wide monitor.
+  // The sprite takes the same factor as the position, so a particle is the same
+  // fraction of the subject at every window size.
   let a = rparams.aspect;
-  if (rparams.mode == ${CLASSIC}u) {
-    out.pos = vec4<f32>(p.x + corner.x * size / a, p.y + corner.y * size, 0.0, 1.0);
-  } else if (rparams.mode == ${BARRED}u || rparams.mode == ${COLLISION}u) {
-    let fx = 1.0 / max(a, 1.0);
-    let fy = min(a, 1.0);
-    let sc = rparams.scale;
-    out.pos = vec4<f32>(
-      (p.x * sc + corner.x * size) * fx,
-      (p.y * sc + corner.y * size) * fy,
-      0.0, 1.0
-    );
-  } else {
-    let s = rparams.vscale;
-    let fx = s / max(a, 1.0);
-    let fy = s * min(a, 1.0);
-    out.pos = vec4<f32>(
-      (p.x + corner.x * size) * fx,
-      (p.y + corner.y * size) * fy,
-      0.0, 1.0
-    );
-  }
+  let s = rparams.vscale;
+  let fx = s / max(a, 1.0);
+  let fy = s * min(a, 1.0);
+  out.pos = vec4<f32>(
+    (p.x + corner.x * size) * fx,
+    (p.y + corner.y * size) * fy,
+    0.0, 1.0
+  );
   out.uv = corner;
   out.speed = clamp(length(p.zw) * 0.22, 0.0, 1.0);
   // Shift toward white with speed so the dense hot core still reads as bright
@@ -1286,7 +1325,11 @@ export async function createWebGPUBackend(
       const fpScale = Math.min(4096, Math.floor(3.9e9 / Math.max(1, count)));
       paramData[11] = fpScale;
       // Converts a raw fixed-point cell total back into simulation mass.
-      paramData[12] = M_DISC / (count * fpScale);
+      // Divided by the *disc* share, not the whole population: the outer field
+      // never reaches depositMass, so if each depositing particle carried
+      // M_DISC/count the mesh would hold seven eighths of the disc's mass and
+      // the whole thing would sit on a rotation curve it was not seeded on.
+      paramData[12] = M_DISC / (count * DISC_SHARE * fpScale);
       // Tonemap exposure. Set from the arithmetic rather than by eye: each
       // particle deposits about `gain * 0.2` of light and the disc averages a
       // few particles per pixel, which puts the mean of the image near 0.05 in
@@ -1294,9 +1337,8 @@ export async function createWebGPUBackend(
       // to land the mid-disc near a third and leave the core room to climb
       // without clipping.
       paramData[13] = 8;
-      // Fills the frame with the disc rather than with the empty corners of the
-      // simulation box. See the vertex shader.
-      paramData[14] = 1.42;
+      // The whole camera, in one number — see cameraZoom() in backend.ts.
+      paramData[14] = cameraZoom(mode, canvas.width / canvas.height);
       paramData[15] = count;
       paramData[16] = cooling;
       // Five orders of magnitude below a typical occupied cell.
@@ -1304,10 +1346,9 @@ export async function createWebGPUBackend(
       paramData[18] = mono ? 1 : 0;
       paramData[19] = grav;
       paramData[20] = cursorMass;
-      // The collision spans a wider field than a disc does; pull the camera back
-      // so the tails stay on screen instead of leaving the frame at their best
-      // moment. Every other fixed-potential mode is framed at 1:1.
-      paramData[21] = mode === COLLISION ? 0.55 : 1;
+      // 21 is padding: c0 below is a vec2 and has to start 8-byte aligned, so
+      // the slot the collision's camera pull-back used to occupy is unaddressable
+      // anyway. That pull-back is now FRAME[COLLISION].r in backend.ts.
       paramData[22] = pair.x0;
       paramData[23] = pair.y0;
       paramData[24] = pair.x1;

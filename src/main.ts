@@ -2,6 +2,7 @@ import './style.css';
 import { Hud, type HudCounters } from './hud';
 import {
   createSim, integrateCPU, RADIAL_DAMP, SPECIES_NAMES, SPECIES_COLORS, G_CURSOR_HOLD,
+  withOuterField,
 } from './sim/world';
 import * as barred from './sim/barred';
 import * as classic from './sim/classic';
@@ -19,7 +20,12 @@ import { BaselineArm, BASELINE_COUNT } from './baseline';
 // to relieve at that scale. ?n= makes the crossover measurable rather than
 // assumed. See README for the measured curve.
 const params = new URLSearchParams(location.search);
-const CAPACITY = Math.max(1, Number(params.get('n')) || 1_000_000);
+// ?n= is the *disc*, and the outer field is added on top of it — see
+// withOuterField() in sim/world.ts for why that is the number worth pinning.
+// The HUD still reports the true total, so the count it claims is the count it
+// is actually simulating and drawing.
+const DISC_COUNT = Math.max(1, Number(params.get('n')) || 1_000_000);
+const CAPACITY = withOuterField(DISC_COUNT);
 
 const canvas = document.getElementById('stage') as HTMLCanvasElement;
 const hud = new Hud(document.getElementById('hud')!);
