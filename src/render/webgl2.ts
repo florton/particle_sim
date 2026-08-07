@@ -45,6 +45,10 @@ uniform float uWarpM;
 uniform float uCooling;
 uniform float uGrav;
 uniform float uGCursor;
+// Core strength of the fixed-potential disc, driven live from the UI — see
+// coreGravity() in sim/classic.ts. A uniform rather than a baked constant
+// because it is the one term in that mode a slider moves.
+uniform float uGCore;
 uniform vec2 uC0;
 uniform vec2 uC1;
 uniform float uPMass;
@@ -202,7 +206,7 @@ void main() {
     vec2 dcc = -aPos;
     float dcc2 = dot(dcc, dcc) + 0.004;
     float rcc = sqrt(dcc2);
-    float fcc = ${classic.G_CORE} / (dcc2 * rcc) - 0.0025 / (dcc2 * dcc2);
+    float fcc = uGCore / (dcc2 * rcc) - 0.0025 / (dcc2 * dcc2);
 
     vec2 dmc2 = uMouse - aPos;
     float dm2c = dot(dmc2, dmc2) + 0.02;
@@ -437,6 +441,7 @@ export function createWebGL2Backend(
     uCooling: gl.getUniformLocation(simProg, 'uCooling'),
     uGrav: gl.getUniformLocation(simProg, 'uGrav'),
     uGCursor: gl.getUniformLocation(simProg, 'uGCursor'),
+    uGCore: gl.getUniformLocation(simProg, 'uGCore'),
     uC0: gl.getUniformLocation(simProg, 'uC0'),
     uC1: gl.getUniformLocation(simProg, 'uC1'),
     uPMass: gl.getUniformLocation(simProg, 'uPMass'),
@@ -559,6 +564,10 @@ export function createWebGL2Backend(
       gl.uniform1f(simLoc.uCooling, cooling);
       gl.uniform1f(simLoc.uGrav, grav);
       gl.uniform1f(simLoc.uGCursor, cursorMass);
+      // Read from the module rather than mirrored in by a setter — the same
+      // number also has to reach the CPU baseline and the seeding, neither of
+      // which goes through a backend. See coreGravity() in sim/classic.ts.
+      gl.uniform1f(simLoc.uGCore, classic.coreGravity());
       gl.uniform2f(simLoc.uC0, pair.x0, pair.y0);
       gl.uniform2f(simLoc.uC1, pair.x1, pair.y1);
       gl.uniform1f(simLoc.uPMass, PAIR_MASS);

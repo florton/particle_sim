@@ -14,7 +14,8 @@
 
 import { BOUNCE, SPECIES_COUNT, STRIDE, type Sim } from './world';
 
-/** Primary attractor strength, fixed at the origin. */
+/** Primary attractor strength, fixed at the origin. The default of the slider
+ *  below rather than a constant of the mode — see coreGravity(). */
 export const G_CORE = 0.55;
 /** Cursor mass — a fraction of the core, so it perturbs rather than destroys. */
 export const G_CURSOR = 0.1;
@@ -24,6 +25,38 @@ export const V_MAX = 3.0;
 export const RADIAL_DAMP = 0.995;
 /** Nominal disc radius the species bands are cut against. */
 export const R_DISC = 0.65;
+/**
+ * How far a home radius may wander from its species' centre, in species widths.
+ * Over one, so the bands overlap and no edge between two colours is anywhere —
+ * see homeRadius() below, and SPECIES_SPREAD in sim/barred.ts for the argument.
+ */
+export const SPECIES_SPREAD = 1.6;
+
+/**
+ * Live core strength, driven by the slider in main.ts. G_CORE is its default.
+ *
+ * Module state rather than a parameter threaded through every caller, because
+ * three separate paths need the same number and two of them have no channel to
+ * receive it: the GPU backends read it into a uniform each frame, the CPU
+ * baseline integrates with it, and the *seeding* uses it through circularSpeed()
+ * — and seeding is reached via seedMode() in sim/modes.ts, which is generic over
+ * all five modes and has no business carrying one mode's control on its
+ * signature. One value, read by everything that needs it, is the smaller thing.
+ *
+ * Only this mode has it. The self-gravitating disc's stability depends on the
+ * ratio between G_CORE and M_DISC (see sim/world.ts), so the same slider there
+ * would be a knob that quietly destroys the galaxy; here the potential is fixed
+ * and prescribed, so scaling it is exactly a speed control: v = sqrt(G/r).
+ */
+let gCore = G_CORE;
+
+export function coreGravity() {
+  return gCore;
+}
+
+export function setCoreGravity(v: number) {
+  gCore = v;
+}
 
 /**
  * Circular-orbit speed: v = sqrt(G / r), with a floor on r.
@@ -33,15 +66,74 @@ export const R_DISC = 0.65;
  * middle — see vCirc() in sim/world.ts. It is part of what this mode is.
  */
 export function circularSpeed(r: number) {
-  return Math.sqrt(G_CORE / Math.max(r, 0.06)) * 0.94;
+  return Math.sqrt(gCore / Math.max(r, 0.06)) * 0.94;
 }
 
-/** Species banded by radius over a uniform-density disc. */
-export function seedSpecies(sim: Sim, rand: () => number) {
+/** Cheap per-slot hash, so a home radius is a function of the slot and not of
+ *  whichever random stream happens to be seeding it. Mirrors hash2 in
+ *  sim/barred.ts and hash() in both shaders. */
+function hash2(n: number) {
+  let x = Math.imul(n, 747796405) + 2891336453;
+  x = Math.imul((x >>> ((x >>> 28) + 4)) ^ x, 277803737);
+  return (((x >>> 22) ^ x) >>> 0) / 4294967296;
+}
+
+/**
+ * The radius a particle belongs at, from its species.
+ *
+ * The inverse of the banding in seedSpecies() below, and it has to exist for the
+ * same reason barred.homeRadius() does: species is drawn *from* radius, so
+ * anything that places particles by drawing a radius independently gets a disc
+ * where the two are uncorrelated. Measured before this existed, all six species
+ * sat at a mean radius of 0.432 with a correlation of -0.001 — six colours
+ * smeared evenly over one annulus, which additive blending renders as grey.
+ *
+ * Uniform-density profile is preserved exactly rather than approximately:
+ * seedSpecies draws r = sqrt(u) * R_DISC and bands on r/R_DISC, so mapping the
+ * band back through (species + 0.5 + jitter) / SPECIES_COUNT * R_DISC returns
+ * the same sqrt-distributed radii it came from. The jitter is the same width, so
+ * the bands overlap here too and no edge between two colours is anywhere.
+ */
+export function homeRadius(species: number, i: number) {
+  const j = (hash2(i * 11 + 5) - 0.5) * SPECIES_SPREAD;
+  const f = Math.min(1, Math.max(0.03, (species + 0.5 + j) / SPECIES_COUNT));
+  return R_DISC * f;
+}
+
+/**
+ * Seed the whole population: positions, velocities and species in one pass.
+ *
+ * One pass over one random stream, and that is the entire point of it. Species
+ * is banded *from* the radius drawn on the line above, so the two are the same
+ * draw and cannot disagree. Splitting this into a seedSpecies() and a reseed()
+ * over two streams is what silently removed the colour bands from this mode:
+ * measured, all six species sat at a mean radius of 0.432 with a correlation of
+ * -0.001 — six colours smeared evenly over one annulus, which additive blending
+ * renders as grey. The disc looked right and had no structure in it at all.
+ *
+ * The draw order is load-bearing beyond that: angle, radius, jitter, stat, four
+ * values per particle in that sequence, which is what the original had before
+ * this mode was split out into its own file. Same PRNG and same seed, so this
+ * reproduces its initial conditions exactly rather than approximately.
+ */
+export function seedDisc(sim: Sim, rand: () => number) {
+  const p = sim.particles;
   for (let i = 0; i < sim.capacity; i++) {
+    const o = i * STRIDE;
+    const a = rand() * Math.PI * 2;
     const r = Math.sqrt(rand()) * R_DISC;
+    const vOrb = circularSpeed(r);
+    p[o] = Math.cos(a) * r;
+    p[o + 1] = Math.sin(a) * r;
+    p[o + 2] = -Math.sin(a) * vOrb;
+    p[o + 3] = Math.cos(a) * vOrb;
+
+    // Species banded by radius: the galaxy reads as composed rings rather than
+    // uniform confetti, and the filter chips then carve visible structure. The
+    // jitter is wide on purpose — the bands have to overlap, or the disc reads
+    // as six authored rings rather than as a sorted population.
     const band = (r / R_DISC) * SPECIES_COUNT;
-    const jitter = (rand() - 0.5) * 1.6;
+    const jitter = (rand() - 0.5) * SPECIES_SPREAD;
     sim.species[i] = Math.max(0, Math.min(SPECIES_COUNT - 1, (band + jitter) | 0));
     sim.stat[i] = rand();
   }
@@ -70,7 +162,7 @@ export function integrateCPU(sim: Sim, dt: number, mx: number, my: number) {
     const rc = Math.sqrt(dc2);
     // Attraction minus a short-range repulsive core. Without the second term the
     // whole population collapses to a single point.
-    const fc = G_CORE / (dc2 * rc) - 0.0025 / (dc2 * dc2);
+    const fc = gCore / (dc2 * rc) - 0.0025 / (dc2 * dc2);
 
     const dx = mx - x;
     const dy = my - y;
@@ -111,13 +203,22 @@ export function integrateCPU(sim: Sim, dt: number, mx: number, my: number) {
   }
 }
 
-/** Re-seed the first `n` slots. Mirrors the WGSL scatter pass for this mode. */
+/**
+ * Re-seed the first `n` slots, positions only — the naive arm's path, which
+ * replaces a prefix of the population and must leave species alone because the
+ * sidebar and the chips are still reading the GPU arm's.
+ *
+ * So angle is random and radius is not: it comes back out of the particle's
+ * existing species through homeRadius(), which is what keeps the colour bands
+ * intact when the species array is not being rewritten alongside. The full
+ * population is seeded by seedDisc() above instead.
+ */
 export function reseed(sim: Sim, n: number, rand: () => number = Math.random) {
   const p = sim.particles;
   for (let i = 0; i < n; i++) {
     const o = i * STRIDE;
     const a = rand() * Math.PI * 2;
-    const r = Math.sqrt(rand()) * R_DISC;
+    const r = homeRadius(sim.species[i], i);
     const vOrb = circularSpeed(r);
     p[o] = Math.cos(a) * r;
     p[o + 1] = Math.sin(a) * r;

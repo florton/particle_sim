@@ -4,6 +4,7 @@ import {
   createSim, integrateCPU, RADIAL_DAMP, SPECIES_NAMES, SPECIES_COLORS, G_CURSOR_HOLD,
 } from './sim/world';
 import * as barred from './sim/barred';
+import * as classic from './sim/classic';
 import { COLLISION, MODES, MODE_COUNT, SELFGRAV } from './sim/modes';
 import { createPair, pairSeparation, resetPair, stepPair } from './sim/pair';
 import { VirtualList } from './ui/list';
@@ -185,6 +186,50 @@ coolInput.addEventListener('input', () => applyCooling(coolFromSlider(+coolInput
 coolRow.append(coolLabel, coolInput);
 head.appendChild(coolRow);
 
+// --- core gravity, fixed-potential disc only ------------------------------
+//
+// The other half of the same idea as the cooling slider, for the one mode where
+// it is safe: the fixed-potential disc's primary is prescribed and carries the
+// entire rotation curve, so scaling it is exactly a speed control. Circular
+// speed goes as sqrt(G), and because the damping here is radial-only the disc
+// does not just get faster — the existing orbits are suddenly wrong for the new
+// potential, fall eccentric, and recircularize into a tighter or wider annulus
+// over about a second. Turning the knob is visible as the disc breathing.
+//
+// Nothing else in the set gets this. See `gravity` in sim/modes.ts for why.
+//
+// Geometric travel rather than linear, because what the eye reads is the ratio:
+// halving G looks like the same size of change as doubling it, and a linear
+// slider would spend most of its length above the default.
+const GRAV_G_MIN = 0.1;
+const GRAV_G_MAX = 3.0;
+const gravFromSlider = (t: number) => GRAV_G_MIN * (GRAV_G_MAX / GRAV_G_MIN) ** (t / 1000);
+const gravToSlider = (v: number) =>
+  (1000 * Math.log(v / GRAV_G_MIN)) / Math.log(GRAV_G_MAX / GRAV_G_MIN);
+
+const gravRow = document.createElement('div');
+gravRow.className = 'control';
+const gravLabel = document.createElement('label');
+gravLabel.htmlFor = 'coregrav';
+const gravInput = document.createElement('input');
+gravInput.type = 'range';
+gravInput.id = 'coregrav';
+gravInput.min = '0';
+gravInput.max = '1000';
+
+function applyCoreGravity(v: number) {
+  // One write. The backends read it into a uniform each frame, the naive arm
+  // integrates with it, and [R] re-seeds the disc at the matching circular
+  // speed — all from this one value. See coreGravity() in sim/classic.ts.
+  classic.setCoreGravity(v);
+  gravLabel.textContent =
+    `core gravity · ${v.toFixed(2)} — orbits ×${Math.sqrt(v / classic.G_CORE).toFixed(2)}`;
+}
+gravInput.value = String(gravToSlider(classic.G_CORE));
+gravInput.addEventListener('input', () => applyCoreGravity(gravFromSlider(+gravInput.value)));
+gravRow.append(gravLabel, gravInput);
+head.appendChild(gravRow);
+
 /**
  * Rebuild the filtered row set and the count above it.
  *
@@ -268,6 +313,8 @@ function setMode(next: number) {
   // The slider only means something to the self-gravitating disc; every other
   // mode has a fixed dissipation law of its own.
   coolRow.style.display = MODES[mode].cooling ? '' : 'none';
+  // And core gravity only to the fixed-potential disc.
+  gravRow.style.display = MODES[mode].gravity ? '' : 'none';
   if (arm === 'gpu') refreshBanner();
   // Switching mode while comparing should switch the thing being compared.
   else setArm('baseline');
@@ -320,6 +367,11 @@ function fit() {
 addEventListener('resize', fit);
 fit();
 applyCooling(RADIAL_DAMP);
+applyCoreGravity(classic.G_CORE);
+// setMode() is not called for the mode the page boots in, so the per-mode rows
+// start in the state that mode wants: cooling belongs to it, core gravity does
+// not.
+gravRow.style.display = MODES[mode].gravity ? '' : 'none';
 setArm('gpu');
 
 // Verification handle. Lets the sim be driven and inspected without relying on

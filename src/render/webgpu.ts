@@ -71,6 +71,12 @@ struct Params {
   c0        : vec2<f32>,
   c1        : vec2<f32>,
   pmass     : f32,
+  // Core strength of the fixed-potential disc, driven live from the UI. A
+  // uniform rather than a shader constant because it is the one term in that
+  // mode a slider moves -- see coreGravity() in sim/classic.ts. Lands at offset
+  // 108, in the padding the struct's 8-byte alignment already reserved, so the
+  // uniform buffer is still 112 bytes.
+  gcore     : f32,
 };
 
 // Central bulge + halo. Fixed at the origin -- see the integrate entry point.
@@ -215,7 +221,6 @@ const BD_RETURN_LO = ${barred.RETURN_LO};
 const BD_RETURN_HI = ${barred.RETURN_HI};
 const BD_CORE_FRAC = ${barred.CORE_FRAC};
 const BD_SPECIES_SPREAD = ${barred.SPECIES_SPREAD};
-const CL_G_CORE = ${classic.G_CORE};
 const CL_G_CURSOR = ${classic.G_CURSOR};
 const CL_RADIAL_DAMP = ${classic.RADIAL_DAMP};
 
@@ -443,7 +448,7 @@ fn clsIntegrate(p : vec4<f32>, dt : f32) -> vec4<f32> {
   let dc = -p.xy;
   let dc2 = dot(dc, dc) + 0.004;
   let rc = sqrt(dc2);
-  let fc = CL_G_CORE / (dc2 * rc) - 0.0025 / (dc2 * dc2);
+  let fc = params.gcore / (dc2 * rc) - 0.0025 / (dc2 * dc2);
 
   let dm = vec2<f32>(params.mx - p.x, params.my - p.y);
   let dm2 = dot(dm, dm) + 0.02;
@@ -1308,6 +1313,10 @@ export async function createWebGPUBackend(
       paramData[24] = pair.x1;
       paramData[25] = pair.y1;
       paramData[26] = PAIR_MASS;
+      // Read from the module rather than mirrored into a local by a setter: the
+      // same number also has to reach the CPU baseline and the seeding, neither
+      // of which goes through a backend. See coreGravity() in sim/classic.ts.
+      paramData[27] = classic.coreGravity();
       device.queue.writeBuffer(paramBuf, 0, paramBytes);
 
       const enc = device.createCommandEncoder();

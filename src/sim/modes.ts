@@ -41,6 +41,18 @@ export interface ModeDef {
   hold: 'ramp' | 'step' | 'none';
   /** Whether the disc-cooling slider means anything here. */
   cooling: boolean;
+  /**
+   * Whether the core-gravity slider means anything here.
+   *
+   * Only the fixed-potential disc. Its primary is prescribed and carries the
+   * whole rotation curve, so scaling it is exactly a speed control — v =
+   * sqrt(G/r) — and the radial damping recircularizes the orbits into the new
+   * disc within a second. Nothing else in the set can say that: the
+   * self-gravitating disc's structure lives on the *ratio* of core to disc mass
+   * (see M_DISC in sim/world.ts), the barred disc's rings sit at resonances tied
+   * to its own core, and the plate has no gravity at all.
+   */
+  gravity: boolean;
   /** What [R] does, for the banner. */
   restart: string;
 }
@@ -50,30 +62,35 @@ export const MODES: readonly ModeDef[] = [
     label: 'orbital galaxy · self-gravitating',
     hold: 'ramp',
     cooling: true,
+    gravity: false,
     restart: 'restart',
   },
   {
     label: 'Chladni plate · 6 frequencies',
     hold: 'none',
     cooling: false,
+    gravity: false,
     restart: 'restart',
   },
   {
     label: 'orbital galaxy · barred',
     hold: 'step',
     cooling: false,
+    gravity: false,
     restart: 'reset',
   },
   {
     label: 'galaxy collision',
     hold: 'step',
     cooling: false,
+    gravity: false,
     restart: 'flip spin',
   },
   {
     label: 'orbital galaxy · fixed potential',
     hold: 'none',
     cooling: false,
+    gravity: true,
     restart: 'reset',
   },
 ];
@@ -104,8 +121,11 @@ export function seedMode(sim: Sim, mode: number, pair: PairState, seed = 0x9e377
       barred.reseedCollision(sim, sim.capacity, pair, mulberry32(seed ^ 0x51));
       break;
     case CLASSIC:
-      classic.seedSpecies(sim, mulberry32(seed));
-      classic.reseed(sim, sim.capacity, mulberry32(seed ^ 0x51));
+      // One call over one stream, unlike the two families above. Species here is
+      // banded from the radius it is seeded at rather than from a home radius
+      // the force law returns particles to, so the two cannot be drawn
+      // separately — see seedDisc() in sim/classic.ts.
+      classic.seedDisc(sim, mulberry32(seed));
       break;
     case CHLADNI:
       // Species stays the exponential disc's, so leaving the plate for mode 0
