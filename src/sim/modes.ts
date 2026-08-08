@@ -1,9 +1,9 @@
 /**
- * The six simulations this demo can run, and how the shell should behave in
+ * The seven simulations this demo can run, and how the shell should behave in
  * each.
  *
- * They are six different force laws, not six settings of one. Four of them are
- * galaxies that answer each other: CLASSIC is a disc of test particles in a
+ * They are seven different force laws, not seven settings of one. Four of them
+ * are galaxies that answer each other: CLASSIC is a disc of test particles in a
  * fixed potential and phase-mixes into a smooth annulus; BARRED drives the same
  * disc with a rotating quadrupole so resonance holds rings open; SELFGRAV gives
  * the disc mass of its own so it amplifies its own density contrast into arms;
@@ -17,12 +17,19 @@
  * constants exactly, plus one term. A mode that differed in more than one thing
  * would not be able to attribute the difference to the halo.
  *
+ * SMOKE is the exception in the other direction, and is the one mode here that
+ * is not a force law at all. Every other entry tells a particle what it weighs
+ * and where the other mass is; the fluid imposes a constraint on the whole
+ * velocity field at once, which no local rule can produce, and the particles in
+ * it carry no dynamics of their own. See sim/smoke.ts.
+ *
  * This table is the only place the set is enumerated. The shaders switch on the
  * same integers, so the order here is load-bearing.
  */
 
 import * as barred from './barred';
 import * as classic from './classic';
+import * as smoke from './smoke';
 import type { PairState } from './pair';
 import { mulberry32, randomSeed, scatterPlate, seedGalaxy, type Sim } from './world';
 
@@ -32,6 +39,7 @@ export const COLLISION = 2;
 export const CLASSIC = 3;
 export const HALO = 4;
 export const SELFGRAV = 5;
+export const SMOKE = 6;
 
 export interface ModeDef {
   /** Shown in the banner. */
@@ -71,6 +79,23 @@ export interface ModeDef {
    * between them is a controlled comparison and not two different galaxies.
    */
   halo: boolean;
+  /**
+   * Whether the vorticity-confinement slider means anything here.
+   *
+   * Only the smoke, which is the only mode with a numerical defect worth putting
+   * a control on. See VORT in sim/smoke.ts for what confinement is correcting
+   * and why the honest description of it is a patch rather than a force.
+   */
+  vorticity: boolean;
+  /**
+   * What the pointer does, for the banner — empty when it does nothing.
+   *
+   * Not derivable from `hold`, because `hold` says how the cursor's strength
+   * changes and this says what the cursor is. In every galaxy it is a mass and
+   * the verb is "pull"; in the smoke it is a paddle and the verb is "stir", and
+   * the two ramp identically.
+   */
+  drag: string;
   /** What [R] does, for the banner. */
   restart: string;
 }
@@ -82,6 +107,8 @@ export const MODES: readonly ModeDef[] = [
     cooling: false,
     gravity: false,
     halo: false,
+    vorticity: false,
+    drag: '',
     restart: 'restart',
   },
   {
@@ -90,6 +117,8 @@ export const MODES: readonly ModeDef[] = [
     cooling: false,
     gravity: false,
     halo: false,
+    vorticity: false,
+    drag: 'drag to pull',
     restart: 'reset',
   },
   {
@@ -98,6 +127,8 @@ export const MODES: readonly ModeDef[] = [
     cooling: false,
     gravity: false,
     halo: false,
+    vorticity: false,
+    drag: 'drag to pull',
     restart: 'flip spin',
   },
   {
@@ -106,6 +137,8 @@ export const MODES: readonly ModeDef[] = [
     cooling: false,
     gravity: true,
     halo: false,
+    vorticity: false,
+    drag: 'drag to pull',
     restart: 'reset',
   },
   {
@@ -120,6 +153,8 @@ export const MODES: readonly ModeDef[] = [
     cooling: true,
     gravity: false,
     halo: true,
+    vorticity: false,
+    drag: 'drag to pull',
     restart: 'restart',
   },
   {
@@ -131,6 +166,25 @@ export const MODES: readonly ModeDef[] = [
     cooling: true,
     gravity: false,
     halo: false,
+    vorticity: false,
+    drag: 'drag to pull',
+    restart: 'restart',
+  },
+  {
+    // The odd one out, and last so that [M] wraps from it to the plate — the two
+    // modes in the set that are not gravity, next to each other.
+    //
+    // Its cursor ramps like the discs above but is not a mass: it is a paddle,
+    // and what it injects is the pointer's own velocity. Holding deepens the
+    // stir and adds heat, which is the same shape of interaction the ramp exists
+    // for — a step change in a fluid arrives as an impulse and tears the field.
+    label: 'smoke · incompressible flow',
+    hold: 'ramp',
+    cooling: false,
+    gravity: false,
+    halo: false,
+    vorticity: true,
+    drag: 'drag to stir',
     restart: 'restart',
   },
 ];
@@ -212,6 +266,15 @@ export function seedRange(
       // finds its bands intact. Only the positions become sand.
       seedGalaxy(sim, seed, from, to);
       scatterPlate(sim, to, mulberry32(seed ^ 0x51), from);
+      break;
+    case SMOKE:
+      // One call over one stream, like CLASSIC, but with the dependency the
+      // other way round: species is drawn first and position comes out of it,
+      // because the ribbon a tracer belongs to is what decides where in the
+      // source it enters. Also wipes the fluid — the field is the mode's real
+      // state and the tracers are only what it is carrying, so re-seeding one
+      // without the other would drop fresh dye into a developed flow.
+      smoke.seedPlume(sim, mulberry32(seed), from, to);
       break;
     default:
       // SELFGRAV and HALO both. Same seeder, and the halo reaches it through

@@ -1,4 +1,4 @@
-import { CHLADNI } from '../sim/modes';
+import { CHLADNI, SMOKE } from '../sim/modes';
 import type { PairState } from '../sim/pair';
 
 /** Hard cap on a single readback window, in particles. */
@@ -42,6 +42,14 @@ export const FRAME = [
   // difference.
   { r: 0.70, cover: 0.0 },
   { r: 0.70, cover: 0.0 }, // SELFGRAV  -- disc light is inside r = 0.7
+  // SMOKE -- the fluid box is 3.6 x 2, so `r` is its half *height* and a
+  // short-side fit shows the whole of it. cover stays 0 for the opposite reason
+  // to the plate's 1: the box has a hard boundary in x that the plate's
+  // repeating lattice does not, and zooming past the fit would push the open
+  // left and right edges into frame. The box is already wide enough to overrun a
+  // 16:9 window on its own -- see NY/NX in sim/smoke.ts, which is where that
+  // shape was chosen.
+  { r: 1.0, cover: 0.0 },
 ] as const;
 
 /**
@@ -67,14 +75,24 @@ export const TILT_COS = 0.5;
 /**
  * Vertical foreshortening for a mode: 1 face-on, TILT_COS inclined.
  *
- * The plate never tilts. It is a physical square with a hard boundary, seen from
- * directly above -- the whole subject is the standing-wave pattern on its
- * surface, and an inclined square is just a smaller square with a perspective
- * excuse. It is also the one mode already filling the window, so a tilt would
- * cost it that and return nothing.
+ * Two modes never tilt, for the same underlying reason: the inclination is a
+ * claim that the subject is a flat disc lying in a plane we are looking down
+ * onto at an angle, and neither of them is.
+ *
+ * The plate is a physical square with a hard boundary, seen from directly above
+ * -- the whole subject is the standing-wave pattern on its surface, and an
+ * inclined square is just a smaller square with a perspective excuse. It is also
+ * the one mode already filling the window, so a tilt would cost it that and
+ * return nothing.
+ *
+ * The smoke is worse than pointless. It is a vertical section through a fluid,
+ * so its y axis is *up* rather than a second horizontal — foreshortening it
+ * would be squashing gravity, and the plume would rise at a rate that disagreed
+ * with the buoyancy driving it. It is the one mode where the two axes are not
+ * interchangeable.
  */
 export function cameraTilt(mode: number, tilted: boolean): number {
-  return tilted && mode !== CHLADNI ? TILT_COS : 1;
+  return tilted && mode !== CHLADNI && mode !== SMOKE ? TILT_COS : 1;
 }
 
 /**
@@ -218,6 +236,26 @@ export interface Backend {
    */
   setCooling?(retention: number): void;
   /**
+   * Whether this backend can run a mode at all.
+   *
+   * Absent means every mode, which is the WebGPU path. It exists for the WebGL2
+   * fallback and the smoke: unlike self-gravity, which degrades to a
+   * fixed-potential galaxy that is still a galaxy, a fluid mode with no solver
+   * behind it is not a worse version of itself — it is a still image. Better to
+   * take it out of the [M] ring on that backend than to offer it and show
+   * nothing. See the note at the top of render/webgl2.ts.
+   */
+  hasMode?(mode: number): boolean;
+  /**
+   * Vorticity confinement strength for the smoke. Ignored by every other mode,
+   * and absent on backends with no fluid solver.
+   *
+   * Exposed for the same reason the cooling slider is: it is the constant that
+   * decides what kind of thing the mode is, rather than how fast it runs. See
+   * VORT in sim/smoke.ts.
+   */
+  setVorticity?(eps: number): void;
+  /**
    * Re-seed the population for the current mode, without rebuilding anything.
    *
    * A self-gravitating disc has no steady state to return to — it slowly
@@ -266,5 +304,24 @@ export interface Backend {
     field: Float32Array;
     grid: number;
     massScale: number;
+  }>;
+  /**
+   * Dump the smoke solver's scalar planes.
+   *
+   * Present only on backends that run the fluid. `div` is the divergence the
+   * pressure solve was handed; recomputing it from the velocity afterwards is
+   * how the projection gets checked rather than admired.
+   */
+  dumpSmoke?(): Promise<{
+    temp: Float32Array;
+    phi: Float32Array;
+    div: Float32Array;
+    curl: Float32Array;
+    /** Projected velocity, interleaved u, v per face, row stride `stride`. */
+    vel: Float32Array;
+    nx: number;
+    ny: number;
+    stride: number;
+    h: number;
   }>;
 }

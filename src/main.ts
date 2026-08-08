@@ -6,7 +6,8 @@ import {
 } from './sim/world';
 import * as barred from './sim/barred';
 import * as classic from './sim/classic';
-import { CHLADNI, CLASSIC, COLLISION, MODES, MODE_COUNT } from './sim/modes';
+import * as smoke from './sim/smoke';
+import { CHLADNI, CLASSIC, COLLISION, SMOKE, MODES, MODE_COUNT } from './sim/modes';
 import { createPair, pairSeparation, resetPair, stepPair } from './sim/pair';
 import { VirtualList } from './ui/list';
 import { speciesMask, toggleSpecies, filterLabel, countEffect, effectRuns } from './ui/state';
@@ -495,6 +496,64 @@ haloInput.addEventListener('input', () => applyHalo((+haloInput.value / 1000) * 
 haloRow.append(haloLabel, haloInput);
 head.appendChild(haloRow);
 
+// --- vorticity confinement, smoke only ------------------------------------
+//
+// The fourth slider, and the only one that is openly a control on a numerical
+// artifact rather than on the physics. The other three move a constant in a
+// force law. This one moves how hard the solver fights its own advection
+// scheme — semi-Lagrangian backtracing is stable because it interpolates, and
+// interpolation is a low-pass filter, so sixty times a second it is quietly
+// erasing the smallest eddies in the field. Confinement finds where vorticity
+// is concentrated and pushes it back up. It is a patch, and calling it anything
+// else would be dishonest; see VORT in sim/smoke.ts.
+//
+// It is on a slider anyway, because the two ends are two things smoke really
+// does. At zero the plume is laminar: it rises, mushrooms once, and the cap
+// dissolves into a smooth cloud. High, it sheds vortices continuously the whole
+// way up and never settles.
+//
+// The default sits low, and near the bottom of a narrow usable window — below
+// about 2 the confinement stops keeping up with the advection's own diffusion
+// and the plume goes smooth within half a minute, while by 12 it is curling at
+// every point and reads as a vortex diagram rather than as smoke. See VORT.
+//
+// Measured over 10 s from one seed, as mean squared vorticity across the grid —
+// 0.84 at epsilon 0, then 5.7, 58, 128, 160 at 6, 12, 24 and 40. The flattening
+// at the top is the clamp in CONF_MAX doing its job: unclamped, the same sweep
+// on the same geometry ran 0.84, 5.1, 78, 1179, 7234, and the top of that is the
+// feedback diverging rather than a rougher plume.
+//
+// Linear travel. The response is already steeply nonlinear in epsilon, so a
+// geometric slider would pile the whole usable range into one end.
+const VORT_MIN = 0;
+
+const vortRow = document.createElement('div');
+vortRow.className = 'control';
+const vortLabel = document.createElement('label');
+vortLabel.htmlFor = 'vorticity';
+const vortInput = document.createElement('input');
+vortInput.type = 'range';
+vortInput.id = 'vorticity';
+vortInput.min = '0';
+vortInput.max = '1000';
+
+function applyVorticity(v: number) {
+  // One write, into the module both arms read — the GPU backend folds it into a
+  // uniform each frame and the CPU reference reads it directly, so there is no
+  // setting for the two to disagree about. See setVorticity() in sim/smoke.ts.
+  backend.setVorticity?.(v);
+  vortLabel.textContent =
+    v <= 1e-6
+      ? 'vorticity confinement · none — advection smooths the curls away'
+      : `vorticity confinement · ε = ${v.toFixed(0)}`;
+}
+vortInput.value = String(((smoke.VORT - VORT_MIN) / (smoke.VORT_MAX - VORT_MIN)) * 1000);
+vortInput.addEventListener('input', () =>
+  applyVorticity(VORT_MIN + (+vortInput.value / 1000) * (smoke.VORT_MAX - VORT_MIN)),
+);
+vortRow.append(vortLabel, vortInput);
+head.appendChild(vortRow);
+
 /**
  * Rebuild the filtered row set and the count above it.
  *
@@ -531,11 +590,11 @@ const modeLabel = () =>
 function refreshBanner() {
   banner.textContent =
     `${backend.name} compute · ${sim.count.toLocaleString()} particles · ${modeLabel()} — ` +
-    (MODES[mode].hold === 'none' ? '' : 'drag to pull · ') +
+    (MODES[mode].drag ? `${MODES[mode].drag} · ` : '') +
     `[M] mode · [B] compare · [R] ${MODES[mode].restart} · [C] ${mono ? 'color' : 'mono'}` +
-    // The plate is always face-on, so offering it a view toggle would be
-    // offering nothing -- see cameraTilt() in render/backend.ts.
-    (mode === CHLADNI ? '' : ` · [V] ${tilted ? 'face-on' : 'tilt'}`);
+    // The plate and the smoke are never tilted, so offering them a view toggle
+    // would be offering nothing -- see cameraTilt() in render/backend.ts.
+    (mode === CHLADNI || mode === SMOKE ? '' : ` · [V] ${tilted ? 'face-on' : 'tilt'}`);
 }
 
 // Plain state, like `mode` and `mono` below: read imperatively at the few points
@@ -580,7 +639,31 @@ function setArm(next: 'gpu' | 'baseline') {
  * file is what pays it, and it has to be setMode() rather than an assignment
  * because the halo mass must reach the world before the re-seed reads it.
  */
+/**
+ * Whether the active backend can run a mode, and the next one it can.
+ *
+ * Only the WebGL2 fallback ever says no, and only about the smoke — see
+ * hasMode() there. Skipping rather than degrading is the right answer for
+ * exactly one mode in the set, and the reason is in that file.
+ *
+ * The walk is bounded by MODE_COUNT rather than by finding an answer, so a
+ * backend that supported nothing would return where it started instead of
+ * spinning.
+ */
+const modeOk = (m: number) => backend.hasMode?.(m) ?? true;
+
+function nextMode(from: number) {
+  for (let k = 1; k <= MODE_COUNT; k++) {
+    const m = (from + k) % MODE_COUNT;
+    if (modeOk(m)) return m;
+  }
+  return from;
+}
+
 let mode = Math.floor(Math.random() * MODE_COUNT);
+// The boot draw is uniform over the whole set, so on a fallback backend it can
+// land on a mode that is not there. Step off it before anything reads it.
+if (!modeOk(mode)) mode = nextMode(mode);
 
 // The colliding pair. One object, mutated in place and held by reference on all
 // sides, so the per-frame cost of the whole encounter is two bodies of leapfrog.
@@ -614,6 +697,8 @@ function setMode(next: number) {
   gravRow.style.display = MODES[mode].gravity ? '' : 'none';
   // And the halo only to the mode that is about having one.
   haloRow.style.display = MODES[mode].halo ? '' : 'none';
+  // And the confinement only to the fluid.
+  vortRow.style.display = MODES[mode].vorticity ? '' : 'none';
   if (arm === 'gpu') refreshBanner();
   // Switching mode while comparing should switch the thing being compared.
   else setArm('baseline');
@@ -685,7 +770,7 @@ function restartCollision(flip = true) {
 
 addEventListener('keydown', (e) => {
   if (e.key === 'b' || e.key === 'B') setArm(arm === 'gpu' ? 'baseline' : 'gpu');
-  if (e.key === 'm' || e.key === 'M') setMode((mode + 1) % MODE_COUNT);
+  if (e.key === 'm' || e.key === 'M') setMode(nextMode(mode));
   if (e.key === 'r' || e.key === 'R') restart();
   if (e.key === 'c' || e.key === 'C') setMono(!mono);
   if (e.key === 'v' || e.key === 'V') setTilt(!tilted);
@@ -700,6 +785,7 @@ fit();
 applyCooling(RADIAL_DAMP);
 applyCoreGravity(classic.G_CORE);
 applyHalo(M_HALO);
+applyVorticity(smoke.VORT);
 // The population. The backends are constructed at capacity, so this is a shrink
 // to the default rather than the page booting into the top of the slider — and a
 // shrink costs nothing, which is why there is no reason to thread the default
@@ -720,12 +806,20 @@ setArm('gpu');
 // rAF, so correctness is checkable independently of what the compositor is doing.
 (globalThis as any).__demo = {
   sim, backend, baseline, hud, counters, integrateCPU, list, effectRuns, setArm,
+  // The CPU fluid reference, so the solver can be driven and dumped without a
+  // GPU at all — stepFluid() and dumpField() are what the confinement and
+  // divergence figures in the README were measured with.
+  smoke,
   // So the pointer mapping can be checked against the camera it inverts rather
   // than by dragging and squinting.
   screenToSim, cursor: () => [mx, my],
 };
 
 let prev = performance.now();
+// The previous frame's pointer position in simulation space, or null when there
+// was no pointer in the force law last frame. See the difference in loop().
+let pmx: number | null = null;
+let pmy = 0;
 
 function loop(now: number) {
   hud.frame(now);
@@ -767,6 +861,25 @@ function loop(now: number) {
   // capture-drag and a hair of extra cursor mass in the force law forever. Idle
   // should be the same arithmetic it was before hold-to-pull existed.
   if (!holding && grav < 1.001) grav = 1;
+
+  // How fast the pointer is moving, in simulation units per second — what the
+  // fluid is stirred by, and nothing else in the set uses it. Differenced here
+  // rather than in a pointer handler because the conversion to simulation space
+  // is already done here, once per frame, against the current camera.
+  //
+  // Gated on the cursor being armed, and hard rather than by smoothing: a parked
+  // cursor sits at CURSOR_PARK, so the frame it arms on would otherwise
+  // difference a million units against a sixtieth of a second and inject an
+  // impulse of 6e7 into the velocity field. Deriving it from the parked value at
+  // all is the bug; the guard is not a filter on a large number, it is a
+  // statement that there is no pointer to have a velocity yet.
+  if (cursorArmed && pmx !== null) {
+    smoke.setCursor((mx - pmx) / dt, (my - pmy) / dt, grav);
+  } else {
+    smoke.setCursor(0, 0, grav);
+  }
+  pmx = cursorArmed ? mx : null;
+  pmy = my;
 
   if (arm === 'gpu') {
     backend.frame(dt, mx, my, grav);

@@ -28,7 +28,8 @@ import {
 } from './sim/world';
 import * as barred from './sim/barred';
 import * as classic from './sim/classic';
-import { BARRED, CHLADNI, CLASSIC, COLLISION } from './sim/modes';
+import * as smoke from './sim/smoke';
+import { BARRED, CHLADNI, CLASSIC, COLLISION, SMOKE } from './sim/modes';
 import { createPair, type PairState } from './sim/pair';
 import { cameraTilt, cameraZoom } from './render/backend';
 
@@ -142,6 +143,7 @@ export class BaselineArm {
       case BARRED: barred.reseedDisc(this.sim, BASELINE_COUNT); break;
       case COLLISION: barred.reseedCollision(this.sim, BASELINE_COUNT, this.pair); break;
       case CLASSIC: classic.reseed(this.sim, BASELINE_COUNT); break;
+      case SMOKE: smoke.reseed(this.sim, BASELINE_COUNT); break;
       default: reseedGalaxy(this.sim, BASELINE_COUNT);
     }
   }
@@ -171,6 +173,17 @@ export class BaselineArm {
         break;
       case CLASSIC:
         classic.integrateCPU(this.sim, dt, mx, my, cursorMass);
+        break;
+      case SMOKE:
+        // The full fluid solve, at the resolution the GPU arm runs it — not a
+        // cheaper one. It is about 8 ms a frame here against well under one on
+        // the GPU, which does narrow the gap this arm exists to show: in every
+        // other mode the naive arm's cost is essentially all presentation, and
+        // in this one a real slice of it is arithmetic the GPU arm also does.
+        // Cutting the grid or the sweep count would widen the gap back out by
+        // making the two arms simulate different things, which is the one thing
+        // the comparison cannot survive. See stepFluid() in sim/smoke.ts.
+        smoke.integrateSmokeCPU(this.sim, dt, mx, my, this.elapsed);
         break;
       default:
         integrateCPU(this.sim, dt, mx, my, this.cooling, grav);

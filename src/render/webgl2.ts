@@ -17,6 +17,17 @@
  * disc within a few seconds and stays there. Everything else here — the seeding
  * profile, the constants, the cooling control, the framing — is kept in sync
  * with the WGSL path so the difference is exactly the one term.
+ *
+ * KNOWN GAP, the smoke: not degraded here but removed. hasMode() takes it out of
+ * the [M] ring on this backend. The distinction from the paragraph above is the
+ * point — a self-gravitating disc with the mesh term dropped is still a disc,
+ * running a force law that is one of the other modes, so it degrades into
+ * something honest. A fluid with the pressure projection dropped is not a
+ * worse fluid; it is not a fluid at all, and the tracers in it have no dynamics
+ * of their own to fall back on, so what would be left is a still image of a
+ * plume. Every stage of that solver is a gather over a small grid and would port
+ * to render-to-texture ping-pong without needing atomics, so this is work not
+ * done rather than a wall.
  */
 
 import {
@@ -26,7 +37,9 @@ import {
 } from '../sim/world';
 import * as barred from '../sim/barred';
 import * as classic from '../sim/classic';
-import { BARRED, CHLADNI, CLASSIC, COLLISION, SELFGRAV, seedMode, seedRange } from '../sim/modes';
+import {
+  BARRED, CHLADNI, CLASSIC, COLLISION, SELFGRAV, SMOKE, seedMode, seedRange,
+} from '../sim/modes';
 import { PAIR_MASS, createPair, type PairState } from '../sim/pair';
 import { cameraTilt, cameraZoom, type Backend } from './backend';
 
@@ -598,6 +611,11 @@ export function createWebGL2Backend(
     setMode(m: number) {
       mode = m | 0;
       reseedBuffers();
+    },
+
+    /** Everything but the smoke — see the note at the top of this file. */
+    hasMode(m: number) {
+      return m !== SMOKE;
     },
 
     reset() {

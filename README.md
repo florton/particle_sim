@@ -14,7 +14,7 @@ checked. All figures below are measured, not estimated.
 | Fallback backend | WebGL2 transform feedback, same force law |
 | Reactivity | `alien-signals` — one signal, one effect, deliberately kept out of the frame loop |
 | Animation | `motion` for UI transitions |
-| Dependencies | 2 runtime packages; ~45 kB built, 15 kB gzipped JS |
+| Dependencies | 2 runtime packages; 120 kB built, 43 kB gzipped JS |
 
 Particle data is uploaded once and never returns to the CPU on the render path.
 Species filtering is a uniform bit test per vertex on the GPU, not a CPU pass over
@@ -22,7 +22,7 @@ the population. The sidebar virtualizes 1,000,000 rows down to ~33 live `<div>`s
 
 ## Simulation modes
 
-`M` cycles between five modes. All share one particle buffer and one render path.
+`M` cycles between seven modes. All share one particle buffer and one render path.
 
 **Spiral galaxy** — a self-gravitating disc. Each frame the population deposits its
 mass into a 64×64 mesh, the mesh is convolved for the force field, and every
@@ -54,6 +54,30 @@ retrograde.
 walls. Nothing drives it and nothing responds to it, so it phase-mixes into a smooth
 annulus within seconds. Kept as the baseline the two galaxy modes are measured
 against.
+
+**Smoke** — the only mode here that is not a force law. Every other entry tells a
+particle what it weighs and where the other mass is; a fluid is incompressible, and
+that is a constraint on the entire velocity field at once rather than an interaction
+between any two points in it. Enforcing it means solving a Poisson equation for
+pressure over the whole domain every frame and subtracting its gradient — there is no
+local rule, no softening length and no interaction radius that produces it. So the
+grid is not standing in for something more accurate here, the way the galaxy's mesh
+stands in for a sum over pairs. It is where the physics is.
+
+The particles are what makes it visible. The grid is 172×96 and the interesting length
+scale in a plume is far below a cell: a tracer path integrates the field, so material
+lines stretch and fold at scales the thing that moved them cannot represent. Drawing
+the grid's own density would be a 172-pixel-wide picture of a smooth blob.
+
+Semi-Lagrangian advection, Boussinesq buoyancy off an advected temperature field,
+vorticity confinement, and twenty red-black Gauss-Seidel sweeps for the projection, on
+a staggered MAC grid. The floor is solid and the other three sides are open. Species
+is used differently from anywhere else in the set: it picks which of six slots across
+the source a tracer enters at, and a recycled tracer returns to its own, so six dye
+ribbons are injected side by side and never homogenize. Turn five chips off and one
+material line is left, folding — the actual signature of chaotic advection, and
+invisible in the full-colour image because six interleaved folded ribbons just look
+like smoke.
 
 ## Measurements
 
@@ -93,6 +117,14 @@ frame.
 
 200× the particles at 3.6× the frame rate, with the main thread going from
 essentially every millisecond inside a blocking long task to zero.
+
+The smoke is the one mode where this comparison is not purely about presentation. The
+naive arm runs the same fluid solve at the same grid resolution and the same sweep
+count — anything else would have the two arms simulating different things — and that
+costs it about 8–9 ms a frame against well under one on the GPU. It still measures 16
+fps and 66.6 ms p50 there, unchanged, because the arm is quantized to whole refresh
+intervals and the DOM work dominates by an order of magnitude; the fluid disappears
+inside the rounding. Worth knowing rather than worth fixing.
 
 ### Does the galaxy have structure?
 
@@ -172,6 +204,110 @@ Four results from tuning the solver:
   with mass conservation unaffected (`dumpGrid()` still sums to 0.18). This explained
   the dropped frames that looked like thermal throttling.
 
+### Cost of the fluid
+
+Same A/B as above, against Chladni mode at the same population — it shares the render
+path and the HDR target and runs no grid passes at all. The fluid's cost is fixed:
+16,512 cells and twenty sweeps regardless of how many tracers are in it.
+
+| particles | smoke | Chladni | delta |
+| --- | --- | --- | --- |
+| 250,000 | 60 fps, 0% dropped | 60 fps, 0% dropped | vsync-capped |
+| 1,000,000 | 42 fps, 36.2% dropped | 49 fps, 21.7% dropped | **~3.4 ms** |
+
+The delta is from mean frame time — 1000/42 against 1000/49, so 23.8 ms against 20.4 —
+rather than from p50, which reads 16.7 ms in all four cells because it is vsync-capped
+and quantized to the refresh interval. At this grid size the fluid costs about what the
+self-gravity mesh does, which is a coincidence of two unrelated solvers and not a
+result.
+
+Below the point where the render alone saturates the frame, the whole solver is free,
+the same as the mesh and for the same reason: at 250k the base render leaves several
+milliseconds of slack and 48 small dispatches fit inside it.
+
+The projection is checked rather than admired. Sampled off the GPU after twelve seconds
+of running, the pressure solve was handed a field with mean |divergence| 1.014 and left
+0.017 — **98.4% removed**, with the peak going 11.36 to 0.252. Twenty sweeps does not
+converge a 16k-cell Poisson solve and is not meant to; Gauss-Seidel clears error
+fastest at the shortest wavelengths, so what twenty sweeps buys is no *local*
+compression, which is the part the eye can see. The smooth remainder reads as the fluid
+being very slightly compressible.
+
+Four results from building it:
+
+- **Vorticity confinement is a positive feedback and runs away.** The force it adds is
+  proportional to the vorticity already present, so vorticity drives a force that makes
+  more vorticity. Mean enstrophy and peak field speed over 10 s from one seed, with and
+  without a ceiling on the force:
+
+  | ε | unclamped | | clamped | |
+  | --- | --- | --- | --- | --- |
+  | | enstrophy | peak speed | enstrophy | peak speed |
+  | 0 | 0.84 | 0.44 | 0.84 | 0.44 |
+  | 6 | 5.12 | 0.57 | 5.69 | 0.62 |
+  | 12 | 77.8 | 3.20 | 57.9 | 1.33 |
+  | 24 | 1179 | 14.6 | 128 | 2.61 |
+  | 40 | 7234 | 28.1 | 160 | 2.66 |
+
+  The buoyancy sustains about 1 unit/s in the body of the plume and roughly 3 inside the
+  jet itself, so the unclamped column at ε=24 and above is not a rougher plume — it is
+  the feedback diverging. Clamping the magnitude keeps the direction, which is where the
+  physics is; the clamp is inactive in ordinary flow and only engages on a vortex that
+  is winding itself up.
+- **A closed box cannot hold a plume.** With solid side walls the column went unstable,
+  flopped over and got pinned by its own return flow, ending as two motionless sheets of
+  tracers down the left and right edges with the middle empty. Opening three sides fixed
+  the pinning, and also took the projection's residual from 1.6 to 0.04 — a Poisson
+  problem with Dirichlet boundaries on three sides converges far faster than one boxed
+  in by Neumann on all four.
+- **Source temperature and cooling length are the same knob if you inject heat at a
+  rate.** Held at rate 4.0 against cooling 4.0, the source sits at T=1 and the plume is
+  cold within a fifth of the box: it gets one kick at the bottom and coasts, mean tracer
+  height stuck at -0.65 and no column at all. Pinning the source to a fixed temperature
+  instead separates them.
+- **Exposure tuned for a galaxy renders a plume in white.** The disc's gain is sized for
+  a population inside r=0.7 spanning orders of magnitude in density. A plume covers four
+  times the area with its light in filaments that are all about equally bright, so every
+  one of them landed above the tonemap's white rolloff — correct turbulent structure,
+  rendered in monochrome, all six dye ribbons indistinguishable. The fluid carries its
+  own gain and exposure.
+- **Tracers with no diffusion render as a foam, and the fix is bounded by the thing it
+  is fixing.** A tracer is present or absent, the flow folds rather than compresses, and
+  with three open sides most of what gets folded in is clean fluid carrying nothing — so
+  the clean regions round off into blobs and the tracers pile onto the sheets between
+  them. What is missing is real: the grid resolves eddies down to about a cell and the
+  standard closure for the transport the unresolved ones would do is a diffusivity. But
+  the voids and the filaments are the *same* length scale, both set by how far the flow
+  folds material between passes, so the setting is a compromise rather than a fix. The
+  scale to think in is the rms smear over a tracer's transit, sqrt(2 D T):
+
+  | D | smear | |
+  | --- | --- | --- |
+  | 2e-5 | 0.7 cells | softens the interfaces, leaves every pocket |
+  | 8e-5 | 1.4 cells | closes the small pockets, filaments intact |
+  | 5e-4 | 3.4 cells | featureless grey column |
+
+  8e-5, because the small pockets are the ones worth losing: a void a cell or two across
+  is a gap in the sampling of a fold rather than a feature of the flow, and in quantity a
+  field of them is the least pleasant thing the mode produces. The large voids are real
+  structure and survive, as do the ribbons, which are tens of cells long.
+- **The confinement's usable window is narrow.** Below about ε=2 it stops keeping up
+  with the diffusion the semi-Lagrangian advection applies and the plume goes laminar
+  within half a minute; by ε=12 it curls at every point. The default is 3, just above the
+  bottom of that window — smoke is mostly smooth sheets with structure at a few scales,
+  and a tightly wound vortex also evacuates its own core, so a high setting fills the
+  frame with small round voids each ringed by a bright filament. The slider tops out at
+  10 rather than at the point where the force saturates, because travel spent on
+  settings nobody should pick is travel it does not have where it matters.
+- **Ambient haze to lift the voids off black does not survive the arithmetic.** The
+  gaps read as holes partly because the fluid around the plume carries nothing at all,
+  which is not physical — a room with a plume in it is not a vacuum. Drawing 18% of the
+  population uniformly over the box instead of at the source is 0.09 tracers per pixel,
+  which after the tonemap is about 0.001 of luminance against a background already at
+  0.03: invisible. Lifting a void even to a tenth of full brightness needs forty times
+  that, more tracers than the whole population has. What it did buy was 18% fewer
+  tracers in the plume. Removed.
+
 ## Controls
 
 | key | action |
@@ -180,9 +316,10 @@ Four results from tuning the solver:
 | `B` | switch between GPU and naive DOM arm |
 | `R` | restart the simulation (flips spin sense in collision mode) |
 | `C` | toggle species palette against a luminance-only render |
+| `V` | face-on or inclined view (not on the plate or the smoke) |
 | click chips | filter species |
-| slider | disc cooling |
-| cursor | perturb the field; hold to grab it |
+| slider | disc cooling; vorticity confinement in the smoke |
+| cursor | perturb the field; hold to grab it — in the smoke, stir it |
 
 Holding the pointer ramps three things together over a few hundred milliseconds — the
 cursor's mass to 4×, its softening down to a tenth, and a local drag that bleeds
@@ -196,7 +333,14 @@ The cooling slider belongs to the self-gravitating disc and is hidden in modes w
 their own dissipation law; in those, holding switches the cursor between two masses
 rather than ramping. `B` compares within whichever mode is active, so both arms always
 run the same force law — including mesh self-gravity, which the CPU reference
-implements at the same grid resolution.
+implements at the same grid resolution, and the fluid, which it implements at the same
+grid resolution and the same sweep count.
+
+In the smoke the cursor is a paddle rather than a mass, and what it injects is the
+pointer's own velocity: a stationary pointer does nothing, because a stationary paddle
+in a real tank does nothing. Holding ramps the stir and adds heat under the pointer,
+using the same ramp the self-gravitating disc uses and for the same reason — a step
+change in a term this size arrives as an impulse and tears the field.
 
 ## Running
 
@@ -237,10 +381,35 @@ let total = 0;
 for (const d of g.dens) total += d * g.massScale;   // -> 0.18
 ```
 
+`dumpSmoke()` does the same for the fluid, and returns the projected velocity alongside
+the divergence the solve was handed — so the one claim worth checking about a pressure
+projection can be checked, rather than inferred from the picture looking like smoke:
+
+```js
+const { div, vel, nx, ny, stride, h } = await window.__demo.backend.dumpSmoke();
+const U = (i, j) => vel[2 * (j * stride + i)];
+const V = (i, j) => vel[2 * (j * stride + i) + 1];
+
+let handed = 0, left = 0;
+for (const d of div) handed += Math.abs(d);
+for (let j = 0; j < ny; j++)
+  for (let i = 0; i < nx; i++)
+    left += Math.abs((U(i + 1, j) - U(i, j) + V(i, j + 1) - V(i, j)) / h);
+
+1 - left / handed;   // -> ~0.98
+```
+
+`__demo.smoke` is the CPU reference the WGSL mirrors, and it needs no GPU at all —
+`stepFluid(dt, mx, my)` advances the fluid on its own and `dumpField()` returns the
+same planes. The confinement sweep and the CPU cost above were measured through it,
+headless.
+
 ## Deploying
 
 Fully static — no server, no runtime, no API. `npm run build` emits three files
-totalling ~45 kB (15 kB gzipped JS) into `dist/`. Copy that directory to your web
+totalling ~125 kB (43 kB gzipped JS) into `dist/`. Most of that is shader source: the
+WGSL and GLSL are template literals and ship verbatim, comments included. Copy that
+directory to your web
 root. Verified by serving the built output and confirming numbers identical to the dev
 server.
 
@@ -280,6 +449,7 @@ Bash on Windows, MSYS mangles a leading-slash value into a Windows path — use
 | --- | --- |
 | `src/hud.ts` | Instrumentation. Allocation-free; built before anything else. |
 | `src/sim/world.ts` | Particle buffer, entity tags, shared constants, CPU reference integration including the mesh solver. |
+| `src/sim/smoke.ts` | The fluid: grid geometry, the solver, the tracers, and the CPU reference the WGSL mirrors. |
 | `src/render/webgpu.ts` | Compute + instanced render over one shared buffer. |
 | `src/render/webgl2.ts` | Transform-feedback fallback, same force law. |
 | `src/ui/list.ts` | Virtualized list + bounded windowed readback. |
@@ -293,6 +463,28 @@ Bash on Windows, MSYS mangles a leading-slash value into a Windows path — use
   the fixed-potential galaxy and decays to a smooth disc. Everything else — seeding
   profile, constants, cooling control, framing — is kept in sync, so the difference is
   exactly that one term. It also has no HDR path, so it clips.
+- **The WebGL2 fallback does not have the smoke at all**, and unlike self-gravity it is
+  removed rather than degraded — `M` skips it on that backend. The distinction is the
+  point: a disc missing its mesh term is still a disc running one of the other modes in
+  the set, so it degrades into something honest. A fluid missing its pressure projection
+  is not a worse fluid, and the tracers in it have no dynamics of their own to fall back
+  on, so what would be left is a still image. Every stage of the solver is a gather over
+  a small grid and needs no atomics, so this is work not done rather than a wall.
+- **The smoke's tracers have a finite residence time, and that is a fudge.** Recycling
+  only what leaves the box is not enough: stagnation points collect tracers that never
+  come out, and over a couple of minutes the plume thins while the still corners fill.
+  So roughly 8% of the population per second is recycled to the source regardless of
+  where it is. It is drawn statelessly, as a hash of the slot against a time bucket,
+  because a particle is four floats and all four are position and velocity.
+- **Twenty sweeps leaves about 1.7% of the mean divergence in the field**, which is a
+  real approximation and not a rounding error — see the figures above. It is invisible
+  at this scale and would not be in a simulation that had to conserve anything.
+- **The smoke still shows voids, and a 2D section is why.** Folding clean entrained
+  fluid into the plume genuinely does make holes — dye in a turbulent flow looks like
+  this. What a photograph of real smoke has and this does not is depth: a volume
+  superposes many layers along the view ray and fills its own gaps in, where a single
+  plane has nothing behind it. The diffusion above softens the rims, which is the part
+  that was fixable without a third dimension.
 - At 1M the GPU arm runs ~19–20 ms on this integrated GPU rather than a clean 16.7.
   500k on the count slider is a locked 60 fps with self-gravity and looks near-identical, since
   per-particle gain is normalized by population.
