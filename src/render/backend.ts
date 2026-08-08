@@ -47,15 +47,11 @@ export const FRAME = [
 /**
  * Inclination of the tilted view, as the foreshortening factor cos(tilt).
  *
- * 0.6 is a 53-degree inclination. A disc seen at inclination i projects to an
- * ellipse cos(i) as tall as it is wide, so it exactly fills a window of aspect
- * 1/cos(i) -- here 1.67:1, just inside 16:9, so the clamp in cameraZoom() takes
- * up the difference on every common widescreen shape.
- *
- * Backed off from 0.5 (60 degrees). The steeper angle doubled surface brightness
- * -- see the tilt term on gain in the renderers -- and even with that corrected,
- * an inclination that deep reads as a disc seen nearly edge-on rather than one
- * seen at an angle.
+ * 0.5 is a 60-degree inclination. Not picked for the round number: a disc seen
+ * at inclination i projects to an ellipse cos(i) as tall as it is wide, so it
+ * exactly fills a window of aspect 1/cos(i). At 0.5 that is 2:1, which covers
+ * the common widescreen shapes -- 16:9 and 21:9 sit either side of it and the
+ * clamp in cameraZoom() takes up the difference.
  *
  * This is the honest version of a trick the fixed-potential disc used to play.
  * That mode scaled x independently of y, so its circular orbits drew as an
@@ -66,7 +62,7 @@ export const FRAME = [
  *
  * M31 sits at about 77 degrees, so 60 is a conservative reading of a real disc.
  */
-export const TILT_COS = 0.6;
+export const TILT_COS = 0.5;
 
 /**
  * Vertical foreshortening for a mode: 1 face-on, TILT_COS inclined.
@@ -102,10 +98,10 @@ export function cameraZoom(mode: number, aspect: number, tilted = false): number
   // instead of a smaller one.
   //
   // Clamped because past a point the foreshortened subject is wider than the
-  // window and filling the height would crop the sides. At TILT_COS = 0.6 the
-  // clamp binds below aspect 1.67 and does nothing above it, so 16:9 and wider
-  // fill vertically with a little margin at the sides, and anything narrower
-  // fills horizontally. Neither letterboxes.
+  // window and filling the height would crop the sides. At TILT_COS = 0.5 the
+  // clamp binds below aspect 2 and does nothing above it, so a 16:9 window fills
+  // edge to edge horizontally with a hair of margin top and bottom, and a 21:9
+  // one fills vertically with a hair at the sides. Neither letterboxes.
   //
   // max(aspect, 1) rather than aspect, because on a *portrait* window the
   // horizontal fit is what binds and a tilt cannot help: foreshortening only

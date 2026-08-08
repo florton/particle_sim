@@ -1328,7 +1328,17 @@ export async function createWebGPUBackend(
       // returned 0.7 ms and visibly thinned the arms from ribbons to wisps.
       // The overdraw is not where the time is going (see the notes on the mesh
       // solver), so this stays at the value that renders arms with body to them.
-      paramData[4] = Math.min(0.006, Math.max(0.0018, 0.06 / Math.sqrt(count)));
+      //
+      // Scaled by the foreshortening, so that a sprite covers the same number of
+      // pixels tilted as face-on. size is in simulation units and the tilted
+      // camera moves in by 1/t, so without the t the stars grow on screen by 1/t
+      // while the disc's *vertical* extent does not move at all -- only x
+      // spreads. The point spread then doubles against the one axis the
+      // inclination already compressed, and the arms smear across their own
+      // thickness. The whole picture reads soft, which is what tilting looked
+      // like before this term.
+      const tilt = cameraTilt(mode, tilted);
+      paramData[4] = Math.min(0.006, Math.max(0.0018, 0.06 / Math.sqrt(count))) * tilt;
       // Under the tonemap this is purely a normalization: total light deposited
       // across the frame is held constant as the population changes, and the
       // tonemap decides how bright that ends up looking. Drawing direct to the
@@ -1337,16 +1347,15 @@ export async function createWebGPUBackend(
       // to white there long before the arms are lit.
       //
       // Scaled by the foreshortening as well, because tilting is not
-      // brightness-neutral. The camera moves in by 1/t to keep the inclined disc
-      // filling the frame, which grows every sprite's *area* by 1/t^2 while the
-      // disc's own screen area only grows by 1/t -- the y extent is unchanged,
-      // only x spreads. So the same particles deposit 1/t times as much light
-      // per pixel: at 1M+ the core was already near the top of the tonemap
-      // face-on, and doubling it flattened the inner disc to white. Multiplying
-      // gain by t cancels it exactly, and the cancellation is independent of the
-      // zoom clamp above, so it holds at every window shape.
-      const tilt = cameraTilt(mode, tilted);
-      paramData[5] = (hdr ? 60_000 / count : Math.min(1, Math.max(0.3, 120_000 / count))) * tilt;
+      // brightness-neutral -- but in the opposite direction from size, and for a
+      // different reason. With sprite area now held fixed on screen, the same
+      // particles carrying the same light are spread across a disc whose screen
+      // area has grown by 1/t, so surface brightness *falls* by t and the arms
+      // go dim. Dividing gain by t restores it: light per particle ends up 1/t
+      // as before, only concentrated in a face-on-sized point rather than smeared
+      // over one 1/t^2 larger. The cancellation is independent of the zoom clamp
+      // in cameraZoom(), so it holds at every window shape.
+      paramData[5] = (hdr ? 60_000 / count : Math.min(1, Math.max(0.3, 120_000 / count))) / tilt;
       paramU32[6] = mask;
       paramU32[7] = mode;
       elapsed += dt;
