@@ -2,28 +2,47 @@ import './style.css';
 import { Hud, type HudCounters } from './hud';
 import {
   createSim, integrateCPU, RADIAL_DAMP, SPECIES_NAMES, SPECIES_COLORS, G_CURSOR_HOLD,
+  M_HALO, M_HALO_MAX, haloShare, randomSeed, setHaloMass, withOuterField,
 } from './sim/world';
 import * as barred from './sim/barred';
 import * as classic from './sim/classic';
-import { COLLISION, MODES, MODE_COUNT, SELFGRAV } from './sim/modes';
+import { CHLADNI, CLASSIC, COLLISION, MODES, MODE_COUNT } from './sim/modes';
 import { createPair, pairSeparation, resetPair, stepPair } from './sim/pair';
 import { VirtualList } from './ui/list';
 import { speciesMask, toggleSpecies, filterLabel, countEffect, effectRuns } from './ui/state';
-import type { Backend } from './render/backend';
+import { screenToSim, type Backend } from './render/backend';
 import { createWebGPUBackend } from './render/webgpu';
 import { createWebGL2Backend } from './render/webgl2';
 import { BaselineArm, BASELINE_COUNT } from './baseline';
 
 // 50k was the number the original brief asked for, but CPU integration of 50k
 // typed-array particles costs well under a millisecond — there is no bottleneck
-// to relieve at that scale. ?n= makes the crossover measurable rather than
-// assumed. See README for the measured curve.
+// to relieve at that scale. The count slider makes the crossover measurable
+// rather than assumed. See README for the measured curve.
+//
+// These are *disc* counts, and the outer field is added on top — see
+// withOuterField() in sim/world.ts for why that is the number worth pinning. The
+// HUD and banner report the true total, so the count they claim is the count
+// actually being simulated and drawn.
+//
+// The maximum is an allocation, not a setting: every buffer on both arms is
+// sized to it at boot and the population is a prefix of that, so the slider
+// costs nothing to move and cannot exceed it. 2M is twice the default, which is
+// the usual amount of headroom to leave — enough that the top of the slider is
+// worth having, not so much that a machine that could run the default fails to
+// start.
+const COUNT_MIN = 25_000;
+const COUNT_MAX = 2_000_000;
+const COUNT_DEFAULT = 1_000_000;
 const params = new URLSearchParams(location.search);
-const CAPACITY = Math.max(1, Number(params.get('n')) || 1_000_000);
+const CAPACITY = withOuterField(COUNT_MAX);
 
 const canvas = document.getElementById('stage') as HTMLCanvasElement;
 const hud = new Hud(document.getElementById('hud')!);
-const sim = createSim(CAPACITY);
+// Fresh seed per load, so the disc the page boots into is a different draw each
+// time rather than the same frozen arrangement — see randomSeed() in
+// sim/world.ts. Same profile, same bands, different particles.
+const sim = createSim(CAPACITY, randomSeed());
 
 const counters: HudCounters = {
   entities: 0,
@@ -49,18 +68,68 @@ async function selectBackend(): Promise<Backend> {
   return gl;
 }
 
+// Pointer position, kept in *window* coordinates and converted to simulation
+// coordinates once per frame in loop() rather than here.
+//
+// Two reasons for the split. The conversion needs the mode and the tilt, and
+// neither exists yet at this point in module evaluation — a pointer event
+// arriving while the backend is still being awaited below would hit the
+// temporal dead zone. And the camera can change without the pointer moving:
+// resize the window, tilt the view with [V], or switch mode, and a value
+// converted at event time is silently stale until the pointer is moved again.
+// Converting per frame is a handful of arithmetic and cannot go stale.
+let px = innerWidth / 2;
+let py = innerHeight / 2;
 let mx = 0;
 let my = 0;
+
+/**
+ * Whether the cursor is a mass in the force law yet, and where it has to move
+ * from to become one.
+ *
+ * Every mode is seeded centred on the origin and the page opens with the pointer
+ * wherever it already was — which on a fresh load is reported as the middle of
+ * the window, i.e. the middle of the galaxy. So the disc's first act is to fall
+ * into a well the user did not place and cannot see, and [R] does the same thing
+ * again to a disc they were watching settle. The cursor is a physical body here,
+ * not a hover state; it should not exist until it is aimed.
+ *
+ * Parked rather than branched: while disarmed the cursor is handed to the
+ * integrators at CURSOR_PARK, far enough out that every 1/r^2 term involving it
+ * underflows and every distance gate (capture radius, hold softening) is outside
+ * its own threshold. One number, and no mode, arm or shader needs to know the
+ * state exists — which matters because "all the modes" here means six force
+ * laws across three integrators.
+ *
+ * The deadzone is what separates aiming from the pointer twitching, an OS
+ * settling a trackpad, or a stray event on load. 8px is small enough to be gone
+ * on the first deliberate movement and large enough that nothing accidental
+ * crosses it.
+ */
+const CURSOR_DEADZONE = 8;
+const CURSOR_PARK = 1e6;
+let cursorArmed = false;
+let armX = px;
+let armY = py;
+
+/** Take the cursor back out of the force law until it is aimed again. */
+function disarmCursor() {
+  cursorArmed = false;
+  armX = px;
+  armY = py;
+  setHolding(false);
+}
+
 addEventListener('pointermove', (e) => {
-  mx = (e.clientX / innerWidth) * 2 - 1;
-  my = -((e.clientY / innerHeight) * 2 - 1);
+  px = e.clientX;
+  py = e.clientY;
+  if (!cursorArmed && Math.hypot(px - armX, py - armY) > CURSOR_DEADZONE) cursorArmed = true;
 });
 
 const backend = await selectBackend();
-backend.setCount(CAPACITY);
 counters.backend = `${backend.name} · ${backend.detail}`;
 
-// --- hold to pull ---------------------------------------------------------
+// --- drag to pull ---------------------------------------------------------
 //
 // In the self-gravitating disc, holding the pointer down ramps the cursor's mass
 // toward G_CURSOR_HOLD instead of switching it there. The ramp is the whole
@@ -75,9 +144,11 @@ counters.backend = `${backend.name} · ${backend.detail}`;
 // Release is faster than the ramp. Building the well is the interaction and
 // wants to feel deliberate; letting go should just let go.
 //
-// The fixed-potential modes switch between two cursor masses instead, and can:
-// nothing there amplifies its own density contrast, so an impulse stirs the disc
-// rather than collapsing it. See sim/modes.ts.
+// The fixed-potential modes — barred, collision and the original disc — switch
+// between two cursor masses instead, and can: nothing there amplifies its own
+// density contrast, so an impulse stirs the disc rather than collapsing it. Each
+// family has its own pair, because the two cursor masses only mean anything
+// against the core they are being weighed against. See sim/modes.ts.
 const GRAV_RAMP = 3.5; // e-folds per second, held
 const GRAV_RELEASE = 8; // e-folds per second, released
 let holding = false;
@@ -88,14 +159,31 @@ let grav = 1;
 const overUI = (t: EventTarget | null) =>
   t instanceof Element && !!t.closest('#sidebar, #hud, #banner');
 
+/**
+ * The switched cursor mass for the current mode — light while merely moving,
+ * heavy while the pointer is down.
+ *
+ * Mode-dependent because the number is a ratio against that mode's core, not an
+ * absolute: the original disc's cursor is half the barred disc's at rest and its
+ * held value is scaled to match. The ramping modes ignore this entirely and take
+ * `grav` on frame() instead.
+ */
+const cursorMass = (held: boolean) =>
+  mode === CLASSIC
+    ? (held ? classic.G_CURSOR_HELD : classic.G_CURSOR)
+    : (held ? barred.G_CURSOR_HELD : barred.G_CURSOR);
+
 function setHolding(next: boolean) {
   if (holding === next) return;
   holding = next;
-  backend.setCursorMass(holding ? barred.G_CURSOR_HELD : barred.G_CURSOR);
+  backend.setCursorMass(cursorMass(holding));
 }
 
 addEventListener('pointerdown', (e) => {
-  if (e.button === 0 && !overUI(e.target)) setHolding(true);
+  // Not while the cursor is parked. The ramp would run to full depth against a
+  // body a million units away and then arrive all at once on the first mouse
+  // movement — an impulse, which is the one thing the ramp exists to prevent.
+  if (e.button === 0 && cursorArmed && !overUI(e.target)) setHolding(true);
 });
 addEventListener('pointerup', () => setHolding(false));
 addEventListener('pointercancel', () => setHolding(false));
@@ -128,6 +216,119 @@ const chips = SPECIES_NAMES.map((name, i) => {
 const summary = document.createElement('div');
 summary.className = 'summary';
 head.appendChild(summary);
+
+// --- particle count -------------------------------------------------------
+//
+// The one control that is about the demo rather than about the physics, and it
+// belongs on screen rather than in a query string: the whole claim here is that
+// a million particles is a different thing from a hundred thousand, and that is
+// an argument you win by letting someone drag the number and watch the arms
+// coarsen, not by asking them to edit a URL and reload.
+//
+// Everything downstream is already written for it. The population is a prefix,
+// strided so that every prefix holds the same share of outer field and the same
+// species banding (see HALO_EVERY in sim/world.ts), and the per-particle mass is
+// derived from the live count on every path — M_DISC/(count * DISC_SHARE) in the
+// mesh solver and in the GPU uniform — so the disc keeps the same total mass and
+// the same rotation curve at every setting. Fewer particles is a coarser
+// sampling of one galaxy, not a lighter one.
+//
+// Geometric travel. The interesting axis is orders of magnitude — 25k, 250k, 2M
+// are three different demos — and a linear slider would spend four fifths of its
+// length between 400k and 2M, where the picture barely changes.
+const countFromSlider = (t: number) => COUNT_MIN * (COUNT_MAX / COUNT_MIN) ** (t / 1000);
+const countToSlider = (v: number) =>
+  (1000 * Math.log(v / COUNT_MIN)) / Math.log(COUNT_MAX / COUNT_MIN);
+
+const countRow = document.createElement('div');
+countRow.className = 'control';
+const countLabel = document.createElement('label');
+countLabel.htmlFor = 'count';
+const countInput = document.createElement('input');
+countInput.type = 'range';
+countInput.id = 'count';
+countInput.min = '0';
+countInput.max = '1000';
+
+/** What the label says, for a disc count that may not have been applied yet. */
+function countText(disc: number) {
+  return `particles · ${withOuterField(disc).toLocaleString()} — ${disc.toLocaleString()} disc`;
+}
+
+/**
+ * How far the population has ever reached since the last full seed.
+ *
+ * The line between a slot that can be switched back on and one that has to be
+ * filled first. Everything below this mark has been live at some point since the
+ * current galaxy was seeded, so the buffer is holding a real particle there —
+ * frozen where it was when the count last passed it going down, but of this
+ * galaxy. Everything above it has never been stepped and is holding whatever the
+ * last whole-buffer seed left, which by now is an initial condition for a disc
+ * that no longer exists: a different rotation curve if the halo slider has
+ * moved, cores in the wrong place if this is an encounter.
+ *
+ * So the mark is what applyCount() seeds *from*, and dragging back up through
+ * ground the slider has already covered returns the particles that were there
+ * rather than new ones.
+ *
+ * Reset to the live count by every full seed — see markSeeded() below.
+ */
+let seeded = sim.count;
+
+/** A whole-buffer seed just ran, so nothing above the live count is trustworthy. */
+function markSeeded() {
+  seeded = sim.count;
+}
+
+/**
+ * Adopt a new population size, in place.
+ *
+ * Neither direction restarts, and neither is expensive, which is what lets the
+ * whole slider be live under the cursor.
+ *
+ * Shrinking is exact and free. The live population is the prefix 0..count, so
+ * dropping the tail is two assignments and every particle that remains is the
+ * one that was already there, on the orbit it was already on — nothing moves,
+ * the disc just samples thinner. The mass per particle is derived from the count
+ * on every path, so the total stays put and the rotation curve does not flinch.
+ *
+ * Growing fills the slots that are new and touches nothing else. The evolved
+ * disc keeps its arms, its clock, its cursor well and its spin sense; the new
+ * particles are seeded for the mode as it stands right now and arrive into it.
+ * They arrive *cold* — smooth and axisymmetric where the disc they land in has
+ * structure — so a big jump visibly dilutes the arms for a second or two before
+ * the disc re-amplifies them. That is the honest thing for it to do: it is the
+ * same swing amplification that made the first set of arms, running on a disc
+ * that has just been resampled, and it is a far smaller discontinuity than
+ * throwing the galaxy away and starting it over. See grow() on the Backend.
+ */
+function applyCount(disc: number) {
+  const n = withOuterField(disc);
+  sim.count = n;
+  backend.setCount(n);
+  if (n > seeded) {
+    backend.grow(seeded, n);
+    seeded = n;
+  }
+  countLabel.textContent = countText(disc);
+  // The row set is built from sim.count, and the banner quotes it.
+  refreshFilter();
+  if (arm === 'gpu') refreshBanner();
+}
+
+countInput.value = String(countToSlider(COUNT_DEFAULT));
+// One event, and it is `input`: both directions are cheap enough to apply
+// continuously through the drag, so the population and the frame time move under
+// the cursor rather than snapping on release. This used to defer growth to
+// `change` because growth meant a restart — see applyCount() for what replaced
+// that. What is left is a seed and an upload of the slots being added, which
+// over a drag is the same total work as one big one, cut into per-event pieces
+// and spread across the frames of the drag.
+countInput.addEventListener('input', () => {
+  applyCount(Math.round(countFromSlider(+countInput.value)));
+});
+countRow.append(countLabel, countInput);
+head.appendChild(countRow);
 
 // --- disc temperature -----------------------------------------------------
 //
@@ -230,6 +431,70 @@ gravInput.addEventListener('input', () => applyCoreGravity(gravFromSlider(+gravI
 gravRow.append(gravLabel, gravInput);
 head.appendChild(gravRow);
 
+// --- dark halo, halo disc only --------------------------------------------
+//
+// The third slider and the only one that changes what a mode *is* rather than
+// how hard it runs. Mode 5 is mode 0 with a rigid extended halo added, and this
+// is that halo's mass: at zero the two modes are the same simulation, and at the
+// top the galaxy is halo-dominated everywhere.
+//
+// Two things should follow as it comes up, and they are the two arguments for
+// dark matter in the order they were historically made.
+//
+// The first is measured. The outer field stops falling off: sampled at 0.90,
+// mean speed runs 1.17 at r = 1.0 to 1.09 at r = 1.75, against 0.79 to 0.60 for
+// the same disc with no halo — a 7% decline where the bare version drops 24%,
+// which is Keplerian to within the noise. The field is seeded and stepped on the
+// same curve, so that is a flat rotation curve rather than a drawing of one. The
+// default has since moved up to 1.30, which is flatter still; see M_HALO in
+// sim/world.ts for why that number and not this one.
+//
+// The second is not measured and is written here as the expectation it is. The
+// halo raises the epicyclic frequency without adding anything the disc can
+// amplify, so the disc should also settle — weaker arms, no bar, and the
+// whole-disc ringing that the cold end of the cooling slider produces damping
+// out. That is the Ostriker & Peebles argument, and it is why halos were held to
+// be dynamically necessary rather than merely observed. Confirming it needs a
+// headless run long enough to measure A(m=2) and the core fraction the way
+// M_DISC in sim/world.ts was measured; sampling it through the live readback
+// path does not work, because the sidebar is already using that buffer.
+//
+// Linear travel, unlike the other two: this one is a mass fraction and the eye
+// reads it as a fraction, so the interesting range is the whole range.
+//
+// Dragging it re-poses the question without re-seeding, so the existing orbits
+// are suddenly wrong for the new curve and the disc breathes outward as it
+// re-circularizes — the same behavior the core-gravity slider has. [R] re-seeds
+// on the curve it currently has, which is the clean comparison.
+let haloValue = M_HALO;
+
+const haloRow = document.createElement('div');
+haloRow.className = 'control';
+const haloLabel = document.createElement('label');
+haloLabel.htmlFor = 'halo';
+const haloInput = document.createElement('input');
+haloInput.type = 'range';
+haloInput.id = 'halo';
+haloInput.min = '0';
+haloInput.max = '1000';
+
+function applyHalo(v: number) {
+  haloValue = v;
+  // Only written through when a mode that has a halo is up. The setter is the
+  // world's and every disc mode shares that force law, so writing it from here
+  // while mode 0 is on screen would silently give mode 0 a halo — which is the
+  // one thing the comparison cannot survive.
+  if (MODES[mode].halo) setHaloMass(v);
+  haloLabel.textContent =
+    v <= 1e-6
+      ? 'dark halo · none — bare disc, same as mode 0'
+      : `dark halo · ${v.toFixed(2)} — ${(haloShare(v) * 100).toFixed(0)}% of v² at the disc edge`;
+}
+haloInput.value = String((haloValue / M_HALO_MAX) * 1000);
+haloInput.addEventListener('input', () => applyHalo((+haloInput.value / 1000) * M_HALO_MAX));
+haloRow.append(haloLabel, haloInput);
+head.appendChild(haloRow);
+
 /**
  * Rebuild the filtered row set and the count above it.
  *
@@ -266,8 +531,11 @@ const modeLabel = () =>
 function refreshBanner() {
   banner.textContent =
     `${backend.name} compute · ${sim.count.toLocaleString()} particles · ${modeLabel()} — ` +
-    (MODES[mode].hold === 'none' ? '' : 'hold to pull · ') +
-    `[M] mode · [B] compare · [R] ${MODES[mode].restart} · [C] ${mono ? 'color' : 'mono'}`;
+    (MODES[mode].hold === 'none' ? '' : 'drag to pull · ') +
+    `[M] mode · [B] compare · [R] ${MODES[mode].restart} · [C] ${mono ? 'color' : 'mono'}` +
+    // The plate is always face-on, so offering it a view toggle would be
+    // offering nothing -- see cameraTilt() in render/backend.ts.
+    (mode === CHLADNI ? '' : ` · [V] ${tilted ? 'face-on' : 'tilt'}`);
 }
 
 // Plain state, like `mode` and `mono` below: read imperatively at the few points
@@ -297,7 +565,22 @@ function setArm(next: 'gpu' | 'baseline') {
   hud.reset();
 }
 
-let mode = SELFGRAV;
+/**
+ * The mode the page boots into: drawn uniformly from the set on every load.
+ *
+ * Six force laws that answer each other is the point of the set, and a fixed
+ * entry point makes five of them things you only see if you press [M]. A refresh
+ * lands somewhere else instead, and [M] still walks the whole ring from wherever
+ * that is — including the halo/bare-disc pair, which stays adjacent in the order
+ * so the controlled comparison survives whichever of the two you happen to open
+ * on.
+ *
+ * Both backends construct themselves seeded for SELFGRAV, so booting elsewhere
+ * costs one extra seed-and-upload at startup; setMode() at the bottom of this
+ * file is what pays it, and it has to be setMode() rather than an assignment
+ * because the halo mass must reach the world before the re-seed reads it.
+ */
+let mode = Math.floor(Math.random() * MODE_COUNT);
 
 // The colliding pair. One object, mutated in place and held by reference on all
 // sides, so the per-frame cost of the whole encounter is two bodies of leapfrog.
@@ -307,7 +590,21 @@ backend.setPair(pair);
 function setMode(next: number) {
   mode = next;
   if (mode === COLLISION) resetPair(pair);
+  // Before the backend re-seeds, not after: seeding reads the halo through
+  // vCirc(), so a disc placed while this still says zero would be placed on the
+  // bare rotation curve and then integrated inside a halo. See haloMass() in
+  // sim/world.ts. Cleared on the way out for the same reason — every disc mode
+  // shares one force law, and the halo is what makes this one a different mode.
+  setHaloMass(MODES[mode].halo ? haloValue : 0);
   backend.setMode(mode);
+  markSeeded();
+  // Which re-seeds — so the cursor goes back out of the force law until it is
+  // aimed at the new population. See CURSOR_DEADZONE.
+  disarmCursor();
+  // Unconditionally, because setHolding() is edge-triggered and the pointer is
+  // already released by the time we get here: without this the new mode keeps
+  // whichever family's rest mass the previous one left in the uniform.
+  backend.setCursorMass(cursorMass(holding));
   // The new mode brought its own species banding with it.
   refreshFilter();
   // The slider only means something to the self-gravitating disc; every other
@@ -315,6 +612,8 @@ function setMode(next: number) {
   coolRow.style.display = MODES[mode].cooling ? '' : 'none';
   // And core gravity only to the fixed-potential disc.
   gravRow.style.display = MODES[mode].gravity ? '' : 'none';
+  // And the halo only to the mode that is about having one.
+  haloRow.style.display = MODES[mode].halo ? '' : 'none';
   if (arm === 'gpu') refreshBanner();
   // Switching mode while comparing should switch the thing being compared.
   else setArm('baseline');
@@ -328,6 +627,31 @@ function setMono(next: boolean) {
   if (arm === 'gpu') refreshBanner();
 }
 
+/**
+ * Face-on or inclined. A camera, not a simulation setting — the world stays two
+ * dimensional and no force law can tell the difference. See TILT_COS in
+ * render/backend.ts for what the angle is and why filling a widescreen window
+ * is what it is for.
+ *
+ * Both arms are told, because the comparison is only worth anything if the two
+ * are drawing the same picture.
+ *
+ * Inclined by default. A disc seen face-on in a widescreen window is a circle
+ * with the window's whole width left over either side of it; the same disc at 60
+ * degrees projects to an ellipse that fills it. It is also what a disc actually
+ * looks like — face-on is the special case, not the norm — so the default view is
+ * the honest one and [V] is there to flatten it out when the structure is what
+ * you want to read. See cameraZoom() in render/backend.ts for how the tilt turns
+ * into a wider picture rather than a shorter one.
+ */
+let tilted = true;
+function setTilt(next: boolean) {
+  tilted = next;
+  backend.setTilt(tilted);
+  baseline.setTilt(tilted);
+  if (arm === 'gpu') refreshBanner();
+}
+
 function restart() {
   if (mode === COLLISION) {
     restartCollision();
@@ -335,7 +659,11 @@ function restart() {
   }
   backend.reset();
   baseline.reset();
+  markSeeded();
   hud.reset();
+  // A fresh disc is centred on the origin again, and the pointer is wherever it
+  // was left — often right on top of it. See CURSOR_DEADZONE.
+  disarmCursor();
 }
 
 /**
@@ -348,9 +676,11 @@ function restart() {
 function restartCollision(flip = true) {
   resetPair(pair, flip ? -pair.spin1 : pair.spin1);
   backend.setMode(COLLISION);
+  markSeeded();
   if (arm === 'baseline') baseline.setMode(COLLISION, pair);
   else refreshBanner();
   hud.reset();
+  disarmCursor();
 }
 
 addEventListener('keydown', (e) => {
@@ -358,6 +688,7 @@ addEventListener('keydown', (e) => {
   if (e.key === 'm' || e.key === 'M') setMode((mode + 1) % MODE_COUNT);
   if (e.key === 'r' || e.key === 'R') restart();
   if (e.key === 'c' || e.key === 'C') setMono(!mono);
+  if (e.key === 'v' || e.key === 'V') setTilt(!tilted);
 });
 
 function fit() {
@@ -368,16 +699,30 @@ addEventListener('resize', fit);
 fit();
 applyCooling(RADIAL_DAMP);
 applyCoreGravity(classic.G_CORE);
-// setMode() is not called for the mode the page boots in, so the per-mode rows
-// start in the state that mode wants: cooling belongs to it, core gravity does
-// not.
-gravRow.style.display = MODES[mode].gravity ? '' : 'none';
+applyHalo(M_HALO);
+// The population. The backends are constructed at capacity, so this is a shrink
+// to the default rather than the page booting into the top of the slider — and a
+// shrink costs nothing, which is why there is no reason to thread the default
+// through the constructors instead.
+applyCount(COUNT_DEFAULT);
+// And the mode. setMode() rather than the row-visibility assignments this used
+// to do inline, because the mode the page boots into is no longer the one the
+// backends seed themselves for: it has a halo, and the halo has to reach the
+// world before the re-seed reads it through vCirc(). Everything else setMode()
+// does — the per-mode rows, the filter, the banner — was already needed here.
+setMode(mode);
+// And the camera. Both arms construct themselves face-on, so the default view
+// has to be pushed rather than assumed — see `tilted` above.
+setTilt(tilted);
 setArm('gpu');
 
 // Verification handle. Lets the sim be driven and inspected without relying on
 // rAF, so correctness is checkable independently of what the compositor is doing.
 (globalThis as any).__demo = {
   sim, backend, baseline, hud, counters, integrateCPU, list, effectRuns, setArm,
+  // So the pointer mapping can be checked against the camera it inverts rather
+  // than by dragging and squinting.
+  screenToSim, cursor: () => [mx, my],
 };
 
 let prev = performance.now();
@@ -388,6 +733,22 @@ function loop(now: number) {
   // Clamp dt so a stall doesn't launch every particle out of the box.
   const dt = Math.min((now - prev) / 1000, 1 / 30);
   prev = now;
+
+  // Where the pointer is, in the simulation rather than on the screen. Depends
+  // on the mode and the tilt as well as the window, so it is solved here rather
+  // than in the pointer handler — see screenToSim() in render/backend.ts.
+  //
+  // Or nowhere at all, until the pointer has been moved past the deadzone since
+  // the last seeding — see CURSOR_DEADZONE above.
+  //
+  // Except on the plate, which is always armed. The cursor is not a mass there;
+  // it is the frequency dial, and parking it at CURSOR_PARK drives n and m to
+  // six million rather than out of range of a force law. The plate then renders
+  // a lattice far finer than a pixel, which reads as noise until the pointer is
+  // moved — a bug, not a neutral idle state.
+  [mx, my] = cursorArmed || mode === CHLADNI
+    ? screenToSim(px, py, innerWidth, innerHeight, mode, tilted)
+    : [CURSOR_PARK, CURSOR_PARK];
 
   // The encounter is over once the cores are well separated and receding, or if
   // they have gone quiet; loop it rather than leaving a spent remnant on screen.
@@ -413,7 +774,7 @@ function loop(now: number) {
     counters.entities = sim.count;
     counters.domNodes = list.liveNodes;
   } else {
-    baseline.frame(dt, mx, my, grav, holding ? barred.G_CURSOR_HELD : barred.G_CURSOR);
+    baseline.frame(dt, mx, my, grav, cursorMass(holding));
     counters.entities = baseline.count;
     counters.domNodes = baseline.domNodes;
   }

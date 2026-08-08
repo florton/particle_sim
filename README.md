@@ -204,9 +204,15 @@ implements at the same grid resolution.
 npm install && npm run dev
 ```
 
+Entity count is the first slider in the sidebar: 25,000 to 2,000,000 disc
+particles, default 1,000,000. Buffers are allocated at the maximum and the
+population is a prefix of them, so the slider never reloads or restarts in either
+direction — dragging down drops the tail, dragging up seeds and uploads only the
+slots being added. The galaxy on screen keeps its arms and its clock; the new
+particles arrive cold and are mixed in by the disc within a second or two.
+
 Query parameters:
 
-- `?n=250000` — entity count (default 1,000,000)
 - `?backend=webgl2` — force the transform-feedback fallback
 
 ## Verification
@@ -288,7 +294,7 @@ Bash on Windows, MSYS mangles a leading-slash value into a Windows path — use
   profile, constants, cooling control, framing — is kept in sync, so the difference is
   exactly that one term. It also has no HDR path, so it clips.
 - At 1M the GPU arm runs ~19–20 ms on this integrated GPU rather than a clean 16.7.
-  `?n=500000` is a locked 60 fps with self-gravity and looks near-identical, since
+  500k on the count slider is a locked 60 fps with self-gravity and looks near-identical, since
   per-particle gain is normalized by population.
 - fps is vsync-capped at 60, so GPU headroom below 1M is unmeasured. A
   `timestamp-query` pass would show it, and would also split the mesh passes apart

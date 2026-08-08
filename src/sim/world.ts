@@ -55,6 +55,94 @@ export const M_DISC = 0.18;
 /** Nominal disc radius — the scale the species bands and the view are fitted to. */
 export const R_DISC = 0.65;
 /**
+ * Core radius of the dark halo, and the default and maximum of its mass — the
+ * HALO mode's slider, see sim/modes.ts. Zero everywhere else.
+ *
+ * The halo is a rigid background potential, not particles, and its one job is to
+ * be *extended* where the anchored core is a point. Rotation curve
+ * v_h^2 = M_HALO r^2 / (r^2 + a^2): rising like solid body inside a, flat at
+ * sqrt(M_HALO) outside it, which is the shape the observations that motivated
+ * dark matter actually have. That makes the acceleration factor M_HALO/(r^2+a^2)
+ * — one divide, no sqrt, and it drops out of the force law entirely at zero mass
+ * rather than needing a branch.
+ *
+ * a = 0.5 is a bit under R_DISC and about 2.3 disc scale lengths, which puts the
+ * turnover where the disc ends: on the default the halo contributes ~8% of v^2 at
+ * r = 0.2 and 49% at the disc edge, so it holds the outskirts and leaves the
+ * inner disc to make its own structure. Pull a down toward the disc and it stops
+ * being a halo and starts being a second bulge.
+ *
+ * M_HALO is in units of an asymptotic v^2, so the default 1.3 puts the flat part
+ * of the curve at v = 1.14, against 0.92 for the bare disc at its edge. The
+ * number is chosen on the share, not on the speed: 1.3 is halo and disc split
+ * almost exactly even at R_DISC, which is the line the literature draws between a
+ * maximal disc and a submaximal one, and it is the smallest default that puts
+ * this mode on the halo-dominated side of it. Below that the mode reads as mode 0
+ * with the outskirts propped up; here it arrives as its own galaxy, and 0.9 —
+ * where the halo is the junior partner at the disc edge — is one drag away.
+ *
+ * On the curve the disc is seeded and stepped on, circular speed falls 2.5%
+ * between r = 1.0 and r = 1.75 at this default, against 24% for the bare disc.
+ * The 0.9 default that preceded it was measured rather than derived: sampled on
+ * the GPU arm, mean orbital speed ran 1.17 at r = 1.0 to 1.09 at r = 1.75, a 7%
+ * decline where the same disc with no halo went 0.79 to 0.60. So the flat curve
+ * is confirmed at 0.9 and extrapolated here — raising M_HALO only flattens it
+ * further, which is the direction the measurement already establishes.
+ */
+export const HALO_A2 = 0.25;
+export const M_HALO = 1.3;
+export const M_HALO_MAX = 2.0;
+
+/**
+ * Live halo mass, driven by the slider in main.ts, and zero in every mode but
+ * HALO.
+ *
+ * Module state for the same reason classic.gCore is — see the note there. Three
+ * paths need this number and two have no channel to receive it: the GPU backends
+ * copy it into a uniform each frame, the CPU baseline integrates with it, and the
+ * *seeding* needs it through vCirc(), which is reached via seedMode() in
+ * sim/modes.ts and is generic over every mode.
+ *
+ * Which makes the ordering load-bearing in one place: setMode() in main.ts sets
+ * this before asking the backend to re-seed, because a disc seeded from a
+ * rotation curve it is not then integrated on starts off equilibrium and breathes
+ * until the damping catches it.
+ */
+let mHalo = 0;
+
+export function haloMass() {
+  return mHalo;
+}
+
+export function setHaloMass(v: number) {
+  mHalo = v;
+}
+
+/**
+ * Radial acceleration factor from the halo: multiply by the vector to the origin,
+ * exactly like coreF(). Takes the same softened q, so the two share an argument
+ * and the seeding cannot disagree with the integrator about either.
+ */
+export function haloF(q: number): number {
+  return mHalo / (q + HALO_A2);
+}
+
+/**
+ * The halo's share of v^2 at the disc edge — what the slider's label reports.
+ *
+ * The honest number for "how much halo is this", and the one the literature
+ * argues about: a maximal disc is one where the disc supplies most of the
+ * rotation at its own edge, and everything above ~50% here is a submaximal,
+ * halo-dominated galaxy. The r^2 cancels between the three terms, so this is just
+ * the ratio of the acceleration factors.
+ */
+export function haloShare(m = mHalo): number {
+  const q = R_DISC * R_DISC + 0.004;
+  const h = m / (q + HALO_A2);
+  const rest = coreF(q) + discEnclosed(R_DISC) / (R_DISC * R_DISC + SOFT * SOFT) ** 1.5;
+  return h / (h + rest);
+}
+/**
  * Exponential scale length of the disc.
  *
  * Real discs are exponential in surface density, and seeding one uniformly was
@@ -89,6 +177,54 @@ export const H_DISC = R_DISC / 3;
 export const SIGMA_FRAC = 0.15;
 /** Force-grid resolution. See render/webgpu.ts for the O(N + G^2) argument. */
 export const GRID = 64;
+/**
+ * Half-width of the simulation domain — the box the walls are at.
+ *
+ * Larger than the mesh box, and that is the whole point. The camera frames the
+ * disc on the short side of the window (see cameraZoom in render/backend.ts), so
+ * a wide window shows x out to about 1.7 while the disc only reaches 0.65: a
+ * round subject cannot fill a 21:9 frame without being zoomed in until it is
+ * cropped. The fix is not a different camera but more world — an outer field of
+ * particles occupying the margins the disc geometrically cannot.
+ *
+ * 2.0 covers the corners of a 21:9 window (1.81 at the extreme) with room for
+ * the wall to sit outside HALO_R_MAX rather than on top of it. It is a square
+ * because the camera is not: fit to the short axis, a portrait window needs the
+ * same reach vertically that a landscape one needs horizontally, and a square
+ * domain serves both without knowing which it is.
+ */
+export const DOMAIN = 2.0;
+/**
+ * The mesh box: the region the self-gravity solver actually covers, in
+ * simulation units. Fixed at the unit box, which is what makes the outer field
+ * cheap — see HALO_EVERY.
+ */
+export const MESH_R = 1.0;
+/**
+ * One particle in this many is seeded into the outer field instead of the disc.
+ *
+ * Strided rather than appended, because the population is a prefix: the count
+ * slider simulates and draws particles 0..count, so a halo living in the tail
+ * would vanish entirely the first time the count came down. Every prefix of a
+ * strided population holds the same fraction.
+ */
+export const HALO_EVERY = 8;
+/** Fraction of the population that is disc, and so the share that has mass. */
+export const DISC_SHARE = 1 - 1 / HALO_EVERY;
+/** Inner edge of the outer field — clear of both the disc and the mesh box. */
+export const HALO_R_MIN = 1.15;
+/**
+ * Outer edge of the outer field.
+ *
+ * Uniform in area over an annulus rather than over the square, even though it is
+ * a square domain. Circular orbits preserve radius, so an area-uniform annulus
+ * stays area-uniform forever — differential rotation only shears it in angle,
+ * which is invisible in a field with no angular structure. Fill the square
+ * corners instead and everything past 1.85 eventually swings onto an axis, hits
+ * a wall it never should have been able to reach, and the field slowly rots into
+ * a bright rim.
+ */
+export const HALO_R_MAX = 1.85;
 /** Force softening, in grid cells. Below ~1 cell the mesh force is pure noise. */
 export const SOFT_CELLS = 1.5;
 /**
@@ -176,8 +312,12 @@ export const CAPTURE_K = 9;
  *
  * The ramp (see main.ts) matters as much as the ceiling: applied instantly this
  * is a step change in the force law and the disc detonates instead of gathering.
+ * That is also the limit on raising it — 5x reaches noticeably further into the
+ * disc than 4x with the ramp still absorbing it, but the ceiling and the ramp
+ * rate are one setting, and pushing this much past 5 needs GRAV_RAMP softened to
+ * match or the hold starts arriving as an impulse again.
  */
-export const G_CURSOR_HOLD = 4;
+export const G_CURSOR_HOLD = 5;
 /** Terminal speed. */
 export const V_MAX = 3.0;
 /**
@@ -228,7 +368,11 @@ export function coreF(q: number): number {
 export function vCirc(r: number): number {
   const q = r * r + 0.004;
   const disc = discEnclosed(r) / (r * r + SOFT * SOFT) ** 1.5;
-  return r * Math.sqrt(Math.max(0, coreF(q) + disc));
+  // Plus the halo, which is zero outside the HALO mode — see haloF(). It has to
+  // be here and not only in the integrator: seeding a disc on the bare curve and
+  // then stepping it inside a halo is seeding it 20-30% slow, and the whole
+  // population falls inward together before settling.
+  return r * Math.sqrt(Math.max(0, coreF(q) + disc + haloF(q)));
 }
 
 /** Disc mass inside radius r, for the exponential profile seeded above. */
@@ -241,6 +385,62 @@ export function discEnclosed(r: number): number {
 export function sampleRadius(u1: number, u2: number): number {
   const r = -H_DISC * (Math.log(Math.max(1e-9, u1)) + Math.log(Math.max(1e-9, u2)));
   return Math.min(1.1, Math.max(0.01, r));
+}
+
+/** True if slot `i` belongs to the outer field rather than the disc. */
+export function isHalo(i: number) {
+  return i % HALO_EVERY === 0;
+}
+
+/**
+ * Total population needed to put exactly `disc` particles in the disc.
+ *
+ * The outer field is additive, not carved out: asking for a million particles
+ * gets a million-particle *galaxy* with the field on top, rather than a
+ * 875,000-particle galaxy wearing one. The count is what the disc looks like,
+ * so it is the number worth holding fixed.
+ *
+ * Exact rather than a `* 8/7` estimate, because every prefix is strided: with
+ * field slots at every HALO_EVERY-th index, a population of T holds
+ * ceil(T/HALO_EVERY) field particles, so T = disc + k with k = ceil(T/8), which
+ * solves to k = ceil(disc/7). A million disc particles is 1,142,858 total.
+ *
+ * The extra 14% is close to free. Field particles return immediately from
+ * depositMass and take one reciprocal instead of a mesh gather, and the pass
+ * that actually costs — the O(GRID^4) convolution — does not scale with
+ * population at all.
+ */
+export function withOuterField(disc: number) {
+  return disc + Math.ceil(disc / (HALO_EVERY - 1));
+}
+
+/**
+ * Write one outer-field particle's position and velocity into `p` at `o`.
+ *
+ * On a circular orbit like everything else, from the same vCirc the disc is
+ * seeded from — out here that is core plus the disc as a point mass, which is
+ * exactly the approximation the integrators use outside the mesh box, so the
+ * field is seeded on the orbit it is then stepped along. A star at r = 1.5 takes
+ * about fifteen seconds to come round, so this reads as a slow wheel behind a
+ * fast disc rather than as a static backdrop.
+ *
+ * No velocity dispersion. The disc needs it to avoid fragmenting on its first
+ * orbit (see SIGMA_FRAC); the field has no self-gravity to fragment under, and
+ * dispersion here would only let particles diffuse in radius until they found
+ * the walls.
+ */
+export function seedHaloAt(p: Float32Array, o: number, rand: () => number) {
+  const a = rand() * Math.PI * 2;
+  // Uniform in *area*: r = sqrt(lerp(rmin^2, rmax^2, u)). Sampling r uniformly
+  // instead would pile the field up against its inner edge.
+  const r = Math.sqrt(
+    HALO_R_MIN * HALO_R_MIN + rand() * (HALO_R_MAX * HALO_R_MAX - HALO_R_MIN * HALO_R_MIN),
+  );
+  const vOrb = vCirc(r);
+  p[o] = Math.cos(a) * r;
+  p[o + 1] = Math.sin(a) * r;
+  p[o + 2] = -Math.sin(a) * vOrb;
+  p[o + 3] = Math.cos(a) * vOrb;
 }
 
 export const SPECIES_NAMES = [
@@ -292,6 +492,21 @@ export function mulberry32(seed: number) {
 }
 
 /**
+ * A fresh 32-bit seed, so no two runs of a mode are the same disc.
+ *
+ * The seeding itself stays deterministic *given* a seed — everything below still
+ * draws from one mulberry32 stream in a fixed order, which is what keeps species
+ * banded by radius. Only the number handed in varies, so a restart is a
+ * different draw from the same distribution rather than a different galaxy: the
+ * profile, the bands and the rotation curve are unchanged, the particular
+ * arrangement is not. Pass an explicit seed to any of the seeders to get the old
+ * exactly-reproducible behaviour back for a measurement.
+ */
+export function randomSeed() {
+  return (Math.random() * 0x100000000) >>> 0;
+}
+
+/**
  * Fill a simulation with the initial galaxy, deterministically.
  *
  * Split out from createSim so that restarting is *exactly* reloading. The
@@ -300,9 +515,16 @@ export function mulberry32(seed: number) {
  * because species is assigned *from* radius here and the species buffer is
  * uploaded once and never changed. Redraw the radii independently and every
  * species ends up spread over the whole disc: six colors, one gray ring.
+ *
+ * Takes a slot range so that growing the population can seed only the slots that
+ * are new — see seedRange() in sim/modes.ts. A partial call draws from its own
+ * stream rather than fast-forwarding the full one to `from`, so the tail it
+ * writes is not the tail a whole-buffer call with the same seed would have
+ * written. That costs nothing worth having: the whole-buffer path is the one
+ * determinism is a claim about, and it is the one left alone.
  */
-export function seedGalaxy(sim: Sim, seed = 0x9e3779b9) {
-  const { particles, species, stat, capacity } = sim;
+export function seedGalaxy(sim: Sim, seed = 0x9e3779b9, from = 0, to = sim.capacity) {
+  const { particles, species, stat } = sim;
   const rand = mulberry32(seed);
 
   // Box-Muller, drawing from the same deterministic stream as everything else.
@@ -311,28 +533,44 @@ export function seedGalaxy(sim: Sim, seed = 0x9e3779b9) {
     return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rand());
   };
 
-  for (let i = 0; i < capacity; i++) {
+  for (let i = from; i < to; i++) {
     const o = i * STRIDE;
-    // Start as an exponential disc, so frame one reads as a galaxy rather than
-    // as a flat washer — see H_DISC.
-    const a = rand() * Math.PI * 2;
-    const r = sampleRadius(rand(), rand());
-    particles[o] = Math.cos(a) * r;
-    particles[o + 1] = Math.sin(a) * r;
+    // Every eighth slot is outer field rather than disc — see HALO_EVERY. It
+    // draws from the same stream in the same order, so restarting is still
+    // exactly reloading.
+    const halo = isHalo(i);
+    let r: number;
+    if (halo) {
+      seedHaloAt(particles, o, rand);
+      r = Math.hypot(particles[o], particles[o + 1]);
+    } else {
+      // Start as an exponential disc, so frame one reads as a galaxy rather than
+      // as a flat washer — see H_DISC.
+      const a = rand() * Math.PI * 2;
+      r = sampleRadius(rand(), rand());
+      particles[o] = Math.cos(a) * r;
+      particles[o + 1] = Math.sin(a) * r;
 
-    // On a circular orbit of the *combined* central + disc field, plus the
-    // velocity dispersion that keeps the first orbit from fragmenting. Seeding
-    // exactly on-orbit and perfectly cold is the one starting condition
-    // guaranteed to look wrong: see SIGMA_FRAC.
-    const vOrb = vCirc(r);
-    const sigma = vOrb * SIGMA_FRAC;
-    particles[o + 2] = -Math.sin(a) * vOrb + gauss() * sigma;
-    particles[o + 3] = Math.cos(a) * vOrb + gauss() * sigma;
+      // On a circular orbit of the *combined* central + disc field, plus the
+      // velocity dispersion that keeps the first orbit from fragmenting. Seeding
+      // exactly on-orbit and perfectly cold is the one starting condition
+      // guaranteed to look wrong: see SIGMA_FRAC.
+      const vOrb = vCirc(r);
+      const sigma = vOrb * SIGMA_FRAC;
+      particles[o + 2] = -Math.sin(a) * vOrb + gauss() * sigma;
+      particles[o + 3] = Math.cos(a) * vOrb + gauss() * sigma;
+    }
 
     // Species banded by radius: the galaxy reads as composed rings rather than
     // uniform confetti, and the filter chips then carve visible structure.
     // Banded on the exponential scale length, not the nominal radius, or five of
     // the six species would land inside the innermost tenth of the disc.
+    //
+    // The outer field falls out of the same rule with no special case: it lives
+    // past r = 1.15, which is off the end of every band, so it clamps into the
+    // outermost species. That is the answer that was wanted anyway — the filter
+    // chips then treat the field as the continuation of the outer disc, and no
+    // chip carves confetti out of it.
     const band = (r / (2.6 * H_DISC)) * SPECIES_COUNT;
     const jitter = (rand() - 0.5) * 1.6;
     species[i] = Math.max(0, Math.min(SPECIES_COUNT - 1, (band + jitter) | 0));
@@ -386,10 +624,18 @@ for (let gy = 0; gy < GRID; gy++) {
 function solveMesh(sim: Sim, n: number) {
   meshMass.fill(0);
   const p = sim.particles;
-  const mPer = M_DISC / n;
+  // Only the disc share deposits, so each depositing particle carries a
+  // correspondingly larger slice — otherwise the mesh would hold 7/8 of M_DISC
+  // and the disc would sit on a rotation curve 7% slower than it was seeded on.
+  const mPer = M_DISC / (n * DISC_SHARE);
 
   for (let i = 0; i < n; i++) {
     const o = i * STRIDE;
+    // Outside the mesh box a particle is outer field, not disc: it is pulled by
+    // the disc's mass but has none of its own here. Skipping it is also what
+    // keeps the clamps below honest — they would otherwise file every one of
+    // these into an edge cell and build a fake rim of mass around the box.
+    if (Math.abs(p[o]) >= MESH_R || Math.abs(p[o + 1]) >= MESH_R) continue;
     const gx = (p[o] + 1) * 0.5 * GRID - 0.5;
     const gy = (p[o + 1] + 1) * 0.5 * GRID - 0.5;
     const i0 = Math.floor(gx);
@@ -471,26 +717,41 @@ export function integrateCPU(
     const cy = -y;
     const dc2 = cx * cx + cy * cy + 0.004;
     const rc = Math.sqrt(dc2);
-    const fc = coreF(dc2);
+    // Core plus halo. The halo term is zero in every mode but HALO, so this is
+    // the same arithmetic the self-gravitating disc always did — and unlike the
+    // mesh it applies to the outer field too, which is where a flat rotation
+    // curve is actually visible.
+    const fc = coreF(dc2) + haloF(dc2);
 
-    // Bilinear gather from the mesh, matching the GPU's sampleField.
-    const ggx = (x + 1) * 0.5 * GRID - 0.5;
-    const ggy = (y + 1) * 0.5 * GRID - 0.5;
-    const gi0 = Math.floor(ggx);
-    const gj0 = Math.floor(ggy);
-    const gfx = ggx - gi0;
-    const gfy = ggy - gj0;
+    // The disc's own gravity. Inside the mesh box, gathered from the mesh;
+    // outside it, the disc as a point mass at the origin — see the same branch
+    // in webgpu.ts for why that is the right answer out there and not a
+    // shortcut.
+    const outer = Math.abs(x) >= MESH_R || Math.abs(y) >= MESH_R;
     let sgx = 0;
     let sgy = 0;
-    for (let dy = 0; dy < 2; dy++) {
-      const jj = Math.min(GRID - 1, Math.max(0, gj0 + dy));
-      const wy = dy ? gfy : 1 - gfy;
-      for (let dx = 0; dx < 2; dx++) {
-        const ii = Math.min(GRID - 1, Math.max(0, gi0 + dx));
-        const w = (dx ? gfx : 1 - gfx) * wy;
-        sgx += meshAccX[jj * GRID + ii] * w;
-        sgy += meshAccY[jj * GRID + ii] * w;
+    if (!outer) {
+      // Bilinear gather from the mesh, matching the GPU's sampleField.
+      const ggx = (x + 1) * 0.5 * GRID - 0.5;
+      const ggy = (y + 1) * 0.5 * GRID - 0.5;
+      const gi0 = Math.floor(ggx);
+      const gj0 = Math.floor(ggy);
+      const gfx = ggx - gi0;
+      const gfy = ggy - gj0;
+      for (let dy = 0; dy < 2; dy++) {
+        const jj = Math.min(GRID - 1, Math.max(0, gj0 + dy));
+        const wy = dy ? gfy : 1 - gfy;
+        for (let dx = 0; dx < 2; dx++) {
+          const ii = Math.min(GRID - 1, Math.max(0, gi0 + dx));
+          const w = (dx ? gfx : 1 - gfx) * wy;
+          sgx += meshAccX[jj * GRID + ii] * w;
+          sgy += meshAccY[jj * GRID + ii] * w;
+        }
       }
+    } else {
+      const fd = M_DISC / (dc2 * rc);
+      sgx = cx * fd;
+      sgy = cy * fd;
     }
 
     const dx = mx - x;
@@ -504,26 +765,31 @@ export function integrateCPU(
     let vx = p[o + 2] + cx * fc * dt + sgx * dt + dx * fm * dt;
     let vy = p[o + 3] + cy * fc * dt + sgy * dt + dy * fm * dt;
 
-    // Radial-only damping — see webgpu.ts for why uniform damping collapses the
-    // disc into a ball instead of holding it open.
-    const rdx = cx / rc;
-    const rdy = cy / rc;
-    const vr = vx * rdx + vy * rdy;
-    vx = (vx - vr * rdx) + vr * rdx * cooling;
-    vy = (vy - vr * rdy) + vr * rdy * cooling;
-    vx *= damp;
-    vy *= damp;
+    // All dissipation is disc physics, so the outer field skips it and orbits
+    // frictionless — see the same branch in webgpu.ts for the measurement that
+    // forced it.
+    if (!outer) {
+      // Radial-only damping — see webgpu.ts for why uniform damping collapses the
+      // disc into a ball instead of holding it open.
+      const rdx = cx / rc;
+      const rdy = cy / rc;
+      const vr = vx * rdx + vy * rdy;
+      vx = (vx - vr * rdx) + vr * rdx * cooling;
+      vy = (vy - vr * rdy) + vr * rdy * cooling;
+      vx *= damp;
+      vy *= damp;
 
-    // Capture drag along the cursor line only — see webgpu.ts for why not the
-    // full velocity vector.
-    if (ht > 0) {
-      const cd = Math.min(0.9, CAPTURE_K * ht * Math.exp(-dm2 / CAPTURE_R2) * dt);
-      const dmLen = Math.max(1e-4, Math.hypot(dx, dy));
-      const mdx = dx / dmLen;
-      const mdy = dy / dmLen;
-      const va = (vx * mdx + vy * mdy) * cd;
-      vx -= va * mdx;
-      vy -= va * mdy;
+      // Capture drag along the cursor line only — see webgpu.ts for why not the
+      // full velocity vector.
+      if (ht > 0) {
+        const cd = Math.min(0.9, CAPTURE_K * ht * Math.exp(-dm2 / CAPTURE_R2) * dt);
+        const dmLen = Math.max(1e-4, Math.hypot(dx, dy));
+        const mdx = dx / dmLen;
+        const mdy = dy / dmLen;
+        const va = (vx * mdx + vy * mdy) * cd;
+        vx -= va * mdx;
+        vy -= va * mdy;
+      }
     }
 
     const speed = Math.hypot(vx, vy);
@@ -535,10 +801,13 @@ export function integrateCPU(
     let nx = x + vx * dt;
     let ny = y + vy * dt;
 
-    // Reflect at the unit box, bleeding energy on contact. A perfectly elastic
-    // wall lets escapees accumulate speed and slowly randomize the field.
-    if (nx < -1) { nx = -1; vx = -vx * BOUNCE; } else if (nx > 1) { nx = 1; vx = -vx * BOUNCE; }
-    if (ny < -1) { ny = -1; vy = -vy * BOUNCE; } else if (ny > 1) { ny = 1; vy = -vy * BOUNCE; }
+    // Reflect at the domain wall, bleeding energy on contact. A perfectly
+    // elastic wall lets escapees accumulate speed and slowly randomize the
+    // field. The wall is at DOMAIN, not at the mesh box — the outer field lives
+    // between the two and must not be bounced off the edge of the solver.
+    const W = DOMAIN;
+    if (nx < -W) { nx = -W; vx = -vx * BOUNCE; } else if (nx > W) { nx = W; vx = -vx * BOUNCE; }
+    if (ny < -W) { ny = -W; vy = -vy * BOUNCE; } else if (ny > W) { ny = W; vy = -vy * BOUNCE; }
 
     p[o] = nx;
     p[o + 1] = ny;
@@ -623,16 +892,16 @@ export function integrateChladniCPU(
 }
 
 /**
- * Spread the first `n` slots evenly over the box, at rest.
+ * Spread slots [from, n) evenly over the box, at rest.
  *
  * The plate has to start as evenly spread sand. Arriving from a galaxy with
  * everything piled in the core produces one bright diagonal and nothing else,
  * because a grain that reaches a node has zero vibration amplitude and never
  * moves again.
  */
-export function scatterPlate(sim: Sim, n: number, rand: () => number = Math.random) {
+export function scatterPlate(sim: Sim, n: number, rand: () => number = Math.random, from = 0) {
   const p = sim.particles;
-  for (let i = 0; i < n; i++) {
+  for (let i = from; i < n; i++) {
     const o = i * STRIDE;
     p[o] = rand() * 2 - 1;
     p[o + 1] = rand() * 2 - 1;
@@ -646,6 +915,10 @@ export function reseedGalaxy(sim: Sim, n: number, rand: () => number = Math.rand
   const p = sim.particles;
   for (let i = 0; i < n; i++) {
     const o = i * STRIDE;
+    if (isHalo(i)) {
+      seedHaloAt(p, o, rand);
+      continue;
+    }
     const a = rand() * Math.PI * 2;
     const r = sampleRadius(rand(), rand());
     const vOrb = vCirc(r);

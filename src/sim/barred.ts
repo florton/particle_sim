@@ -28,7 +28,7 @@ export const G_CURSOR = 0.2;
  * the regime where an encounter stops being a ripple and starts throwing tidal
  * tails and a bridge — Toomre's prograde-encounter result, driven by hand.
  */
-export const G_CURSOR_HELD = 0.6;
+export const G_CURSOR_HELD = 0.75;
 /** Terminal speed. */
 export const V_MAX = 3.0;
 /**
@@ -108,8 +108,8 @@ export function homeRadius(species: number, i: number) {
  * Species drives home radius on recycling, so this is what the colour structure
  * of the barred disc and of both colliding discs is built out of.
  */
-export function seedSpecies(sim: Sim, rand: () => number) {
-  for (let i = 0; i < sim.capacity; i++) {
+export function seedSpecies(sim: Sim, rand: () => number, from = 0, to = sim.capacity) {
+  for (let i = from; i < to; i++) {
     const r = Math.sqrt(rand()) * R_DISC;
     const band = (r / R_DISC) * SPECIES_COUNT;
     const jitter = (rand() - 0.5) * SPECIES_SPREAD;
@@ -283,10 +283,10 @@ export function integrateCollisionCPU(
   }
 }
 
-/** Re-seed the first `n` slots as the barred disc. Mirrors the WGSL scatter. */
-export function reseedDisc(sim: Sim, n: number, rand: () => number = Math.random) {
+/** Re-seed slots [from, n) as the barred disc. Mirrors the WGSL scatter. */
+export function reseedDisc(sim: Sim, n: number, rand: () => number = Math.random, from = 0) {
   const p = sim.particles;
-  for (let i = 0; i < n; i++) {
+  for (let i = from; i < n; i++) {
     const o = i * STRIDE;
     const a = rand() * Math.PI * 2;
     const r = Math.max(0.03, Math.sqrt(rand()) * R_DISC);
@@ -298,15 +298,16 @@ export function reseedDisc(sim: Sim, n: number, rand: () => number = Math.random
   }
 }
 
-/** Re-seed the first `n` slots as the two colliding discs, interleaved by parity. */
+/** Re-seed slots [from, n) as the two colliding discs, interleaved by parity. */
 export function reseedCollision(
   sim: Sim,
   n: number,
   pair: PairState,
   rand: () => number = Math.random,
+  from = 0,
 ) {
   const p = sim.particles;
-  for (let i = 0; i < n; i++) {
+  for (let i = from; i < n; i++) {
     const o = i * STRIDE;
     const g = i & 1;
     const a = rand() * Math.PI * 2;

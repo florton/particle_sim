@@ -20,14 +20,15 @@
  */
 
 import {
-  CAPTURE_K, CAPTURE_R2, CURSOR_SOFT2, CURSOR_SOFT2_HOLD, G_CORE, G_CURSOR,
-  G_CURSOR_HOLD, RADIAL_DAMP, type Sim,
+  CAPTURE_K, CAPTURE_R2, CURSOR_SOFT2, CURSOR_SOFT2_HOLD, DOMAIN, G_CORE,
+  G_CURSOR, G_CURSOR_HOLD, HALO_A2, MESH_R, M_DISC, RADIAL_DAMP, haloMass,
+  type Sim,
 } from '../sim/world';
 import * as barred from '../sim/barred';
 import * as classic from '../sim/classic';
-import { BARRED, CHLADNI, CLASSIC, COLLISION, SELFGRAV, seedMode } from '../sim/modes';
+import { BARRED, CHLADNI, CLASSIC, COLLISION, SELFGRAV, seedMode, seedRange } from '../sim/modes';
 import { PAIR_MASS, createPair, type PairState } from '../sim/pair';
-import type { Backend } from './backend';
+import { cameraTilt, cameraZoom, type Backend } from './backend';
 
 const SIM_VS = `#version 300 es
 precision highp float;
@@ -49,6 +50,9 @@ uniform float uGCursor;
 // coreGravity() in sim/classic.ts. A uniform rather than a baked constant
 // because it is the one term in that mode a slider moves.
 uniform float uGCore;
+// Dark-halo mass of the HALO mode, live from the UI and 0 everywhere else — see
+// M_HALO in sim/world.ts. A uniform for the same reason uGCore is.
+uniform float uHalo;
 uniform vec2 uC0;
 uniform vec2 uC1;
 uniform float uPMass;
@@ -212,7 +216,9 @@ void main() {
     float dm2c = dot(dmc2, dmc2) + 0.02;
     vec2 vv2 = aVel
       + dcc * fcc * uDt
-      + dmc2 * (${classic.G_CURSOR} / (dm2c * sqrt(dm2c))) * uDt;
+      // uGCursor rather than a constant — two cursor masses, switched on pointer
+      // down. See G_CURSOR_HELD in sim/classic.ts.
+      + dmc2 * (uGCursor / (dm2c * sqrt(dm2c))) * uDt;
 
     vec2 rdirc = dcc / rcc;
     vec2 vRadc = dot(vv2, rdirc) * rdirc;
@@ -238,7 +244,10 @@ void main() {
   vec2 dc = -aPos;
   float dc2 = dot(dc, dc) + 0.004;
   float rc = sqrt(dc2);
-  float fc = ${G_CORE} / (dc2 * rc) - 0.0025 / (dc2 * dc2);
+  // Core plus the dark halo — mirrors coreF() + haloF() in sim/world.ts. uHalo
+  // is 0 in mode ${SELFGRAV}, so the two disc modes share this line unbranched.
+  float fc = ${G_CORE} / (dc2 * rc) - 0.0025 / (dc2 * dc2)
+           + uHalo / (dc2 + float(${HALO_A2}));
 
   vec2 dm = uMouse - aPos;
   // Mass and softening ramp together — see sim/world.ts CURSOR_SOFT2_HOLD.
@@ -246,29 +255,46 @@ void main() {
   float dm2 = dot(dm, dm) + mix(${CURSOR_SOFT2}, ${CURSOR_SOFT2_HOLD}, ht);
   float fm = ${G_CURSOR} * uGrav / (dm2 * sqrt(dm2));
 
-  vec2 v = aVel + dc * fc * uDt + dm * fm * uDt;
+  // Outside the mesh box, the disc as a point mass. This path has no mesh at all
+  // (see the header), so this is the *only* place the disc's own mass appears in
+  // it — and it has to, because the outer field is seeded from vCirc(), which
+  // includes that mass. Leave it out and the field is seeded 20% fast at r = 1.5
+  // and spirals outward onto the wall instead of holding station.
+  bool outer = max(abs(aPos.x), abs(aPos.y)) >= float(${MESH_R.toFixed(3)});
+  vec2 sg = outer ? dc * (float(${M_DISC}) / (dc2 * rc)) : vec2(0.0);
 
-  // Radial-only damping — see webgpu.ts for why uniform damping collapses the disc.
-  vec2 rdir = dc / rc;
-  vec2 vRad = dot(v, rdir) * rdir;
-  v = ((v - vRad) + vRad * uCooling) * 0.99995;
+  vec2 v = aVel + dc * fc * uDt + sg * uDt + dm * fm * uDt;
 
-  // Capture drag along the cursor line only — see webgpu.ts for why not the
-  // full velocity vector.
-  float cw = ht * exp(-dm2 / float(${CAPTURE_R2}));
-  vec2 mdir = dm / max(1e-4, length(dm));
-  v -= dot(v, mdir) * mdir * min(0.9, float(${CAPTURE_K}) * cw * uDt);
+  // All dissipation is disc physics; the outer field orbits frictionless. See
+  // webgpu.ts for the measurement — with the global bleed applied out there the
+  // field inspirals out of frame over about a minute.
+  if (!outer) {
+    // Radial-only damping — see webgpu.ts for why uniform damping collapses the disc.
+    vec2 rdir = dc / rc;
+    vec2 vRad = dot(v, rdir) * rdir;
+    v = ((v - vRad) + vRad * uCooling) * 0.99995;
+
+    // Capture drag along the cursor line only — see webgpu.ts for why not the
+    // full velocity vector.
+    float cw = ht * exp(-dm2 / float(${CAPTURE_R2}));
+    vec2 mdir = dm / max(1e-4, length(dm));
+    v -= dot(v, mdir) * mdir * min(0.9, float(${CAPTURE_K}) * cw * uDt);
+  }
 
   float speed = length(v);
   if (speed > 3.0) v *= 3.0 / speed;
 
   vec2 p = aPos + v * uDt;
 
+  // Walls at DOMAIN, matching webgpu.ts: the outer field that fills a wide
+  // frame lives outside the unit box, so a unit-box wall would flatten it
+  // against the edge of the disc on the first frame.
   float bounce = 0.45;
-  if (p.x < -1.0) { p.x = -1.0; v.x = -v.x * bounce; }
-  else if (p.x > 1.0) { p.x = 1.0; v.x = -v.x * bounce; }
-  if (p.y < -1.0) { p.y = -1.0; v.y = -v.y * bounce; }
-  else if (p.y > 1.0) { p.y = 1.0; v.y = -v.y * bounce; }
+  float W = float(${DOMAIN.toFixed(3)});
+  if (p.x < -W) { p.x = -W; v.x = -v.x * bounce; }
+  else if (p.x > W) { p.x = W; v.x = -v.x * bounce; }
+  if (p.y < -W) { p.y = -W; v.y = -v.y * bounce; }
+  else if (p.y > W) { p.y = W; v.y = -v.y * bounce; }
 
   vPos = p;
   vVel = v;
@@ -294,7 +320,8 @@ uniform int uMask;
 uniform float uVScale;
 uniform float uMono;
 uniform int uMode;
-uniform float uScale;
+// Vertical foreshortening of the inclined view — see cameraTilt in backend.ts.
+uniform float uTilt;
 
 // Mirrors SPECIES_COLORS in sim/world.ts and PALETTE in webgpu.ts.
 const vec3 PALETTE[6] = vec3[6](
@@ -321,27 +348,18 @@ void main() {
   // See webgpu.ts: mono drops the palette for a single faintly warm white.
   vec3 base = uMono > 0.5 ? vec3(0.86, 0.89, 1.0) : PALETTE[sp];
   vTint = mix(base, vec3(1.0, 0.95, 0.88), vSpeed * 0.3);
-  // Each mode keeps the framing it was built with — see the vs() entry point in
-  // webgpu.ts, which makes the same three choices.
-  if (uMode == ${CLASSIC}) {
-    gl_Position = vec4(aPos.x + aCorner.x * uSize / uAspect, aPos.y + aCorner.y * uSize, 0.0, 1.0);
-  } else if (uMode == ${BARRED} || uMode == ${COLLISION}) {
-    float fx = 1.0 / max(uAspect, 1.0);
-    float fy = min(uAspect, 1.0);
-    gl_Position = vec4(
-      (aPos.x * uScale + aCorner.x * uSize) * fx,
-      (aPos.y * uScale + aCorner.y * uSize) * fy,
-      0.0, 1.0
-    );
-  } else {
-    float fx = uVScale / max(uAspect, 1.0);
-    float fy = uVScale * min(uAspect, 1.0);
-    gl_Position = vec4(
-      (aPos.x + aCorner.x * uSize) * fx,
-      (aPos.y + aCorner.y * uSize) * fy,
-      0.0, 1.0
-    );
-  }
+  // One camera for every mode, solved on the CPU by cameraZoom() in
+  // backend.ts — see the vs() entry point in webgpu.ts, which splits the same
+  // number across the two axes the same way.
+  float fx = uVScale / max(uAspect, 1.0);
+  float fy = uVScale * min(uAspect, 1.0);
+  // Inclination on the disc's y only, not the quad's — the disc tilts, the
+  // stars in it stay round. See the vs() entry point in webgpu.ts.
+  gl_Position = vec4(
+    (aPos.x + aCorner.x * uSize) * fx,
+    (aPos.y * uTilt + aCorner.y * uSize) * fy,
+    0.0, 1.0
+  );
 }`;
 
 const DRAW_FS = `#version 300 es
@@ -435,6 +453,7 @@ export function createWebGL2Backend(
     uDt: gl.getUniformLocation(simProg, 'uDt'),
     uMouse: gl.getUniformLocation(simProg, 'uMouse'),
     uMode: gl.getUniformLocation(simProg, 'uMode'),
+    uHalo: gl.getUniformLocation(simProg, 'uHalo'),
     uTime: gl.getUniformLocation(simProg, 'uTime'),
     uWarp: gl.getUniformLocation(simProg, 'uWarp'),
     uWarpM: gl.getUniformLocation(simProg, 'uWarpM'),
@@ -458,7 +477,7 @@ export function createWebGL2Backend(
     uVScale: gl.getUniformLocation(drawProg, 'uVScale'),
     uMono: gl.getUniformLocation(drawProg, 'uMono'),
     uMode: gl.getUniformLocation(drawProg, 'uMode'),
-    uScale: gl.getUniformLocation(drawProg, 'uScale'),
+    uTilt: gl.getUniformLocation(drawProg, 'uTilt'),
   };
 
   const tf = gl.createTransformFeedback()!;
@@ -476,6 +495,7 @@ export function createWebGL2Backend(
   let elapsed = 0;
   let cooling = RADIAL_DAMP;
   let mono = false;
+  let tilted = false;
   let cursorMass = barred.G_CURSOR;
   // Replaced by setPair() before collision mode is ever entered.
   let pair: PairState = createPair();
@@ -489,15 +509,19 @@ export function createWebGL2Backend(
   gl.blendFunc(gl.ONE, gl.ONE);
 
   /**
-   * Re-seed for the current mode and refill both ping-pong buffers.
+   * De-interleave slots [from, to) out of the sim buffer and into all four
+   * ping-pong buffers.
    *
-   * The same deterministic CPU seeding the WebGPU path uses, so the two backends
-   * start every mode from the same state — see seedMode() in sim/modes.ts. A
-   * one-time cost on mode switch or restart, not per frame.
+   * All four, and not just the one the next pass reads from, because which of
+   * the two pairs is current depends on how many frames have been drawn — and a
+   * range written to only one of them would be overwritten by the stale copy on
+   * the following swap. The slots being written are not live in either buffer
+   * (this is called with a range that is either the whole population or one
+   * being grown into, never a range being stepped), so writing both sides is
+   * writing the same value twice rather than clobbering a result.
    */
-  const reseedBuffers = () => {
-    seedMode(sim, mode, pair);
-    for (let i = 0; i < n; i++) {
+  const uploadRange = (from: number, to: number) => {
+    for (let i = from; i < to; i++) {
       pos[i * 2] = sim.particles[i * 4];
       pos[i * 2 + 1] = sim.particles[i * 4 + 1];
       vel[i * 2] = sim.particles[i * 4 + 2];
@@ -505,7 +529,7 @@ export function createWebGL2Backend(
       speciesData[i] = sim.species[i];
     }
     gl.bindBuffer(gl.ARRAY_BUFFER, speciesBuf);
-    gl.bufferSubData(gl.ARRAY_BUFFER, 0, speciesData);
+    gl.bufferSubData(gl.ARRAY_BUFFER, from * 4, speciesData, from, to - from);
     for (const [buf, data] of [
       [posA, pos],
       [posB, pos],
@@ -513,8 +537,23 @@ export function createWebGL2Backend(
       [velB, vel],
     ] as const) {
       gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-      gl.bufferSubData(gl.ARRAY_BUFFER, 0, data);
+      // Two floats per particle here: eight bytes into the buffer, two elements
+      // into the source.
+      gl.bufferSubData(gl.ARRAY_BUFFER, from * 8, data, from * 2, (to - from) * 2);
     }
+  };
+
+  /**
+   * Re-seed for the current mode and refill both ping-pong buffers.
+   *
+   * The same CPU seeding the WebGPU path uses, so the two backends start every
+   * mode from the same distribution — a fresh seed per call, so not the same
+   * draw; see seedMode() in sim/modes.ts. A one-time cost on mode switch or
+   * restart, not per frame.
+   */
+  const reseedBuffers = () => {
+    seedMode(sim, mode, pair);
+    uploadRange(0, n);
   };
 
   return {
@@ -523,6 +562,13 @@ export function createWebGL2Backend(
 
     setCount(v: number) {
       count = Math.min(v, sim.capacity);
+    },
+
+    grow(from: number, to: number) {
+      const hi = Math.min(to, sim.capacity);
+      if (hi <= from) return;
+      seedRange(sim, mode, pair, from, hi);
+      uploadRange(from, hi);
     },
 
     setSpeciesMask(m: number) {
@@ -535,6 +581,10 @@ export function createWebGL2Backend(
 
     setMono(v: boolean) {
       mono = v;
+    },
+
+    setTilt(v: boolean) {
+      tilted = v;
     },
 
     setCursorMass(m: number) {
@@ -568,6 +618,7 @@ export function createWebGL2Backend(
       // number also has to reach the CPU baseline and the seeding, neither of
       // which goes through a backend. See coreGravity() in sim/classic.ts.
       gl.uniform1f(simLoc.uGCore, classic.coreGravity());
+      gl.uniform1f(simLoc.uHalo, haloMass());
       gl.uniform2f(simLoc.uC0, pair.x0, pair.y0);
       gl.uniform2f(simLoc.uC1, pair.x1, pair.y1);
       gl.uniform1f(simLoc.uPMass, PAIR_MASS);
@@ -602,15 +653,17 @@ export function createWebGL2Backend(
 
       gl.useProgram(drawProg);
       gl.uniform1f(drawLoc.uAspect, canvas.width / canvas.height);
-      // Same size/gain curve as the WebGPU path — see webgpu.ts for the reasoning.
-      gl.uniform1f(drawLoc.uSize, Math.min(0.006, Math.max(0.0018, 0.06 / Math.sqrt(count))));
-      gl.uniform1f(drawLoc.uGain, Math.min(1, Math.max(0.6, 200_000 / count)));
+      // Same size/gain curve as the WebGPU path — see webgpu.ts for the reasoning,
+      // including why both carry the tilt factor and in which direction.
+      const tilt = cameraTilt(mode, tilted);
+      gl.uniform1f(drawLoc.uSize, Math.min(0.006, Math.max(0.0018, 0.06 / Math.sqrt(count))) * tilt);
+      gl.uniform1f(drawLoc.uGain, Math.min(1, Math.max(0.6, 200_000 / count)) / tilt);
       gl.uniform1i(drawLoc.uMask, mask);
-      gl.uniform1f(drawLoc.uVScale, 1.42);
+      // The whole camera, in one number — see cameraZoom() in backend.ts.
+      gl.uniform1f(drawLoc.uVScale, cameraZoom(mode, canvas.width / canvas.height, tilted));
+      gl.uniform1f(drawLoc.uTilt, tilt);
       gl.uniform1f(drawLoc.uMono, mono ? 1 : 0);
       gl.uniform1i(drawLoc.uMode, mode);
-      // The collision spans a wider field than a disc does — see webgpu.ts.
-      gl.uniform1f(drawLoc.uScale, mode === COLLISION ? 0.55 : 1);
 
       bindAttrib(cornerBuf, drawLoc.aCorner, 0);
       bindAttrib(posB, drawLoc.aPos, 1);
