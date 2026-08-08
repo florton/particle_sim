@@ -308,15 +308,21 @@ export interface Backend {
   /**
    * Dump the smoke solver's scalar planes.
    *
-   * Present only on backends that run the fluid. `div` is the divergence the
-   * pressure solve was handed; recomputing it from the velocity afterwards is
-   * how the projection gets checked rather than admired.
+   * Present only on backends that run the fluid. `div` is the right-hand side
+   * the pressure solve was handed; recomputing the divergence from the velocity
+   * afterwards is how the projection gets checked rather than admired.
+   *
+   * That target is not zero everywhere. `dil` is the thermal expansion the solve
+   * was asked to leave in the field — see EXPAND in sim/smoke.ts — so the field
+   * the projection was given had divergence `div + dil`, and the one it left
+   * behind should have `dil`.
    */
   dumpSmoke?(): Promise<{
     temp: Float32Array;
     phi: Float32Array;
     div: Float32Array;
     curl: Float32Array;
+    dil: Float32Array;
     /** Projected velocity, interleaved u, v per face, row stride `stride`. */
     vel: Float32Array;
     nx: number;

@@ -512,10 +512,12 @@ head.appendChild(haloRow);
 // dissolves into a smooth cloud. High, it sheds vortices continuously the whole
 // way up and never settles.
 //
-// The default sits low, and near the bottom of a narrow usable window — below
-// about 2 the confinement stops keeping up with the advection's own diffusion
-// and the plume goes smooth within half a minute, while by 12 it is curling at
-// every point and reads as a vortex diagram rather than as smoke. See VORT.
+// The default sits low, and lower than it used to. By 12 the field is curling at
+// every point and reads as a vortex diagram rather than as smoke; at the bottom
+// end the old floor was set by the confinement being the only source of small
+// structure, and it no longer is — the tracers carry their own. What is left for
+// a high setting to do at the plume's rim is wind isolated vortices up out of
+// still fluid, which is the numerics rather than the flow. See VORT.
 //
 // Measured over 10 s from one seed, as mean squared vorticity across the grid —
 // 0.84 at epsilon 0, then 5.7, 58, 128, 160 at 6, 12, 24 and 40. The flattening

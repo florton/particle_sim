@@ -41,8 +41,9 @@ const CELLS = GRID * GRID;
 const SM_CELLS = smoke.CELLS;
 const SM_FACES = smoke.FACES;
 /** Planes in `scal`: temperature, its advection scratch, pressure, divergence,
- *  curl, and the two components of the confinement force. */
-const SM_PLANES = 7;
+ *  curl, the two components of the confinement force, and the thermal-expansion
+ *  target the projection solves against. */
+const SM_PLANES = 8;
 
 
 const SHADER = /* wgsl */ `
@@ -731,6 +732,7 @@ const P_DIV  = ${3 * SM_CELLS}u;
 const P_CURL = ${4 * SM_CELLS}u;
 const P_CFX  = ${5 * SM_CELLS}u;
 const P_CFY  = ${6 * SM_CELLS}u;
+const P_DIL  = ${7 * SM_CELLS}u;
 // And into svel.
 const V_A = 0u;
 const V_B = ${SM_FACES}u;
@@ -752,6 +754,17 @@ const SM_TURN_HZ = ${smoke.TURN_HZ};
 const SM_RECYCLE_P = ${smoke.RECYCLE_P};
 const SM_VMAX = ${smoke.V_MAX};
 const SM_DIFFUSIVITY = ${smoke.DIFFUSIVITY};
+const SM_SUB_L = ${smoke.SUBGRID_L};
+const SM_SUB_V = ${smoke.SUBGRID_V};
+const SM_SUB_FALLOFF = ${smoke.SUBGRID_FALLOFF};
+const SM_SUB_RATE = ${smoke.SUBGRID_RATE};
+const SM_SUB_OMEGA = ${smoke.SUBGRID_OMEGA};
+const SM_SUB_FLOOR = ${smoke.SUBGRID_FLOOR};
+const SM_AMB_V = ${smoke.AMBIENT_V};
+const SM_AMB_L = ${smoke.AMBIENT_L};
+const SM_AMB_RATE = ${smoke.AMBIENT_RATE};
+const SM_EXPAND = ${smoke.EXPAND};
+const SM_NOISE_NORM = ${smoke.NOISE_NORM};
 
 fn smCell(i : u32, j : u32) -> u32 { return j * SM_NX + i; }
 fn smFace(i : u32, j : u32) -> u32 { return j * SM_SX + i; }
@@ -785,15 +798,20 @@ fn smSampleV(base : u32, gx : f32, gy : f32) -> f32 {
   return mix(s0, s1, b.y);
 }
 
-fn smSampleT(gx : f32, gy : f32) -> f32 {
+/** Bilinear read of any cell-centered plane. */
+fn smSampleCell(base : u32, gx : f32, gy : f32) -> f32 {
   let a = smSpan(gx, SM_NX);
   let b = smSpan(gy, SM_NY);
   let i = u32(a.x);
   let j = u32(b.x);
-  let o = P_T + j * SM_NX + i;
+  let o = base + j * SM_NX + i;
   let s0 = mix(scal[o], scal[o + 1u], a.y);
   let s1 = mix(scal[o + SM_NX], scal[o + SM_NX + 1u], a.y);
   return mix(s0, s1, b.y);
+}
+
+fn smSampleT(gx : f32, gy : f32) -> f32 {
+  return smSampleCell(P_T, gx, gy);
 }
 
 /** Grid coordinates: vertical faces on integer x, horizontal faces on integer y. */
@@ -808,6 +826,105 @@ fn smVel(base : u32, p : vec2<f32>) -> vec2<f32> {
     smSampleU(base, g.x, g.y - 0.5),
     smSampleV(base, g.x - 0.5, g.y)
   );
+}
+
+/** The curl at an arbitrary point -- the gate on the sub-grid noise. */
+fn smCurlAt(p : vec2<f32>) -> f32 {
+  let g = smGrid(p);
+  return smSampleCell(P_CURL, g.x - 0.5, g.y - 0.5);
+}
+
+// --- curl noise --------------------------------------------------------------
+//
+// Mirrors the block of the same name in sim/smoke.ts, which carries the argument
+// for why a 2D solver needs this at all: there is no vortex stretching in two
+// dimensions, so the cascade runs backwards and nothing populates the scales
+// below a cell. This is the curl of a scalar potential, which is divergence-free
+// identically and can therefore be added downstream of the projection.
+//
+// Gradient noise rather than value noise, and that file carries the reason: the
+// derivative of value noise vanishes on every lattice plane, which draws a
+// visible square grid through a million tracers.
+
+/**
+ * Mirrors hash3(). Multiplied in u32, which wraps by definition, because that is
+ * exactly what Math.imul does to the same inputs -- so the two arms agree bit for
+ * bit and a tracer takes the same path on either.
+ */
+fn smHash3(i : i32, j : i32, k : i32) -> f32 {
+  let h = (u32(i) * 374761393u) ^ (u32(j) * 668265263u) ^ (u32(k) * 1442695041u);
+  return hash(h);
+}
+
+/** A lattice corner's direction, uniform on the circle. Mirrors the angle draw
+ *  in noiseSlice(); a table of eight would be half axis-aligned. */
+fn smGradDir(i : i32, j : i32, k : i32) -> vec2<f32> {
+  let a = smHash3(i, j, k) * 6.28318531;
+  return vec2<f32>(cos(a), sin(a));
+}
+
+/** One 2D slice of gradient noise, weighted. Mirrors noiseSlice(). */
+fn smNoiseSlice(i : i32, j : i32, k : i32, f : vec2<f32>, w : f32) -> vec2<f32> {
+  // Quintic fade: with gradient noise the derivative is the output, so it is the
+  // derivative that has to join smoothly across a lattice plane.
+  let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+  let du = 30.0 * f * f * (f - 1.0) * (f - 1.0);
+
+  let g00 = smGradDir(i,     j,     k);
+  let g10 = smGradDir(i + 1, j,     k);
+  let g01 = smGradDir(i,     j + 1, k);
+  let g11 = smGradDir(i + 1, j + 1, k);
+
+  let n00 = dot(g00, f);
+  let n10 = dot(g10, f - vec2<f32>(1.0, 0.0));
+  let n01 = dot(g01, f - vec2<f32>(0.0, 1.0));
+  let n11 = dot(g11, f - vec2<f32>(1.0, 1.0));
+
+  let b = n10 - n00;
+  let c = n01 - n00;
+  let d = n00 - n10 - n01 + n11;
+
+  let w00 = (1.0 - u.x) * (1.0 - u.y);
+  let w10 = u.x * (1.0 - u.y);
+  let w01 = (1.0 - u.x) * u.y;
+  let w11 = u.x * u.y;
+
+  // Second term is the fade-weighted mean corner direction, and it is the one
+  // that does not vanish on the lattice.
+  let mean = w00 * g00 + w10 * g10 + w01 * g01 + w11 * g11;
+  return w * (vec2<f32>(du.x * (b + d * u.y), du.y * (c + d * u.x)) + mean);
+}
+
+/** psi's x and y derivatives, analytically. Mirrors noiseGrad(). */
+fn smNoiseGrad(x : f32, y : f32, z : f32) -> vec2<f32> {
+  let i = i32(floor(x));
+  let j = i32(floor(y));
+  let k = i32(floor(z));
+  let f = vec2<f32>(x - floor(x), y - floor(y));
+  let fz = z - floor(z);
+  // Two slices lerped in time. The weight does not depend on x or y, so the
+  // derivative of the lerp is exactly the lerp of the derivatives.
+  let uz = fz * fz * fz * (fz * (fz * 6.0 - 15.0) + 10.0);
+  return smNoiseSlice(i, j, k, f, 1.0 - uz) + smNoiseSlice(i, j, k + 1, f, uz);
+}
+
+/** Divergence-free velocity from the potential. Mirrors curlNoise(). */
+fn smCurlNoise(p : vec2<f32>, t : f32, len : f32, vel : f32, rate : f32) -> vec2<f32> {
+  // The +512 keeps the lattice indices positive over the whole box, so neither
+  // arm has to have an opinion about negative indices.
+  let g = smNoiseGrad(p.x / len + 512.0, p.y / len + 512.0, t * rate);
+  let a = vel * SM_NOISE_NORM;
+  return vec2<f32>(g.y * a, -g.x * a);
+}
+
+/** Two octaves of it, for the tracers. Mirrors subgridNoise(). */
+fn smSubgrid(p : vec2<f32>, t : f32) -> vec2<f32> {
+  // Offset on the fine octave so the two do not share their extrema and leave a
+  // visible lattice in the sum; rate at 2^(2/3), which is the turnover vel/len
+  // at half the scale and 0.79 of the speed.
+  return smCurlNoise(p, t, SM_SUB_L, SM_SUB_V, SM_SUB_RATE)
+       + smCurlNoise(p + vec2<f32>(37.1, -19.3), t,
+                     SM_SUB_L * 0.5, SM_SUB_V * SM_SUB_FALLOFF, SM_SUB_RATE * 1.587);
 }
 
 /** How much of the source a point is in. Mirrors sourceWeight(). */
@@ -918,7 +1035,8 @@ fn smCommitScalar(@builtin(global_invocation_id) gid : vec3<u32>) {
   }
 
   let p = vec2<f32>(-SM_XR + (f32(i) + 0.5) * SM_H, -SM_YR + (f32(j) + 0.5) * SM_H);
-  var t = scal[P_TS + c] * exp(-SM_COOL * dt);
+  let advected = scal[P_TS + c];
+  var t = advected * exp(-SM_COOL * dt);
   t += (1.0 - t) * min(1.0, SM_SRC_RATE * dt) * smRamp() * smSource(p);
   let cheat = SM_CURSOR_HEAT * dt * max(0.0, params.grav - 1.0);
   if (cheat > 0.0) {
@@ -926,6 +1044,12 @@ fn smCommitScalar(@builtin(global_invocation_id) gid : vec3<u32>) {
     t += cheat * exp(-dot(d, d) / SM_CURSOR_R2);
   }
   scal[P_T + c] = t;
+  // Thermal expansion -- see EXPAND in sim/smoke.ts. Whatever the temperature
+  // did this step that advection did not do is heating, and heating is what a
+  // low-Mach fluid expands in response to. Taken as the difference rather than
+  // by re-deriving the source and cooling terms, so the cursor's heat is in for
+  // free and the two cannot drift apart.
+  scal[P_DIL + c] = (t - advected) * SM_EXPAND / max(dt, 1e-6);
 }
 
 @compute @workgroup_size(${WORKGROUP})
@@ -937,6 +1061,11 @@ fn smForces(@builtin(global_invocation_id) gid : vec3<u32>) {
   let dt = params.dt;
   let keep = exp(-SM_DRAG * dt);
   let k = SM_CURSOR_K * dt * params.grav;
+  // The ambient drift is specified as the speed it settles at, and under a
+  // linear drag that is f/DRAG -- so the force is DRAG times it. A force rather
+  // than a velocity so it goes in upstream of the projection and the fluid gets
+  // to answer it. See AMBIENT_V in sim/smoke.ts.
+  let amb = SM_AMB_V * SM_DRAG;
 
   var vel = svel[V_B + t];
 
@@ -947,6 +1076,7 @@ fn smForces(@builtin(global_invocation_id) gid : vec3<u32>) {
     var f = 0.5 * (cl + cr);
     let d = p - vec2<f32>(params.mx, params.my);
     f += params.cvel.x * k * exp(-dot(d, d) / SM_CURSOR_R2);
+    f += smCurlNoise(p, params.time, SM_AMB_L, amb, SM_AMB_RATE).x;
     vel.x = vel.x * keep + f * dt;
   }
 
@@ -960,6 +1090,7 @@ fn smForces(@builtin(global_invocation_id) gid : vec3<u32>) {
               + scal[P_CFY + smCell(i, min(j, SM_NY - 1u))]);
     let d = p - vec2<f32>(params.mx, params.my);
     f += params.cvel.y * k * exp(-dot(d, d) / SM_CURSOR_R2);
+    f += smCurlNoise(p, params.time, SM_AMB_L, amb, SM_AMB_RATE).y;
     vel.y = vel.y * keep + f * dt;
   }
 
@@ -973,8 +1104,13 @@ fn smDivergence(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = c % SM_NX;
   let j = c / SM_NX;
   let o = V_B + smFace(i, j);
+  // Divergence the field has, less the divergence it is supposed to have.
+  // Solving against the difference leaves the projected field carrying exactly
+  // the expansion term; with it zero this is the incompressible projection
+  // unchanged, which is what every cell that is not heating gets.
   scal[P_DIV + c] =
-    (svel[o + 1u].x - svel[o].x + svel[o + SM_SX].y - svel[o].y) / SM_H;
+    (svel[o + 1u].x - svel[o].x + svel[o + SM_SX].y - svel[o].y) / SM_H
+    - scal[P_DIL + c];
 }
 
 /**
@@ -1086,15 +1222,29 @@ fn smokeStep(i : u32, p : vec4<f32>, dt : f32) -> vec4<f32> {
   let speed = length(v);
   if (speed > SM_VMAX) { v = v * (SM_VMAX / speed); }
 
-  // Advection plus the sub-grid random walk -- rms sqrt(2 D dt) per axis, with
-  // the sqrt(3) turning that into the half-width of a uniform draw. See
-  // DIFFUSIVITY in sim/smoke.ts for why a tracer scheme needs one at all.
+  // Sub-grid turbulence, gated by how hard the resolved flow is turning here --
+  // see SUBGRID_V in sim/smoke.ts. Divergence-free by construction, which is
+  // what lets it be added downstream of the projection without putting the
+  // compression back that the projection just removed.
+  //
+  // Added to the position rather than to the reported velocity: the velocity
+  // slot is what the renderer tints by and the sidebar reads, and that is a
+  // statement about the fluid. The closure term moves the tracer; it is not
+  // something the fluid is doing.
+  let gate = SM_SUB_FLOOR
+    + (1.0 - SM_SUB_FLOOR) * min(1.0, abs(smCurlAt(p.xy)) / SM_SUB_OMEGA);
+  let sub = smSubgrid(p.xy, params.time) * gate;
+
+  // Advection, the sub-grid field, and the uncorrelated jitter under it -- rms
+  // sqrt(2 D dt) per axis, with the sqrt(3) turning that into the half-width of
+  // a uniform draw. See DIFFUSIVITY in sim/smoke.ts for what is left for it to
+  // do now that the curl noise carries the structure.
   let walk = sqrt(2.0 * SM_DIFFUSIVITY * dt) * 1.7320508;
   let jitter = vec2<f32>(
     hash(i * 3u + tick * 9781u) * 2.0 - 1.0,
     hash(i * 3u + 1u + tick * 6151u) * 2.0 - 1.0
   ) * walk;
-  let pos = p.xy + v * dt + jitter;
+  let pos = p.xy + (v + sub) * dt + jitter;
 
   if (pos.y > SM_YR || pos.y < -SM_YR || pos.x < -SM_XR || pos.x > SM_XR) {
     return smRespawn(i);
@@ -1392,9 +1542,161 @@ fn tmVs(@builtin(vertex_index) vi : u32) -> TMOut {
 @group(0) @binding(0) var hdr : texture_2d<f32>;
 @group(0) @binding(1) var<uniform> tparams : Params;
 
+// --- smoke as participating media --------------------------------------------
+//
+// Every other mode here is luminous. A galaxy, a plate of glowing grains and a
+// pair of colliding cores all genuinely emit, so accumulating additively into
+// the HDR buffer and curving the result is not a stylization -- it is what a
+// long exposure of a bright thing on a dark sky does, and the tonemap above is
+// the film.
+//
+// Smoke emits nothing. It is lit from outside, and the two things it does with
+// that light are scatter it and block it. Rendered additively it comes out as a
+// glowing plume in a vacuum, which is the single loudest reason the mode reads
+// as CG: not the shapes, which are the solver's and are correct, but the fact
+// that the dense parts get *brighter* where they should get more opaque, and
+// that a thick region shows no sign of having anything behind it.
+//
+// So the smoke branch below is a different picture built from the same buffer.
+// The alpha channel already carries exactly what is needed and always has: the
+// particle shader writes tint*w into rgb and w into alpha, so alpha is a column
+// density and rgb/alpha is the density-weighted mean dye colour, with the gain
+// cancelling out of the ratio. Nothing about the accumulation pass changes.
+//
+// What is missing is a light path, and in two dimensions there isn't one -- the
+// depth the light would travel through does not exist. The march below fakes it
+// in the plane: step from the pixel toward the key light, sum the density found
+// along the way, and attenuate. It is the standard 2D dodge and it works for the
+// reason most rendering dodges work, which is that the eye reads the *gradient*
+// -- lit rim, shadowed interior, soft falloff between -- and is not checking the
+// transport equation.
+
+/** Optical depth per unit of accumulated column density, along the view ray. */
+const SM_EXTINCT = 7.0;
+/**
+ * The same, along the light ray, per frame-height of travel.
+ *
+ * Not derivable from SM_EXTINCT and much larger than it, which is a real
+ * statement rather than a fudge factor: the view ray integrates a density that
+ * has *already* been integrated through the sprite, while the light ray
+ * integrates it across the screen. The number is large because it is standing in
+ * for a path through a third dimension that this mode does not have.
+ */
+const SM_SHADOW = 120.0;
+/** Toward the key light, in screen space with y up. */
+const SM_LIGHT = vec2<f32>(-0.55, 0.84);
+/**
+ * Shadow march: taps, first step as a fraction of the frame height, and the
+ * ratio between successive steps.
+ *
+ * Geometric rather than uniform, because the near field is what carries the
+ * shape. Fourteen taps at 1.4x from 0.002 reaches 0.55 of the frame height,
+ * which a uniform march at the same near resolution would need 275 taps to do.
+ * The far taps undersample and can miss a thin filament, but they are also the
+ * ones already attenuated by everything in front of them.
+ */
+const SM_TAPS = 14;
+const SM_STEP0 = 0.002;
+const SM_GROWTH = 1.4;
+/** Key and fill. Warm key, cool fill -- the fill stands in for the light the
+ *  smoke scatters between its own parts, which single scattering cannot see. */
+const SM_KEY = vec3<f32>(1.00, 0.95, 0.86);
+const SM_FILL = vec3<f32>(0.20, 0.25, 0.34);
+/**
+ * Chroma boost, and how far the result is lifted toward white before being used
+ * as an albedo.
+ *
+ * A palette entry is a hue, not a scattering albedo, and smoke's is high -- it
+ * scatters most of what reaches it, which is why it is pale. Used raw the plume
+ * renders as coloured glass, so some lift is not optional.
+ *
+ * The boost is, and it is a deliberate departure from the physics that the rest
+ * of this block is careful about. Three separate things desaturate the dye here
+ * and they compound: a pixel's tint is the density-weighted *mean* of whatever
+ * species landed on it and six overlapping ribbons average to grey; the lift
+ * pulls what survives toward white; and the composite is bg*trans + lit*(1-trans)
+ * over a neutral room, so thin smoke at trans 0.7 is seven parts grey wall. All
+ * three are correct and the sum of them is a monochrome plume — which is fine as
+ * a picture of smoke and useless as this mode, where the six ribbons are the
+ * entire reason species exist and the filter chips are the only way to watch a
+ * single material line fold.
+ *
+ * So chroma is scaled about the pixel's own luminance before the lift, which
+ * moves hue without moving brightness — the same separation the tonemap below
+ * makes for the opposite reason. At 1.6 a filament carrying mostly one dye reads
+ * as that dye and a well-mixed region still goes grey, which is the honest part:
+ * mixing really has happened there.
+ */
+const SM_SATURATE = 1.6;
+const SM_ALBEDO_LIFT = 0.25;
+
+/** The room the plume is in. */
+fn smokeRoom(px : vec2<f32>, dim : vec2<f32>) -> vec3<f32> {
+  // A vacuum is the one thing the background cannot be. Smoke is generally
+  // *lighter* than what is behind it, so against black it can only ever add
+  // light, and every part of the argument above collapses -- there is nothing
+  // for the opaque regions to occlude and no darker value for the shadowed side
+  // to fall to. A dim room, brighter toward the key, gives the plume both.
+  //
+  // Kept dim and kept falling off fast. A wide, bright gradient stops reading as
+  // a wall and starts reading as a light source in frame, which is a second
+  // subject competing with the plume; the falloff below puts most of the range in
+  // the corner nearest the key and leaves the rest of the box nearly as dark as
+  // every other mode's background.
+  let uv = px / dim;
+  let g = 1.0 - clamp(length(uv - vec2<f32>(0.18, 0.06)) * 1.15, 0.0, 1.0);
+  return mix(vec3<f32>(0.013, 0.015, 0.020), vec3<f32>(0.046, 0.047, 0.055), g * g);
+}
+
+/** Density between this pixel and the key light, as an optical depth. */
+fn smokeShadow(px : vec2<f32>, dim : vec2<f32>) -> f32 {
+  // Screen y runs down and SM_LIGHT is written with y up.
+  let dir = vec2<f32>(SM_LIGHT.x, -SM_LIGHT.y);
+  var step = SM_STEP0 * dim.y;
+  var dist = 0.0;
+  var tau = 0.0;
+  for (var n = 0; n < SM_TAPS; n = n + 1) {
+    dist = dist + step;
+    let s = px + dir * dist;
+    if (s.x < 0.0 || s.y < 0.0 || s.x >= dim.x || s.y >= dim.y) { break; }
+    // Steps measured in frame-heights, so the same plume casts the same shadow
+    // at every resolution.
+    tau = tau + textureLoad(hdr, vec2<i32>(s), 0).a * (step / dim.y);
+    step = step * SM_GROWTH;
+  }
+  return tau * SM_SHADOW;
+}
+
+/** Scattered radiance for one pixel of smoke, composited over the room. */
+fn smokeShade(px : vec2<f32>, acc : vec4<f32>, dim : vec2<f32>, bg : vec3<f32>) -> vec3<f32> {
+  let dens = acc.a;
+  // Most of the frame is empty, and this is what keeps the march off it.
+  if (dens < 1e-5) { return bg; }
+  let tint = acc.rgb / dens;
+  let lum = dot(tint, vec3<f32>(0.2126, 0.7152, 0.0722));
+  let chroma = max(vec3<f32>(0.0), mix(vec3<f32>(lum), tint, SM_SATURATE));
+  let albedo = mix(chroma, vec3<f32>(1.0), SM_ALBEDO_LIFT);
+  let lit = albedo * (SM_KEY * exp(-smokeShadow(px, dim)) + SM_FILL);
+  let trans = exp(-dens * SM_EXTINCT);
+  return bg * trans + lit * (1.0 - trans);
+}
+
 @fragment
 fn tmFs(in : TMOut) -> @location(0) vec4<f32> {
-  let c = textureLoad(hdr, vec2<i32>(in.pos.xy), 0).rgb;
+  let acc = textureLoad(hdr, vec2<i32>(in.pos.xy), 0);
+  var c = acc.rgb;
+
+  // Background sits underneath rather than being cleared into the accumulation
+  // buffer, so it never participates in the tonemap and the darkest particle
+  // still lifts off it. The smoke is the exception and has to be: there the
+  // background is part of the lit scene, seen *through* the medium rather than
+  // behind it, so it is composited in here and laid under nothing.
+  var bg = vec3<f32>(0.027, 0.035, 0.051);
+  if (tparams.mode == ${SMOKE}u) {
+    let dim = vec2<f32>(textureDimensions(hdr));
+    c = smokeShade(in.pos.xy, acc, dim, smokeRoom(in.pos.xy, dim));
+    bg = vec3<f32>(0.0);
+  }
 
   // Tonemap the *luminance* and carry the chroma through unchanged, rather than
   // curving each channel on its own.
@@ -1425,10 +1727,6 @@ fn tmFs(in : TMOut) -> @location(0) vec4<f32> {
   // which is what an overexposed source does -- without touching anything below.
   mapped = mix(mapped, vec3<f32>(lm), smoothstep(0.75, 1.0, lm));
 
-  // Background sits underneath rather than being cleared into the accumulation
-  // buffer, so it never participates in the tonemap and the darkest particle
-  // still lifts off it.
-  let bg = vec3<f32>(0.027, 0.035, 0.051);
   let lit = bg + clamp(mapped, vec3<f32>(0.0), vec3<f32>(1.0)) * (1.0 - bg);
 
   // The swap chain is a plain unorm format, so the sRGB transfer is ours to
@@ -1924,7 +2222,14 @@ export async function createWebGPUBackend(
       // the accumulation buffer. Under Reinhard that wants an exposure around 8
       // to land the mid-disc near a third and leave the core room to climb
       // without clipping.
-      paramData[13] = mode === SMOKE ? 5 : 8;
+      //
+      // The smoke is handed something else entirely. Its branch of the tonemap
+      // composites a *radiance* — lit smoke over a lit room, already bounded by
+      // the albedo and the key — rather than an unbounded accumulation, so the
+      // curve is there to roll off the brightest lit filaments and nothing else.
+      // Its old 5 was sized for the accumulation and would blow the composite to
+      // white.
+      paramData[13] = mode === SMOKE ? 2.0 : 8;
       // The whole camera, in one number — see cameraZoom() in backend.ts.
       paramData[14] = cameraZoom(mode, canvas.width / canvas.height, tilted);
       paramData[15] = count;
@@ -2129,6 +2434,7 @@ export async function createWebGPUBackend(
         phi: plane(2),
         div: plane(3),
         curl: plane(4),
+        dil: plane(7),
         vel,
         nx: smoke.NX,
         ny: smoke.NY,

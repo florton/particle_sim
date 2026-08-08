@@ -71,7 +71,34 @@ the grid's own density would be a 172-pixel-wide picture of a smooth blob.
 
 Semi-Lagrangian advection, Boussinesq buoyancy off an advected temperature field,
 vorticity confinement, and twenty red-black Gauss-Seidel sweeps for the projection, on
-a staggered MAC grid. The floor is solid and the other three sides are open. Species
+a staggered MAC grid. The floor is solid and the other three sides are open. Heated
+cells are allowed a non-zero target divergence, so the projection leaves the thermal
+expansion in rather than removing it as an error.
+
+Two things are added because the solve is two-dimensional and cannot produce them. In
+3D, turbulence runs a forward cascade — the vortex-stretching term (ω·∇)u tips and thins
+vortex tubes, and structure breaks downward through every scale. In 2D that term is
+identically zero; vorticity is a scalar that is merely advected, and the cascade runs
+*backwards*, small eddies merging into large persistent ones. So a 2D plume drifts
+toward a few big smooth counter-rotating blobs no matter how it is tuned, which is also
+why the confinement's usable window is so narrow: it is re-injecting at one scale what a
+missing term should deliver across all of them. The tracers therefore carry a curl-noise
+closure — two octaves of the curl of a value-noise potential, divergence-free by
+construction and gated by the local resolved vorticity — which supplies the scales the
+cascade would have populated. And the room gets a much larger, much slower version of the
+same field, so the column leans and wanders because something is pushing it rather than
+because a rounding error eventually broke a perfect symmetry.
+
+The renderer treats it as an absorbing medium rather than an emissive one, which is the
+other half of why it used to read as CG. Every other mode here genuinely emits, so
+accumulating additively into an HDR buffer and curving the result is what a long exposure
+of a bright thing on a dark sky does. Smoke emits nothing: it scatters light and blocks
+it. The accumulation buffer already carried what was needed — alpha is a column density
+and rgb/alpha the density-weighted mean dye colour — so the tonemap reads that as an
+optical depth, marches the density toward a key light for self-shadowing, and composites
+the result over a dim room instead of over a vacuum. Species
+
+
 is used differently from anywhere else in the set: it picks which of six slots across
 the source a tracer enters at, and a recycled tracer returns to its own, so six dye
 ribbons are injected side by side and never homogenize. Turn five chips off and one
@@ -215,6 +242,21 @@ path and the HDR target and runs no grid passes at all. The fluid's cost is fixe
 | 250,000 | 60 fps, 0% dropped | 60 fps, 0% dropped | vsync-capped |
 | 1,000,000 | 42 fps, 36.2% dropped | 49 fps, 21.7% dropped | **~3.4 ms** |
 
+The sub-grid noise and the shadow march do not measurably change that. Timed off the
+vsync clock instead — 120–150 `frame()` calls back to back at 1M, synced on a readback,
+1280×720 — smoke ran 22.2–23.5 ms against Chladni's 20.7–20.8 on a cold machine, so the
+whole fluid including both new passes lands **~1.5–2.5 ms**, at or under where it was
+before them.
+
+That range is wider than the effect being measured, and it is quoted as a range for a
+reason: repeating the same A/B once the machine had warmed gave Chladni 24.2–30.3 and
+smoke 23.0–25.3, which is a *negative* delta. The thermal drift is larger than the thing
+under test, so the honest claim is only that neither addition is expensive enough to
+find. That is not surprising for either — at 1M sprites both modes are render-bound, the
+noise is a few dozen ALU ops and sixteen trig calls on a pass that was already sampling
+the velocity field, and the shadow march early-outs on the ~85% of the frame with no
+smoke in it. A `timestamp-query` pass would settle it properly.
+
 The delta is from mean frame time — 1000/42 against 1000/49, so 23.8 ms against 20.4 —
 rather than from p50, which reads 16.7 ms in all four cells because it is vsync-capped
 and quantized to the refresh interval. At this grid size the fluid costs about what the
@@ -287,18 +329,109 @@ Four results from building it:
   | 8e-5 | 1.4 cells | closes the small pockets, filaments intact |
   | 5e-4 | 3.4 cells | featureless grey column |
 
-  8e-5, because the small pockets are the ones worth losing: a void a cell or two across
-  is a gap in the sampling of a fold rather than a feature of the flow, and in quantity a
-  field of them is the least pleasant thing the mode produces. The large voids are real
-  structure and survive, as do the ribbons, which are tens of cells long.
-- **The confinement's usable window is narrow.** Below about ε=2 it stops keeping up
-  with the diffusion the semi-Lagrangian advection applies and the plume goes laminar
-  within half a minute; by ε=12 it curls at every point. The default is 3, just above the
-  bottom of that window — smoke is mostly smooth sheets with structure at a few scales,
-  and a tightly wound vortex also evacuates its own core, so a high setting fills the
-  frame with small round voids each ringed by a bright filament. The slider tops out at
-  10 rather than at the point where the force saturates, because travel spent on
-  settings nobody should pick is travel it does not have where it matters.
+  It sat at 8e-5 for as long as this was the only sub-grid term, because the small
+  pockets are the ones worth losing and 8e-5 is the weakest setting that closes them.
+  But the trade is made of nothing but the walk's own limitation: it is isotropic and
+  uncorrelated, so the only thing it can do to a structure is blur it, and paying a
+  filament to close a void is the best a scheme with no spatial coherence can manage.
+  The curl noise below is the same missing physics with the coherence put back — it
+  fills a pocket by folding it shut — so this dropped back to 2e-5, where its whole job
+  is softening the interface at the scale of a single tracer. Both are kept: the noise
+  has structure and therefore leaves its own texture, and a little genuinely
+  uncorrelated jitter under it is what stops that texture reading as a pattern.
+- **Value noise draws a lattice through a million tracers, and no aggregate catches it.**
+  The curl-noise closure was built on value noise first — hash a scalar at each lattice
+  corner, fade between the scalars — because it is cheaper and the difference from
+  gradient noise looked cosmetic. It is not, and the reason is that everything here is a
+  *derivative* of the noise. Value noise's is `(b + d·u_y)·du_x`, and every fade that
+  joins smoothly to its neighbours has `du = 0` at both ends, so the x-derivative
+  vanishes identically on every vertical lattice plane and the y-derivative on every
+  horizontal one. The field stops pushing on a regular grid, tracers settle onto it, and
+  the sparse regions at the plume's edge reticulate into visible squares at the noise
+  wavelength — tens of pixels across, far too coarse for any diffusivity to blur without
+  erasing the filaments too. Gradient noise carries a second term in its derivative, the
+  fade-weighted mean of the four corner direction vectors, which is order one everywhere
+  including on the lattice. Mean |∇ψ| binned by distance to the nearest plane, on it to
+  mid-cell, 200k samples:
+
+  | | on plane | → | mid-cell |
+  | --- | --- | --- | --- |
+  | value noise | 0.298 | 0.322 0.357 0.385 0.410 0.429 0.444 0.456 0.457 | 0.465 |
+  | gradient noise | 0.928 | 0.930 0.926 0.922 0.916 0.909 0.910 0.895 0.879 | 0.855 |
+
+  A 36% dip on a regular grid, against a flat 8% the other way. The part worth keeping is
+  that **nothing aggregate would have found this**: the rms, the mean and the spectrum of
+  the value-noise field were all unremarkable, and the only statistic that shows it is one
+  binned against the lattice — which nobody computes unless they already suspect the
+  lattice. It was found by looking at the picture. `dumpNoise()` exists so the check is
+  cheap the next time.
+- **The confinement's floor was a statement about the picture, read as one about the
+  field.** The default was 3, and the note under it said ε=2 "goes laminar within half a
+  minute". Field enstrophy in 15 s windows over 90 s says otherwise — nothing decays at
+  either setting:
+
+  | ε | 0–15s | 15–30 | 30–45 | 45–60 | 60–75 | 75–90 |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 2 | 1.09 | 1.19 | 1.13 | 1.50 | 1.52 | 1.51 |
+  | 3 | 0.95 | 1.88 | 3.16 | 3.48 | 3.33 | 3.34 |
+
+  ε=2 simply sustains about a third of the vorticity, and with the tracers carrying no
+  structure of their own that third did not look like anything, so "laminar" was the word
+  for it. Now that the closure supplies the small scales, the confinement is only being
+  asked to stop the resolved eddies being smeared flat — and the thing it does badly is
+  the other job: at the plume's rim, where the strain is low and there is nothing to
+  sharpen, it winds isolated vortices up out of still fluid, each evacuating its own core
+  into a small spiral. Those are numerics, not flow, and they go with ε. The default is
+  now 2, which holds flat over the same 90 s (0.69, 0.93, 0.89, 1.02, 0.95, 0.78).
+- **The sub-grid gate was scaled off the peak vorticity, twice.** The curl noise is
+  gated by the local resolved |curl| so that quiescent fluid does not acquire a texture
+  with no cause. Saturating that ramp was set from the peak of the distribution the first
+  time (8) and from the wrong confinement setting the second (3) — and the distribution
+  is extremely long-tailed, so anything read off its top pins the gate at its floor
+  across the whole plume, which is a uniform noise field with an expensive multiply in
+  front of it. Over 55 sampled frames of a settled plume:
+
+  | ε | median | p75 | p90 | p99 | max |
+  | --- | --- | --- | --- | --- | --- |
+  | 3 | 0.38 | 1.12 | 2.23 | 5.00 | 16.36 |
+  | 2 | 0.12 | 0.37 | 0.92 | 4.55 | 16.12 |
+
+  The max is over a hundred times the median at ε=2. The setting is 1, between p75 and
+  p90 of the default: quiescent fluid comes out at 0.34, shear layers at 0.94, vortex
+  cores saturate. Those two rows also say the constant is coupled to the confinement
+  slider — the body of the distribution moves threefold between them while the tail
+  barely moves. That is left in on purpose, since a flow with more resolved vorticity
+  should carry more sub-grid motion, but it means the number is centred on the default
+  and only on the default.
+- **Thermal expansion estimated from the source strength is off by an order of
+  magnitude, because the source stops heating.** The first coefficient assumed fluid in
+  the source heats at SRC_RATE the whole time it is on. It does not — it saturates at
+  T=1 within a fraction of a second, and after that all the expansion lives on the thin
+  rim where cold entrained fluid first meets it. Measured, |E| is nonzero in 9.5% of
+  cells and reaches p99 0.014, p999 0.083, max 0.128: real, correctly placed, and worth
+  about 1% of the plume's volume flux, which nobody can see. The gas law gives the
+  coefficient properly — at constant pressure density goes as 1/T, so the expansion is
+  (dT/dt)/T and the number is order one rather than order a tenth. At 0.6 it is ~9% of
+  the volume flux, visible as a push at the root, and a held cursor now drives E to
+  about 2.4 under the pointer so the smoke expands away from it instead of merely
+  rising off it.
+- **Rendering smoke correctly renders the dye invisible.** Three things desaturate it
+  and they compound: a pixel's tint is the density-weighted mean of whatever species
+  landed on it and six overlapping ribbons average to grey, the albedo lift pulls what
+  survives toward white, and compositing `bg*trans + lit*(1-trans)` over a neutral room
+  makes thin smoke seven parts grey wall. Each step is right and the sum is a monochrome
+  plume — fine as a picture of smoke, useless as this mode, where the six ribbons are
+  the only reason species exist here. Chroma is scaled about the pixel's own luminance
+  before the lift, which moves hue without moving brightness. A filament carrying mostly
+  one dye reads as that dye; a well-mixed region still goes grey, which is honest,
+  because mixing really has happened there.
+- **The confinement's usable window is narrow.** By ε=12 it curls at every point — smoke
+  is mostly smooth sheets with structure at a few scales, and a tightly wound vortex also
+  evacuates its own core, so a high setting fills the frame with small round voids each
+  ringed by a bright filament. The slider tops out at 10 rather than at the point where
+  the force saturates, because travel spent on settings nobody should pick is travel it
+  does not have where it matters. The bottom of the window is set out above, and it moved
+  once the tracers stopped depending on confinement for their detail.
 - **Ambient haze to lift the voids off black does not survive the arithmetic.** The
   gaps read as holes partly because the fluid around the plume carries nothing at all,
   which is not physical — a room with a plume in it is not a vacuum. Drawing 18% of the
@@ -383,20 +516,47 @@ for (const d of g.dens) total += d * g.massScale;   // -> 0.18
 
 `dumpSmoke()` does the same for the fluid, and returns the projected velocity alongside
 the divergence the solve was handed — so the one claim worth checking about a pressure
-projection can be checked, rather than inferred from the picture looking like smoke:
+projection can be checked, rather than inferred from the picture looking like smoke.
+
+The target is not zero everywhere. `dil` is the thermal expansion the solve was *asked*
+to leave in the field, and `div` is the right-hand side it was handed, which is the raw
+divergence minus that target. So the field going in had `div + dil` and the field coming
+out should have `dil` — the residual to measure is the distance from the target, not the
+distance from zero:
 
 ```js
-const { div, vel, nx, ny, stride, h } = await window.__demo.backend.dumpSmoke();
+const { div, dil, vel, nx, ny, stride, h } = await window.__demo.backend.dumpSmoke();
 const U = (i, j) => vel[2 * (j * stride + i)];
 const V = (i, j) => vel[2 * (j * stride + i) + 1];
 
-let handed = 0, left = 0;
-for (const d of div) handed += Math.abs(d);
+let handed = 0, off = 0;
 for (let j = 0; j < ny; j++)
-  for (let i = 0; i < nx; i++)
-    left += Math.abs((U(i + 1, j) - U(i, j) + V(i, j + 1) - V(i, j)) / h);
+  for (let i = 0; i < nx; i++) {
+    const c = j * nx + i;
+    const got = (U(i + 1, j) - U(i, j) + V(i, j + 1) - V(i, j)) / h;
+    handed += Math.abs(div[c] + dil[c]);
+    off += Math.abs(got - dil[c]);
+  }
 
-1 - left / handed;   // -> ~0.98
+1 - off / handed;   // -> ~0.996
+```
+
+`__demo.smoke.dumpNoise(x, y, t)` returns the sub-grid curl-noise velocity at a point,
+which exists because the one bug this mode has had that was invisible to every aggregate
+was a lattice in that field. Bin the speed against distance to the nearest lattice plane
+and a flat profile is the pass condition:
+
+```js
+const { dumpNoise } = window.__demo.smoke;
+const band = new Float64Array(10), n = new Float64Array(10);
+for (let i = 0; i < 2e5; i++) {
+  const x = Math.random() * 40 - 20, y = Math.random() * 40 - 20;
+  const [vx, vy] = dumpNoise(x, y, Math.random() * 10);   // unit wavelength
+  const f = x - Math.floor(x);
+  const b = Math.min(9, Math.floor(Math.min(f, 1 - f) * 20));
+  band[b] += Math.hypot(vx, vy); n[b]++;
+}
+[...band].map((s, i) => (s / n[i]).toFixed(3));   // -> flat, ~0.93 down to ~0.86
 ```
 
 `__demo.smoke` is the CPU reference the WGSL mirrors, and it needs no GPU at all —
@@ -479,12 +639,21 @@ Bash on Windows, MSYS mangles a leading-slash value into a Windows path — use
 - **Twenty sweeps leaves about 1.7% of the mean divergence in the field**, which is a
   real approximation and not a rounding error — see the figures above. It is invisible
   at this scale and would not be in a simulation that had to conserve anything.
-- **The smoke still shows voids, and a 2D section is why.** Folding clean entrained
-  fluid into the plume genuinely does make holes — dye in a turbulent flow looks like
-  this. What a photograph of real smoke has and this does not is depth: a volume
-  superposes many layers along the view ray and fills its own gaps in, where a single
-  plane has nothing behind it. The diffusion above softens the rims, which is the part
-  that was fixable without a third dimension.
+- **The smoke is still a 2D section, and the two things it cannot have are still
+  missing.** There is no vortex stretching, so nothing here runs a real forward cascade —
+  the curl-noise closure supplies the *appearance* of the scales one would have
+  populated, not the physics, and it knows nothing about the flow except how hard to
+  push. And there is no depth: a volume superposes many layers along the view ray and
+  fills its own gaps in, where a single plane has nothing behind it. The self-shadowing
+  march fakes a light path across the screen because there is no path through the page to
+  integrate, which is why its extinction coefficient is unrelated to the view ray's and
+  has to be set by eye. Both are the same fix and it is a 3D solver.
+- **The absorbing renderer makes sparse regions grainier, not smoother.** Isolated
+  tracers at the plume's edge used to be a dim additive glow and now read as individual
+  specks, because a lone particle is a small opaque thing rather than a small amount of
+  light. It is arguably more honest — that is what a suspended soot grain does — but it
+  is a real change and it is most visible with five filter chips off, where a sixth of
+  the population is drawing the whole picture.
 - At 1M the GPU arm runs ~19–20 ms on this integrated GPU rather than a clean 16.7.
   500k on the count slider is a locked 60 fps with self-gravity and looks near-identical, since
   per-particle gain is normalized by population.
