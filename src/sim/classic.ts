@@ -40,7 +40,7 @@ export const SPECIES_SPREAD = 1.6;
  * receive it: the GPU backends read it into a uniform each frame, the CPU
  * baseline integrates with it, and the *seeding* uses it through circularSpeed()
  * — and seeding is reached via seedMode() in sim/modes.ts, which is generic over
- * all five modes and has no business carrying one mode's control on its
+ * every mode and has no business carrying one mode's control on its
  * signature. One value, read by everything that needs it, is the smaller thing.
  *
  * Only this mode has it. The self-gravitating disc's stability depends on the

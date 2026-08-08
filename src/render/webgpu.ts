@@ -21,12 +21,12 @@
 
 import {
   CAPTURE_K, CAPTURE_R2, CURSOR_SOFT2, CURSOR_SOFT2_HOLD, DISC_SHARE, DOMAIN,
-  GRID, G_CORE, G_CURSOR, G_CURSOR_HOLD, MESH_R, M_DISC, RADIAL_DAMP,
-  SOFT_CELLS, type Sim,
+  GRID, G_CORE, G_CURSOR, G_CURSOR_HOLD, HALO_A2, MESH_R, M_DISC, RADIAL_DAMP,
+  SOFT_CELLS, haloMass, type Sim,
 } from '../sim/world';
 import * as barred from '../sim/barred';
 import * as classic from '../sim/classic';
-import { BARRED, CHLADNI, CLASSIC, COLLISION, SELFGRAV, seedMode } from '../sim/modes';
+import { BARRED, CHLADNI, CLASSIC, COLLISION, HALO, SELFGRAV, seedMode } from '../sim/modes';
 import { PAIR_MASS, createPair, type PairState } from '../sim/pair';
 import { READBACK_MAX, cameraTilt, cameraZoom, type Backend } from './backend';
 
@@ -52,7 +52,8 @@ struct Params {
   exposure  : f32,
   vscale    : f32,
   // Live particle count, so the deposit pass never walks past the live
-  // population into the unused tail of the buffer when ?n= is below capacity.
+  // population into the unused tail of the buffer when the count slider is below
+  // capacity.
   pcount    : f32,
   // Radial-velocity retention per step — the disc's cooling rate, driven live
   // from the UI. See sim/world.ts RADIAL_DAMP for what it physically is.
@@ -80,6 +81,10 @@ struct Params {
   // 108, in the padding the struct's 8-byte alignment already reserved, so the
   // uniform buffer is still 112 bytes.
   gcore     : f32,
+  // Dark-halo mass of the HALO mode, driven live from the UI; 0 in every other
+  // mode, which is what lets the term stay in the force law unbranched. Pushes
+  // the struct to 116 bytes, padded to 120 by its vec2 alignment.
+  mhalo     : f32,
 };
 
 // Central bulge + halo. Fixed at the origin -- see the integrate entry point.
@@ -160,6 +165,13 @@ fn gridCoord(p : vec2<f32>) -> vec2<f32> {
  *  sim/world.ts; used by both the integrator and the seeding below. */
 fn coreF(q : f32) -> f32 {
   return G_CORE / (q * sqrt(q)) - 0.0025 / (q * q);
+}
+
+/** The dark halo, mirroring haloF() in sim/world.ts. Rigid background potential
+ *  with a flat outer rotation curve; params.mhalo is 0 outside the HALO mode, so
+ *  this contributes exactly nothing there and needs no branch to say so. */
+fn haloF(q : f32) -> f32 {
+  return params.mhalo / (q + ${HALO_A2});
 }
 
 /**
@@ -679,10 +691,15 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   // nothing left to re-form it. Anchoring the primary and demoting the cursor to
   // a weaker secondary mass turns interaction into tidal perturbation: the arms
   // stretch and wake, then relax back.
+  //
+  // Plus the dark halo in mode ${HALO}, which is this same force law with that one
+  // term switched on -- see M_HALO in sim/world.ts. Unlike the mesh below it acts
+  // on the outer field as well, because a flat rotation curve is a statement
+  // about what happens outside the disc.
   let dc = -p.xy;
   let dc2 = dot(dc, dc) + 0.004;
   let rc = sqrt(dc2);
-  let fc = coreF(dc2);
+  let fc = coreF(dc2) + haloF(dc2);
 
   // The disc's own gravity, gathered from the mesh the first three passes built.
   // This is the term that makes structure possible: it is the only one that
@@ -828,7 +845,7 @@ fn vs(@builtin(vertex_index) vi : u32, @builtin(instance_index) ii : u32) -> VSO
   // Fit the simulation to the viewport, applying the same factor to the position
   // as to the sprite.
   //
-  // One camera for all five modes. vscale is the whole of it -- how much clip
+  // One camera for every mode. vscale is the whole of it -- how much clip
   // space one simulation unit spans along the short axis -- and it is solved on
   // the CPU by cameraZoom() in backend.ts, which is where the framing decisions
   // live. Nothing here is per-mode, so a mode cannot drift into its own framing.
@@ -1003,9 +1020,10 @@ export async function createWebGPUBackend(
   });
   device.queue.writeBuffer(particleBuf, 0, sim.particles);
 
-  // 112 bytes: 22 scalars, then the two collision cores and their mass. Must
-  // match the Params struct exactly, vec2 alignment included.
-  const PARAM_BYTES = 112;
+  // 120 bytes: 22 scalars, the two collision cores and their mass, then the two
+  // live slider values and four bytes of tail padding the vec2 alignment forces.
+  // Must match the Params struct exactly, vec2 alignment included.
+  const PARAM_BYTES = 120;
   const paramBuf = device.createBuffer({
     size: PARAM_BYTES,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -1291,7 +1309,7 @@ export async function createWebGPUBackend(
       // The self-gravitating disc and the plate are tonemapped out of an HDR
       // buffer; the fixed-potential modes draw straight to the swap chain, which
       // is the renderer each of them was tuned against.
-      const hdr = mode === SELFGRAV || mode === CHLADNI;
+      const hdr = mode === SELFGRAV || mode === HALO || mode === CHLADNI;
 
       paramData[0] = dt;
       paramData[1] = mx;
@@ -1371,6 +1389,10 @@ export async function createWebGPUBackend(
       // same number also has to reach the CPU baseline and the seeding, neither
       // of which goes through a backend. See coreGravity() in sim/classic.ts.
       paramData[27] = classic.coreGravity();
+      // Same arrangement, for the same reason: the halo also has to reach the
+      // CPU baseline and the seeding. Zero outside the HALO mode -- see
+      // haloMass() in sim/world.ts.
+      paramData[28] = haloMass();
       device.queue.writeBuffer(paramBuf, 0, paramBytes);
 
       const enc = device.createCommandEncoder();
@@ -1379,14 +1401,16 @@ export async function createWebGPUBackend(
       const cellGroups = Math.ceil(CELLS / WORKGROUP);
       const cpass = enc.beginComputePass();
       cpass.setBindGroup(0, computeBind);
-      // Self-gravity, mode 0 only — every other mode is a prescribed field and
-      // the particles in them are not supposed to see each other at all.
+      // Self-gravity: the two disc modes only. Every other mode is a prescribed
+      // field and the particles in them are not supposed to see each other at
+      // all. The halo mode runs the identical solver — its halo is a background
+      // potential, not mass on the mesh, so nothing about this pass changes.
       //
       // Dispatches inside one compute pass are ordered and their writes are
       // visible to the next, so these four need no explicit barrier: the mesh
       // is fully deposited before it is solved, and fully solved before it is
       // sampled.
-      if (mode === SELFGRAV) {
+      if (mode === SELFGRAV || mode === HALO) {
         cpass.setPipeline(clearPipeline);
         cpass.dispatchWorkgroups(cellGroups);
         cpass.setPipeline(depositPipeline);

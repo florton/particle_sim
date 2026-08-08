@@ -21,7 +21,8 @@
 
 import {
   CAPTURE_K, CAPTURE_R2, CURSOR_SOFT2, CURSOR_SOFT2_HOLD, DOMAIN, G_CORE,
-  G_CURSOR, G_CURSOR_HOLD, MESH_R, M_DISC, RADIAL_DAMP, type Sim,
+  G_CURSOR, G_CURSOR_HOLD, HALO_A2, MESH_R, M_DISC, RADIAL_DAMP, haloMass,
+  type Sim,
 } from '../sim/world';
 import * as barred from '../sim/barred';
 import * as classic from '../sim/classic';
@@ -49,6 +50,9 @@ uniform float uGCursor;
 // coreGravity() in sim/classic.ts. A uniform rather than a baked constant
 // because it is the one term in that mode a slider moves.
 uniform float uGCore;
+// Dark-halo mass of the HALO mode, live from the UI and 0 everywhere else — see
+// M_HALO in sim/world.ts. A uniform for the same reason uGCore is.
+uniform float uHalo;
 uniform vec2 uC0;
 uniform vec2 uC1;
 uniform float uPMass;
@@ -238,7 +242,10 @@ void main() {
   vec2 dc = -aPos;
   float dc2 = dot(dc, dc) + 0.004;
   float rc = sqrt(dc2);
-  float fc = ${G_CORE} / (dc2 * rc) - 0.0025 / (dc2 * dc2);
+  // Core plus the dark halo — mirrors coreF() + haloF() in sim/world.ts. uHalo
+  // is 0 in mode ${SELFGRAV}, so the two disc modes share this line unbranched.
+  float fc = ${G_CORE} / (dc2 * rc) - 0.0025 / (dc2 * dc2)
+           + uHalo / (dc2 + float(${HALO_A2}));
 
   vec2 dm = uMouse - aPos;
   // Mass and softening ramp together — see sim/world.ts CURSOR_SOFT2_HOLD.
@@ -339,7 +346,7 @@ void main() {
   // See webgpu.ts: mono drops the palette for a single faintly warm white.
   vec3 base = uMono > 0.5 ? vec3(0.86, 0.89, 1.0) : PALETTE[sp];
   vTint = mix(base, vec3(1.0, 0.95, 0.88), vSpeed * 0.3);
-  // One camera for all five modes, solved on the CPU by cameraZoom() in
+  // One camera for every mode, solved on the CPU by cameraZoom() in
   // backend.ts — see the vs() entry point in webgpu.ts, which splits the same
   // number across the two axes the same way.
   float fx = uVScale / max(uAspect, 1.0);
@@ -444,6 +451,7 @@ export function createWebGL2Backend(
     uDt: gl.getUniformLocation(simProg, 'uDt'),
     uMouse: gl.getUniformLocation(simProg, 'uMouse'),
     uMode: gl.getUniformLocation(simProg, 'uMode'),
+    uHalo: gl.getUniformLocation(simProg, 'uHalo'),
     uTime: gl.getUniformLocation(simProg, 'uTime'),
     uWarp: gl.getUniformLocation(simProg, 'uWarp'),
     uWarpM: gl.getUniformLocation(simProg, 'uWarpM'),
@@ -583,6 +591,7 @@ export function createWebGL2Backend(
       // number also has to reach the CPU baseline and the seeding, neither of
       // which goes through a backend. See coreGravity() in sim/classic.ts.
       gl.uniform1f(simLoc.uGCore, classic.coreGravity());
+      gl.uniform1f(simLoc.uHalo, haloMass());
       gl.uniform2f(simLoc.uC0, pair.x0, pair.y0);
       gl.uniform2f(simLoc.uC1, pair.x1, pair.y1);
       gl.uniform1f(simLoc.uPMass, PAIR_MASS);

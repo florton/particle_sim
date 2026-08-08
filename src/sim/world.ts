@@ -55,6 +55,94 @@ export const M_DISC = 0.18;
 /** Nominal disc radius — the scale the species bands and the view are fitted to. */
 export const R_DISC = 0.65;
 /**
+ * Core radius of the dark halo, and the default and maximum of its mass — the
+ * HALO mode's slider, see sim/modes.ts. Zero everywhere else.
+ *
+ * The halo is a rigid background potential, not particles, and its one job is to
+ * be *extended* where the anchored core is a point. Rotation curve
+ * v_h^2 = M_HALO r^2 / (r^2 + a^2): rising like solid body inside a, flat at
+ * sqrt(M_HALO) outside it, which is the shape the observations that motivated
+ * dark matter actually have. That makes the acceleration factor M_HALO/(r^2+a^2)
+ * — one divide, no sqrt, and it drops out of the force law entirely at zero mass
+ * rather than needing a branch.
+ *
+ * a = 0.5 is a bit under R_DISC and about 2.3 disc scale lengths, which puts the
+ * turnover where the disc ends: on the default the halo contributes ~8% of v^2 at
+ * r = 0.2 and 49% at the disc edge, so it holds the outskirts and leaves the
+ * inner disc to make its own structure. Pull a down toward the disc and it stops
+ * being a halo and starts being a second bulge.
+ *
+ * M_HALO is in units of an asymptotic v^2, so the default 1.3 puts the flat part
+ * of the curve at v = 1.14, against 0.92 for the bare disc at its edge. The
+ * number is chosen on the share, not on the speed: 1.3 is halo and disc split
+ * almost exactly even at R_DISC, which is the line the literature draws between a
+ * maximal disc and a submaximal one, and it is the smallest default that puts
+ * this mode on the halo-dominated side of it. Below that the mode reads as mode 0
+ * with the outskirts propped up; here it arrives as its own galaxy, and 0.9 —
+ * where the halo is the junior partner at the disc edge — is one drag away.
+ *
+ * On the curve the disc is seeded and stepped on, circular speed falls 2.5%
+ * between r = 1.0 and r = 1.75 at this default, against 24% for the bare disc.
+ * The 0.9 default that preceded it was measured rather than derived: sampled on
+ * the GPU arm, mean orbital speed ran 1.17 at r = 1.0 to 1.09 at r = 1.75, a 7%
+ * decline where the same disc with no halo went 0.79 to 0.60. So the flat curve
+ * is confirmed at 0.9 and extrapolated here — raising M_HALO only flattens it
+ * further, which is the direction the measurement already establishes.
+ */
+export const HALO_A2 = 0.25;
+export const M_HALO = 1.3;
+export const M_HALO_MAX = 2.0;
+
+/**
+ * Live halo mass, driven by the slider in main.ts, and zero in every mode but
+ * HALO.
+ *
+ * Module state for the same reason classic.gCore is — see the note there. Three
+ * paths need this number and two have no channel to receive it: the GPU backends
+ * copy it into a uniform each frame, the CPU baseline integrates with it, and the
+ * *seeding* needs it through vCirc(), which is reached via seedMode() in
+ * sim/modes.ts and is generic over every mode.
+ *
+ * Which makes the ordering load-bearing in one place: setMode() in main.ts sets
+ * this before asking the backend to re-seed, because a disc seeded from a
+ * rotation curve it is not then integrated on starts off equilibrium and breathes
+ * until the damping catches it.
+ */
+let mHalo = 0;
+
+export function haloMass() {
+  return mHalo;
+}
+
+export function setHaloMass(v: number) {
+  mHalo = v;
+}
+
+/**
+ * Radial acceleration factor from the halo: multiply by the vector to the origin,
+ * exactly like coreF(). Takes the same softened q, so the two share an argument
+ * and the seeding cannot disagree with the integrator about either.
+ */
+export function haloF(q: number): number {
+  return mHalo / (q + HALO_A2);
+}
+
+/**
+ * The halo's share of v^2 at the disc edge — what the slider's label reports.
+ *
+ * The honest number for "how much halo is this", and the one the literature
+ * argues about: a maximal disc is one where the disc supplies most of the
+ * rotation at its own edge, and everything above ~50% here is a submaximal,
+ * halo-dominated galaxy. The r^2 cancels between the three terms, so this is just
+ * the ratio of the acceleration factors.
+ */
+export function haloShare(m = mHalo): number {
+  const q = R_DISC * R_DISC + 0.004;
+  const h = m / (q + HALO_A2);
+  const rest = coreF(q) + discEnclosed(R_DISC) / (R_DISC * R_DISC + SOFT * SOFT) ** 1.5;
+  return h / (h + rest);
+}
+/**
  * Exponential scale length of the disc.
  *
  * Real discs are exponential in surface density, and seeding one uniformly was
@@ -280,7 +368,11 @@ export function coreF(q: number): number {
 export function vCirc(r: number): number {
   const q = r * r + 0.004;
   const disc = discEnclosed(r) / (r * r + SOFT * SOFT) ** 1.5;
-  return r * Math.sqrt(Math.max(0, coreF(q) + disc));
+  // Plus the halo, which is zero outside the HALO mode — see haloF(). It has to
+  // be here and not only in the integrator: seeding a disc on the bare curve and
+  // then stepping it inside a halo is seeding it 20-30% slow, and the whole
+  // population falls inward together before settling.
+  return r * Math.sqrt(Math.max(0, coreF(q) + disc + haloF(q)));
 }
 
 /** Disc mass inside radius r, for the exponential profile seeded above. */
@@ -618,7 +710,11 @@ export function integrateCPU(
     const cy = -y;
     const dc2 = cx * cx + cy * cy + 0.004;
     const rc = Math.sqrt(dc2);
-    const fc = coreF(dc2);
+    // Core plus halo. The halo term is zero in every mode but HALO, so this is
+    // the same arithmetic the self-gravitating disc always did — and unlike the
+    // mesh it applies to the outer field too, which is where a flat rotation
+    // curve is actually visible.
+    const fc = coreF(dc2) + haloF(dc2);
 
     // The disc's own gravity. Inside the mesh box, gathered from the mesh;
     // outside it, the disc as a point mass at the origin — see the same branch

@@ -35,6 +35,11 @@ export const FRAME = [
   { r: 1.0,  cover: 0.0 }, // BARRED    -- recycled at the box edge, so the box
   { r: 1.82, cover: 0.0 }, // COLLISION -- pulled back to hold both tails
   { r: 1.0,  cover: 0.0 }, // CLASSIC   -- framed on the box, like the barred disc
+  // HALO -- deliberately mode 0's framing rather than its own. The halo spins the
+  // disc up and spreads it, so a frame fitted to what it settles at would be a
+  // different picture, and the point of the mode is the comparison with the one
+  // above it. Same camera, same seed, one term of difference.
+  { r: 0.70, cover: 0.0 },
 ] as const;
 
 /**
@@ -111,6 +116,41 @@ export function cameraZoom(mode: number, aspect: number, tilted = false): number
   // landscape one rather than by a second branch.
   const fill = 1 + cover * (Math.max(aspect, 1 / aspect) - 1);
   return fill / rv;
+}
+
+/**
+ * Window coordinates to simulation coordinates — the inverse of the camera
+ * above, and it lives here so it cannot drift from the forward transform.
+ *
+ * The cursor is a mass in the force law, not a UI element, so it has to be
+ * placed in simulation space. Reading clientX/innerWidth straight into a [-1, 1]
+ * pair is only correct when the camera is the identity, and it has not been one
+ * since the framing moved into cameraZoom(): at 16:9 in the self-gravitating
+ * disc that mapping puts the cursor's mass at 0.80x its apparent distance from
+ * center horizontally and 1.43x vertically, so the disc gets pulled toward
+ * somewhere the pointer is not — worst at the edges of the frame, exactly where
+ * a pull is most visible, and doubled again on the y axis with the inclined view
+ * on, where the disc is foreshortened and the pointer is not.
+ *
+ * Both arms and every mode go through this, because both arms and every mode go
+ * through cameraZoom() to get on screen.
+ */
+export function screenToSim(
+  clientX: number,
+  clientY: number,
+  width: number,
+  height: number,
+  mode: number,
+  tilted = false,
+): [number, number] {
+  const aspect = width / height;
+  const z = cameraZoom(mode, aspect, tilted);
+  const t = cameraTilt(mode, tilted);
+  // The same split of the one zoom number the vertex shaders make -- see vs() in
+  // render/webgpu.ts.
+  const fx = z / Math.max(aspect, 1);
+  const fy = z * Math.min(aspect, 1);
+  return [((clientX / width) * 2 - 1) / fx, -((clientY / height) * 2 - 1) / (fy * t)];
 }
 
 /** Uniform surface over the WebGPU and WebGL2 paths. */

@@ -1,15 +1,21 @@
 /**
- * The five simulations this demo can run, and how the shell should behave in
+ * The six simulations this demo can run, and how the shell should behave in
  * each.
  *
- * They are five different force laws, not five settings of one. Three of them
- * are galaxies that answer each other: CLASSIC is a disc of test particles in a
+ * They are six different force laws, not six settings of one. Four of them are
+ * galaxies that answer each other: CLASSIC is a disc of test particles in a
  * fixed potential and phase-mixes into a smooth annulus; BARRED drives the same
  * disc with a rotating quadrupole so resonance holds rings open; SELFGRAV gives
- * the disc mass of its own so it amplifies its own density contrast into arms.
- * Each keeps its own constants, its own seeding and its own branch of the
- * shaders — see sim/world.ts, sim/barred.ts, sim/classic.ts. Nothing is shared
- * between them but the buffer layout and the palette.
+ * the disc mass of its own so it amplifies its own density contrast into arms;
+ * HALO embeds that same self-gravitating disc in a rigid extended halo, which
+ * flattens its rotation curve and takes away its ability to run away with itself.
+ * The first three keep their own constants, their own seeding and their own
+ * branch of the shaders — see sim/world.ts, sim/barred.ts, sim/classic.ts.
+ * Nothing is shared between them but the buffer layout and the palette.
+ *
+ * HALO is the exception and is meant to be: it is SELFGRAV's branch, seeding and
+ * constants exactly, plus one term. A mode that differed in more than one thing
+ * would not be able to attribute the difference to the halo.
  *
  * This table is the only place the set is enumerated. The shaders switch on the
  * same integers, so the order here is load-bearing.
@@ -25,6 +31,7 @@ export const CHLADNI = 1;
 export const BARRED = 2;
 export const COLLISION = 3;
 export const CLASSIC = 4;
+export const HALO = 5;
 
 export interface ModeDef {
   /** Shown in the banner. */
@@ -53,6 +60,15 @@ export interface ModeDef {
    * to its own core, and the plate has no gravity at all.
    */
   gravity: boolean;
+  /**
+   * Whether the dark-halo slider means anything here.
+   *
+   * Only HALO, which is mode 0's force law with one term added — see M_HALO in
+   * sim/world.ts. The two are deliberately the same simulation otherwise, same
+   * constants and same seeding, so [M] between them is a controlled comparison
+   * and not two different galaxies.
+   */
+  halo: boolean;
   /** What [R] does, for the banner. */
   restart: string;
 }
@@ -63,6 +79,7 @@ export const MODES: readonly ModeDef[] = [
     hold: 'ramp',
     cooling: true,
     gravity: false,
+    halo: false,
     restart: 'restart',
   },
   {
@@ -70,6 +87,7 @@ export const MODES: readonly ModeDef[] = [
     hold: 'none',
     cooling: false,
     gravity: false,
+    halo: false,
     restart: 'restart',
   },
   {
@@ -77,6 +95,7 @@ export const MODES: readonly ModeDef[] = [
     hold: 'step',
     cooling: false,
     gravity: false,
+    halo: false,
     restart: 'reset',
   },
   {
@@ -84,6 +103,7 @@ export const MODES: readonly ModeDef[] = [
     hold: 'step',
     cooling: false,
     gravity: false,
+    halo: false,
     restart: 'flip spin',
   },
   {
@@ -91,7 +111,22 @@ export const MODES: readonly ModeDef[] = [
     hold: 'none',
     cooling: false,
     gravity: true,
+    halo: false,
     restart: 'reset',
+  },
+  {
+    // Mode 0 inside a dark halo, and identical to it in every other respect. The
+    // cooling slider stays live because the halo's claim is about what the disc
+    // can survive, and the cold end is where mode 0 stops surviving — a disc that
+    // rings as a single mass rather than making arms. Whether the halo fixes that
+    // is the question the mode poses; see the note on the slider in main.ts for
+    // what is measured and what is not.
+    label: 'orbital galaxy · dark halo',
+    hold: 'ramp',
+    cooling: true,
+    gravity: false,
+    halo: true,
+    restart: 'restart',
   },
 ];
 
@@ -137,6 +172,11 @@ export function seedMode(sim: Sim, mode: number, pair: PairState, seed = randomS
       scatterPlate(sim, sim.capacity, mulberry32(seed ^ 0x51));
       break;
     default:
+      // SELFGRAV and HALO both. Same seeder, and the halo reaches it through
+      // vCirc() rather than through an argument — so this is one disc placed on
+      // whichever rotation curve the mode it is being seeded for actually has.
+      // See haloMass() in sim/world.ts for why that is module state, and why
+      // main.ts has to set it before it calls this.
       seedGalaxy(sim, seed);
   }
 }
