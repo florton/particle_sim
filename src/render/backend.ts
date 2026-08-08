@@ -1,3 +1,4 @@
+import { CHLADNI } from '../sim/modes';
 import type { PairState } from '../sim/pair';
 
 /** Hard cap on a single readback window, in particles. */
@@ -30,16 +31,17 @@ export const READBACK_MAX = 4096;
  * so anything less shows an actual dark border rather than a fade.
  */
 export const FRAME = [
-  { r: 0.70, cover: 0.0 }, // SELFGRAV  -- disc light is inside r = 0.7
   { r: 1.0,  cover: 1.0 }, // CHLADNI   -- square plate; fills the window
   { r: 1.0,  cover: 0.0 }, // BARRED    -- recycled at the box edge, so the box
   { r: 1.82, cover: 0.0 }, // COLLISION -- pulled back to hold both tails
   { r: 1.0,  cover: 0.0 }, // CLASSIC   -- framed on the box, like the barred disc
-  // HALO -- deliberately mode 0's framing rather than its own. The halo spins the
-  // disc up and spreads it, so a frame fitted to what it settles at would be a
-  // different picture, and the point of the mode is the comparison with the one
-  // above it. Same camera, same seed, one term of difference.
+  // HALO -- deliberately the self-gravitating disc's framing rather than its own.
+  // The halo spins the disc up and spreads it, so a frame fitted to what it
+  // settles at would be a different picture, and the point of the mode is the
+  // comparison with the one after it. Same camera, same seed, one term of
+  // difference.
   { r: 0.70, cover: 0.0 },
+  { r: 0.70, cover: 0.0 }, // SELFGRAV  -- disc light is inside r = 0.7
 ] as const;
 
 /**
@@ -72,7 +74,7 @@ export const TILT_COS = 0.5;
  * cost it that and return nothing.
  */
 export function cameraTilt(mode: number, tilted: boolean): number {
-  return tilted && mode !== 1 ? TILT_COS : 1;
+  return tilted && mode !== CHLADNI ? TILT_COS : 1;
 }
 
 /**

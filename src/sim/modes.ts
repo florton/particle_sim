@@ -26,12 +26,12 @@ import * as classic from './classic';
 import type { PairState } from './pair';
 import { mulberry32, randomSeed, scatterPlate, seedGalaxy, type Sim } from './world';
 
-export const SELFGRAV = 0;
-export const CHLADNI = 1;
-export const BARRED = 2;
-export const COLLISION = 3;
-export const CLASSIC = 4;
-export const HALO = 5;
+export const CHLADNI = 0;
+export const BARRED = 1;
+export const COLLISION = 2;
+export const CLASSIC = 3;
+export const HALO = 4;
+export const SELFGRAV = 5;
 
 export interface ModeDef {
   /** Shown in the banner. */
@@ -42,8 +42,10 @@ export interface ModeDef {
    * `ramp` is the self-gravitating disc's: cursor mass, softening and a capture
    * drag ramp in together over a few hundred milliseconds, because a step change
    * in a term that large arrives as an impulse and shatters the disc. `step`
-   * is the fixed-potential version — two cursor masses, switched. See
-   * G_CURSOR_HOLD in sim/world.ts and G_CURSOR_HELD in sim/barred.ts.
+   * is the fixed-potential version — two cursor masses, switched, which those
+   * modes can afford because nothing in them amplifies its own density contrast.
+   * See G_CURSOR_HOLD in sim/world.ts, G_CURSOR_HELD in sim/barred.ts and
+   * G_CURSOR_HELD in sim/classic.ts. Only the plate has no pull at all.
    */
   hold: 'ramp' | 'step' | 'none';
   /** Whether the disc-cooling slider means anything here. */
@@ -63,10 +65,10 @@ export interface ModeDef {
   /**
    * Whether the dark-halo slider means anything here.
    *
-   * Only HALO, which is mode 0's force law with one term added — see M_HALO in
+   * Only HALO, which is SELFGRAV's force law with one term added — see M_HALO in
    * sim/world.ts. The two are deliberately the same simulation otherwise, same
-   * constants and same seeding, so [M] between them is a controlled comparison
-   * and not two different galaxies.
+   * constants and same seeding, and they are adjacent in the order above, so [M]
+   * between them is a controlled comparison and not two different galaxies.
    */
   halo: boolean;
   /** What [R] does, for the banner. */
@@ -74,14 +76,6 @@ export interface ModeDef {
 }
 
 export const MODES: readonly ModeDef[] = [
-  {
-    label: 'orbital galaxy · self-gravitating',
-    hold: 'ramp',
-    cooling: true,
-    gravity: false,
-    halo: false,
-    restart: 'restart',
-  },
   {
     label: 'Chladni plate · 6 frequencies',
     hold: 'none',
@@ -108,24 +102,35 @@ export const MODES: readonly ModeDef[] = [
   },
   {
     label: 'orbital galaxy · fixed potential',
-    hold: 'none',
+    hold: 'step',
     cooling: false,
     gravity: true,
     halo: false,
     restart: 'reset',
   },
   {
-    // Mode 0 inside a dark halo, and identical to it in every other respect. The
-    // cooling slider stays live because the halo's claim is about what the disc
-    // can survive, and the cold end is where mode 0 stops surviving — a disc that
-    // rings as a single mass rather than making arms. Whether the halo fixes that
-    // is the question the mode poses; see the note on the slider in main.ts for
-    // what is measured and what is not.
+    // The self-gravitating disc inside a dark halo, and identical to it in every
+    // other respect. The cooling slider stays live because the halo's claim is
+    // about what the disc can survive, and the cold end is where the bare disc
+    // stops surviving — a disc that rings as a single mass rather than making
+    // arms. Whether the halo fixes that is the question the mode poses; see the
+    // note on the slider in main.ts for what is measured and what is not.
     label: 'orbital galaxy · dark halo',
     hold: 'ramp',
     cooling: true,
     gravity: false,
     halo: true,
+    restart: 'restart',
+  },
+  {
+    // Last in the order, and reached from the halo above it: the comparison the
+    // pair exists for reads in that direction — show the galaxy, then take the
+    // halo away and watch it run away with itself.
+    label: 'orbital galaxy · self-gravitating',
+    hold: 'ramp',
+    cooling: true,
+    gravity: false,
+    halo: false,
     restart: 'restart',
   },
 ];

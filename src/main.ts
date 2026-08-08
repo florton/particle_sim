@@ -6,7 +6,7 @@ import {
 } from './sim/world';
 import * as barred from './sim/barred';
 import * as classic from './sim/classic';
-import { CHLADNI, COLLISION, HALO, MODES, MODE_COUNT } from './sim/modes';
+import { CHLADNI, CLASSIC, COLLISION, HALO, MODES, MODE_COUNT } from './sim/modes';
 import { createPair, pairSeparation, resetPair, stepPair } from './sim/pair';
 import { VirtualList } from './ui/list';
 import { speciesMask, toggleSpecies, filterLabel, countEffect, effectRuns } from './ui/state';
@@ -129,7 +129,7 @@ addEventListener('pointermove', (e) => {
 const backend = await selectBackend();
 counters.backend = `${backend.name} · ${backend.detail}`;
 
-// --- hold to pull ---------------------------------------------------------
+// --- drag to pull ---------------------------------------------------------
 //
 // In the self-gravitating disc, holding the pointer down ramps the cursor's mass
 // toward G_CURSOR_HOLD instead of switching it there. The ramp is the whole
@@ -144,9 +144,11 @@ counters.backend = `${backend.name} · ${backend.detail}`;
 // Release is faster than the ramp. Building the well is the interaction and
 // wants to feel deliberate; letting go should just let go.
 //
-// The fixed-potential modes switch between two cursor masses instead, and can:
-// nothing there amplifies its own density contrast, so an impulse stirs the disc
-// rather than collapsing it. See sim/modes.ts.
+// The fixed-potential modes — barred, collision and the original disc — switch
+// between two cursor masses instead, and can: nothing there amplifies its own
+// density contrast, so an impulse stirs the disc rather than collapsing it. Each
+// family has its own pair, because the two cursor masses only mean anything
+// against the core they are being weighed against. See sim/modes.ts.
 const GRAV_RAMP = 3.5; // e-folds per second, held
 const GRAV_RELEASE = 8; // e-folds per second, released
 let holding = false;
@@ -157,10 +159,24 @@ let grav = 1;
 const overUI = (t: EventTarget | null) =>
   t instanceof Element && !!t.closest('#sidebar, #hud, #banner');
 
+/**
+ * The switched cursor mass for the current mode — light while merely moving,
+ * heavy while the pointer is down.
+ *
+ * Mode-dependent because the number is a ratio against that mode's core, not an
+ * absolute: the original disc's cursor is half the barred disc's at rest and its
+ * held value is scaled to match. The ramping modes ignore this entirely and take
+ * `grav` on frame() instead.
+ */
+const cursorMass = (held: boolean) =>
+  mode === CLASSIC
+    ? (held ? classic.G_CURSOR_HELD : classic.G_CURSOR)
+    : (held ? barred.G_CURSOR_HELD : barred.G_CURSOR);
+
 function setHolding(next: boolean) {
   if (holding === next) return;
   holding = next;
-  backend.setCursorMass(holding ? barred.G_CURSOR_HELD : barred.G_CURSOR);
+  backend.setCursorMass(cursorMass(holding));
 }
 
 addEventListener('pointerdown', (e) => {
@@ -496,7 +512,7 @@ const modeLabel = () =>
 function refreshBanner() {
   banner.textContent =
     `${backend.name} compute · ${sim.count.toLocaleString()} particles · ${modeLabel()} — ` +
-    (MODES[mode].hold === 'none' ? '' : 'hold to pull · ') +
+    (MODES[mode].hold === 'none' ? '' : 'drag to pull · ') +
     `[M] mode · [B] compare · [R] ${MODES[mode].restart} · [C] ${mono ? 'color' : 'mono'}` +
     // The plate is always face-on, so offering it a view toggle would be
     // offering nothing -- see cameraTilt() in render/backend.ts.
@@ -533,15 +549,16 @@ function setArm(next: 'gpu' | 'baseline') {
 /**
  * The mode the page boots into.
  *
- * HALO rather than SELFGRAV, which is the mode above it plus one term. Both are
+ * HALO rather than SELFGRAV, which is the mode after it minus one term. Both are
  * the same disc and the same seeding, so this is not a change of subject — it is
  * a choice about which of the two is the picture and which is the comparison,
  * and the halo makes the better one: it flattens the rotation curve, so the
  * outer field turns as a wheel instead of falling off Keplerian, and it takes
  * away the disc's ability to run away with itself, so what is on screen after
- * two minutes still resembles what was on screen after ten seconds. [M] steps to
- * mode 0 to take the halo away, which is the direction the comparison reads in
- * anyway — you show the galaxy, then remove the thing holding it together.
+ * two minutes still resembles what was on screen after ten seconds. [M] steps
+ * straight to the bare disc to take the halo away, which is the direction the
+ * comparison reads in anyway — you show the galaxy, then remove the thing
+ * holding it together.
  *
  * Both backends construct themselves seeded for SELFGRAV, so booting elsewhere
  * costs one extra seed-and-upload at startup; setMode() at the bottom of this
@@ -568,6 +585,10 @@ function setMode(next: number) {
   // Which re-seeds — so the cursor goes back out of the force law until it is
   // aimed at the new population. See CURSOR_DEADZONE.
   disarmCursor();
+  // Unconditionally, because setHolding() is edge-triggered and the pointer is
+  // already released by the time we get here: without this the new mode keeps
+  // whichever family's rest mass the previous one left in the uniform.
+  backend.setCursorMass(cursorMass(holding));
   // The new mode brought its own species banding with it.
   refreshFilter();
   // The slider only means something to the self-gravitating disc; every other
@@ -598,8 +619,16 @@ function setMono(next: boolean) {
  *
  * Both arms are told, because the comparison is only worth anything if the two
  * are drawing the same picture.
+ *
+ * Inclined by default. A disc seen face-on in a widescreen window is a circle
+ * with the window's whole width left over either side of it; the same disc at 60
+ * degrees projects to an ellipse that fills it. It is also what a disc actually
+ * looks like — face-on is the special case, not the norm — so the default view is
+ * the honest one and [V] is there to flatten it out when the structure is what
+ * you want to read. See cameraZoom() in render/backend.ts for how the tilt turns
+ * into a wider picture rather than a shorter one.
  */
-let tilted = false;
+let tilted = true;
 function setTilt(next: boolean) {
   tilted = next;
   backend.setTilt(tilted);
@@ -664,6 +693,9 @@ applyCount(COUNT_DEFAULT);
 // world before the re-seed reads it through vCirc(). Everything else setMode()
 // does — the per-mode rows, the filter, the banner — was already needed here.
 setMode(mode);
+// And the camera. Both arms construct themselves face-on, so the default view
+// has to be pushed rather than assumed — see `tilted` above.
+setTilt(tilted);
 setArm('gpu');
 
 // Verification handle. Lets the sim be driven and inspected without relying on
@@ -718,7 +750,7 @@ function loop(now: number) {
     counters.entities = sim.count;
     counters.domNodes = list.liveNodes;
   } else {
-    baseline.frame(dt, mx, my, grav, holding ? barred.G_CURSOR_HELD : barred.G_CURSOR);
+    baseline.frame(dt, mx, my, grav, cursorMass(holding));
     counters.entities = baseline.count;
     counters.domNodes = baseline.domNodes;
   }

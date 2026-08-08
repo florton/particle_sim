@@ -216,7 +216,9 @@ void main() {
     float dm2c = dot(dmc2, dmc2) + 0.02;
     vec2 vv2 = aVel
       + dcc * fcc * uDt
-      + dmc2 * (${classic.G_CURSOR} / (dm2c * sqrt(dm2c))) * uDt;
+      // uGCursor rather than a constant — two cursor masses, switched on pointer
+      // down. See G_CURSOR_HELD in sim/classic.ts.
+      + dmc2 * (uGCursor / (dm2c * sqrt(dm2c))) * uDt;
 
     vec2 rdirc = dcc / rcc;
     vec2 vRadc = dot(vv2, rdirc) * rdirc;

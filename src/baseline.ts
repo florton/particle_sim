@@ -170,7 +170,7 @@ export class BaselineArm {
         barred.integrateCollisionCPU(this.sim, dt, mx, my, this.pair, cursorMass);
         break;
       case CLASSIC:
-        classic.integrateCPU(this.sim, dt, mx, my);
+        classic.integrateCPU(this.sim, dt, mx, my, cursorMass);
         break;
       default:
         integrateCPU(this.sim, dt, mx, my, this.cooling, grav);

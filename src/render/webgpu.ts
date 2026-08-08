@@ -236,7 +236,6 @@ const BD_RETURN_LO = ${barred.RETURN_LO};
 const BD_RETURN_HI = ${barred.RETURN_HI};
 const BD_CORE_FRAC = ${barred.CORE_FRAC};
 const BD_SPECIES_SPREAD = ${barred.SPECIES_SPREAD};
-const CL_G_CURSOR = ${classic.G_CURSOR};
 const CL_RADIAL_DAMP = ${classic.RADIAL_DAMP};
 
 /**
@@ -467,7 +466,10 @@ fn clsIntegrate(p : vec4<f32>, dt : f32) -> vec4<f32> {
 
   let dm = vec2<f32>(params.mx - p.x, params.my - p.y);
   let dm2 = dot(dm, dm) + 0.02;
-  let fm = CL_G_CURSOR / (dm2 * sqrt(dm2));
+  // params.gcur, not a constant: this mode switches between two cursor masses on
+  // pointer down, like the barred disc above -- see G_CURSOR_HELD in
+  // sim/classic.ts.
+  let fm = params.gcur / (dm2 * sqrt(dm2));
 
   var v = p.zw + dc * fc * dt + dm * fm * dt;
 

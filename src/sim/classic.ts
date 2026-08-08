@@ -19,6 +19,33 @@ import { BOUNCE, SPECIES_COUNT, STRIDE, type Sim } from './world';
 export const G_CORE = 0.55;
 /** Cursor mass — a fraction of the core, so it perturbs rather than destroys. */
 export const G_CURSOR = 0.1;
+/**
+ * Cursor mass while the pointer is held down. Switched rather than ramped, which
+ * this mode can afford for the same reason the barred disc can: the potential is
+ * prescribed and nothing here amplifies its own density contrast, so an impulse
+ * stirs the disc instead of collapsing it.
+ *
+ * Far under the core, and far under the barred disc's 0.75, because this mode has
+ * no way back. The barred disc recycles anything it throws past ESCAPE_R and
+ * returns it to its home radius; here the only restoring mechanism is radial
+ * damping, so whatever a pull takes out of the annulus stays out — and what it
+ * takes out first is the species/radius correlation the colour bands *are*.
+ *
+ * Measured against a 1.2 s pull at the disc edge, watched for six seconds after
+ * release. At 0.6 — comparable to the core, the regime the barred disc is tuned
+ * in — the disc was a featureless white blob before the pointer came up. At 0.3
+ * and at 0.2 it re-formed, but as one saturated annulus with the six colours
+ * mixed through it, so the filter chips carved nothing afterward and only [R]
+ * brought them back. At 0.15 the same pull opens the disc into a wide spiral of
+ * streams that is still visibly banded, and phase-mixes back to an annulus with
+ * its colours intact.
+ *
+ * Only 1.5x the resting mass, which sounds like nothing and is not: the disc is
+ * cold, on near-circular orbits, and has no self-gravity holding it together, so
+ * it responds to the entire perturbation rather than to the part that exceeds its
+ * own binding.
+ */
+export const G_CURSOR_HELD = 0.15;
 /** Terminal speed. */
 export const V_MAX = 3.0;
 /** Radial-velocity retention per step. Circularizes orbits without killing them. */
@@ -144,7 +171,13 @@ export function seedDisc(sim: Sim, rand: () => number) {
  * be a fair implementation, not a strawman: allocation-free, monomorphic, one
  * pass over contiguous memory.
  */
-export function integrateCPU(sim: Sim, dt: number, mx: number, my: number) {
+export function integrateCPU(
+  sim: Sim,
+  dt: number,
+  mx: number,
+  my: number,
+  gCursor = G_CURSOR,
+) {
   const p = sim.particles;
   const n = sim.count;
   const damp = 0.99995;
@@ -167,7 +200,7 @@ export function integrateCPU(sim: Sim, dt: number, mx: number, my: number) {
     const dx = mx - x;
     const dy = my - y;
     const dm2 = dx * dx + dy * dy + 0.02;
-    const fm = G_CURSOR / (dm2 * Math.sqrt(dm2));
+    const fm = gCursor / (dm2 * Math.sqrt(dm2));
 
     let vx = p[o + 2] + cx * fc * dt + dx * fm * dt;
     let vy = p[o + 3] + cy * fc * dt + dy * fm * dt;
