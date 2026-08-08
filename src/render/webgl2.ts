@@ -630,11 +630,16 @@ export function createWebGL2Backend(
       gl.uniform1f(drawLoc.uAspect, canvas.width / canvas.height);
       // Same size/gain curve as the WebGPU path — see webgpu.ts for the reasoning.
       gl.uniform1f(drawLoc.uSize, Math.min(0.006, Math.max(0.0018, 0.06 / Math.sqrt(count))));
-      gl.uniform1f(drawLoc.uGain, Math.min(1, Math.max(0.6, 200_000 / count)));
+      // Gain carries the tilt factor for the same reason the WebGPU path does:
+      // the inclined camera moves in by 1/t, which grows sprite area by 1/t^2
+      // against a disc whose screen area only grows by 1/t, so surface
+      // brightness would climb by 1/t and clip. See webgpu.ts.
+      const tilt = cameraTilt(mode, tilted);
+      gl.uniform1f(drawLoc.uGain, Math.min(1, Math.max(0.6, 200_000 / count)) * tilt);
       gl.uniform1i(drawLoc.uMask, mask);
       // The whole camera, in one number — see cameraZoom() in backend.ts.
       gl.uniform1f(drawLoc.uVScale, cameraZoom(mode, canvas.width / canvas.height, tilted));
-      gl.uniform1f(drawLoc.uTilt, cameraTilt(mode, tilted));
+      gl.uniform1f(drawLoc.uTilt, tilt);
       gl.uniform1f(drawLoc.uMono, mono ? 1 : 0);
       gl.uniform1i(drawLoc.uMode, mode);
 

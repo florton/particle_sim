@@ -722,7 +722,13 @@ function loop(now: number) {
   //
   // Or nowhere at all, until the pointer has been moved past the deadzone since
   // the last seeding — see CURSOR_DEADZONE above.
-  [mx, my] = cursorArmed
+  //
+  // Except on the plate, which is always armed. The cursor is not a mass there;
+  // it is the frequency dial, and parking it at CURSOR_PARK drives n and m to
+  // six million rather than out of range of a force law. The plate then renders
+  // a lattice far finer than a pixel, which reads as noise until the pointer is
+  // moved — a bug, not a neutral idle state.
+  [mx, my] = cursorArmed || mode === CHLADNI
     ? screenToSim(px, py, innerWidth, innerHeight, mode, tilted)
     : [CURSOR_PARK, CURSOR_PARK];
 

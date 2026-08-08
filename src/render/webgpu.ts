@@ -1335,7 +1335,18 @@ export async function createWebGPUBackend(
       // swap chain it has to double as the saturation guard again, clamped low
       // because the core reaches very high overdraw and additive blending clips
       // to white there long before the arms are lit.
-      paramData[5] = hdr ? 60_000 / count : Math.min(1, Math.max(0.3, 120_000 / count));
+      //
+      // Scaled by the foreshortening as well, because tilting is not
+      // brightness-neutral. The camera moves in by 1/t to keep the inclined disc
+      // filling the frame, which grows every sprite's *area* by 1/t^2 while the
+      // disc's own screen area only grows by 1/t -- the y extent is unchanged,
+      // only x spreads. So the same particles deposit 1/t times as much light
+      // per pixel: at 1M+ the core was already near the top of the tonemap
+      // face-on, and doubling it flattened the inner disc to white. Multiplying
+      // gain by t cancels it exactly, and the cancellation is independent of the
+      // zoom clamp above, so it holds at every window shape.
+      const tilt = cameraTilt(mode, tilted);
+      paramData[5] = (hdr ? 60_000 / count : Math.min(1, Math.max(0.3, 120_000 / count))) * tilt;
       paramU32[6] = mask;
       paramU32[7] = mode;
       elapsed += dt;
@@ -1381,7 +1392,7 @@ export async function createWebGPUBackend(
       // Slot 21 is the padding c0's 8-byte alignment reserves; tiltY lives there
       // for free. The collision's old camera pull-back, which used to occupy it,
       // is now FRAME[COLLISION].r in backend.ts.
-      paramData[21] = cameraTilt(mode, tilted);
+      paramData[21] = tilt;
       paramData[22] = pair.x0;
       paramData[23] = pair.y0;
       paramData[24] = pair.x1;
