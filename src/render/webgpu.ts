@@ -1232,7 +1232,7 @@ export async function createWebGPUBackend(
   /**
    * Re-seed the population for the current mode.
    *
-   * Deterministic CPU seeding and one upload, rather than a GPU kernel that
+   * CPU seeding and one upload, rather than a GPU kernel that
    * redraws radius from a hash: species is assigned *from* radius, and the
    * species buffer is the CPU's, so redrawing radii on the GPU independently of
    * it returns a disc with no color bands at all. It also keeps every mode's

@@ -2,7 +2,7 @@ import './style.css';
 import { Hud, type HudCounters } from './hud';
 import {
   createSim, integrateCPU, RADIAL_DAMP, SPECIES_NAMES, SPECIES_COLORS, G_CURSOR_HOLD,
-  withOuterField,
+  randomSeed, withOuterField,
 } from './sim/world';
 import * as barred from './sim/barred';
 import * as classic from './sim/classic';
@@ -29,7 +29,10 @@ const CAPACITY = withOuterField(DISC_COUNT);
 
 const canvas = document.getElementById('stage') as HTMLCanvasElement;
 const hud = new Hud(document.getElementById('hud')!);
-const sim = createSim(CAPACITY);
+// Fresh seed per load, so the disc the page boots into is a different draw each
+// time rather than the same frozen arrangement — see randomSeed() in
+// sim/world.ts. Same profile, same bands, different particles.
+const sim = createSim(CAPACITY, randomSeed());
 
 const counters: HudCounters = {
   entities: 0,

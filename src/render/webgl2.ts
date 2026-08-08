@@ -501,9 +501,10 @@ export function createWebGL2Backend(
   /**
    * Re-seed for the current mode and refill both ping-pong buffers.
    *
-   * The same deterministic CPU seeding the WebGPU path uses, so the two backends
-   * start every mode from the same state — see seedMode() in sim/modes.ts. A
-   * one-time cost on mode switch or restart, not per frame.
+   * The same CPU seeding the WebGPU path uses, so the two backends start every
+   * mode from the same distribution — a fresh seed per call, so not the same
+   * draw; see seedMode() in sim/modes.ts. A one-time cost on mode switch or
+   * restart, not per frame.
    */
   const reseedBuffers = () => {
     seedMode(sim, mode, pair);

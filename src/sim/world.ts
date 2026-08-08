@@ -224,8 +224,12 @@ export const CAPTURE_K = 9;
  *
  * The ramp (see main.ts) matters as much as the ceiling: applied instantly this
  * is a step change in the force law and the disc detonates instead of gathering.
+ * That is also the limit on raising it — 5x reaches noticeably further into the
+ * disc than 4x with the ramp still absorbing it, but the ceiling and the ramp
+ * rate are one setting, and pushing this much past 5 needs GRAV_RAMP softened to
+ * match or the hold starts arriving as an impulse again.
  */
-export const G_CURSOR_HOLD = 4;
+export const G_CURSOR_HOLD = 5;
 /** Terminal speed. */
 export const V_MAX = 3.0;
 /**
@@ -393,6 +397,21 @@ export function mulberry32(seed: number) {
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
+}
+
+/**
+ * A fresh 32-bit seed, so no two runs of a mode are the same disc.
+ *
+ * The seeding itself stays deterministic *given* a seed — everything below still
+ * draws from one mulberry32 stream in a fixed order, which is what keeps species
+ * banded by radius. Only the number handed in varies, so a restart is a
+ * different draw from the same distribution rather than a different galaxy: the
+ * profile, the bands and the rotation curve are unchanged, the particular
+ * arrangement is not. Pass an explicit seed to any of the seeders to get the old
+ * exactly-reproducible behaviour back for a measurement.
+ */
+export function randomSeed() {
+  return (Math.random() * 0x100000000) >>> 0;
 }
 
 /**

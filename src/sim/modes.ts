@@ -18,7 +18,7 @@
 import * as barred from './barred';
 import * as classic from './classic';
 import type { PairState } from './pair';
-import { mulberry32, scatterPlate, seedGalaxy, type Sim } from './world';
+import { mulberry32, randomSeed, scatterPlate, seedGalaxy, type Sim } from './world';
 
 export const SELFGRAV = 0;
 export const CHLADNI = 1;
@@ -108,9 +108,12 @@ export const MODE_COUNT = MODES.length;
  * load-bearing twice over, because a recycled particle returns to the radius its
  * species belongs at.
  *
- * Deterministic, so restarting is exactly reloading.
+ * Deterministic given a seed, and the seed is fresh each call — see randomSeed()
+ * in sim/world.ts. Restarting or switching modes therefore draws a new disc from
+ * the same distribution rather than replaying the one before it. Pass a seed
+ * explicitly to pin the initial conditions for a measurement.
  */
-export function seedMode(sim: Sim, mode: number, pair: PairState, seed = 0x9e3779b9) {
+export function seedMode(sim: Sim, mode: number, pair: PairState, seed = randomSeed()) {
   switch (mode) {
     case BARRED:
       barred.seedSpecies(sim, mulberry32(seed));

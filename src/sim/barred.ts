@@ -28,7 +28,7 @@ export const G_CURSOR = 0.2;
  * the regime where an encounter stops being a ripple and starts throwing tidal
  * tails and a bridge — Toomre's prograde-encounter result, driven by hand.
  */
-export const G_CURSOR_HELD = 0.6;
+export const G_CURSOR_HELD = 0.75;
 /** Terminal speed. */
 export const V_MAX = 3.0;
 /**
