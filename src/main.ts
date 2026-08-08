@@ -6,7 +6,7 @@ import {
 } from './sim/world';
 import * as barred from './sim/barred';
 import * as classic from './sim/classic';
-import { COLLISION, MODES, MODE_COUNT, SELFGRAV } from './sim/modes';
+import { CHLADNI, COLLISION, MODES, MODE_COUNT, SELFGRAV } from './sim/modes';
 import { createPair, pairSeparation, resetPair, stepPair } from './sim/pair';
 import { VirtualList } from './ui/list';
 import { speciesMask, toggleSpecies, filterLabel, countEffect, effectRuns } from './ui/state';
@@ -273,7 +273,10 @@ function refreshBanner() {
   banner.textContent =
     `${backend.name} compute · ${sim.count.toLocaleString()} particles · ${modeLabel()} — ` +
     (MODES[mode].hold === 'none' ? '' : 'hold to pull · ') +
-    `[M] mode · [B] compare · [R] ${MODES[mode].restart} · [C] ${mono ? 'color' : 'mono'}`;
+    `[M] mode · [B] compare · [R] ${MODES[mode].restart} · [C] ${mono ? 'color' : 'mono'}` +
+    // The plate is always face-on, so offering it a view toggle would be
+    // offering nothing -- see cameraTilt() in render/backend.ts.
+    (mode === CHLADNI ? '' : ` · [V] ${tilted ? 'face-on' : 'tilt'}`);
 }
 
 // Plain state, like `mode` and `mono` below: read imperatively at the few points
@@ -334,6 +337,23 @@ function setMono(next: boolean) {
   if (arm === 'gpu') refreshBanner();
 }
 
+/**
+ * Face-on or inclined. A camera, not a simulation setting — the world stays two
+ * dimensional and no force law can tell the difference. See TILT_COS in
+ * render/backend.ts for what the angle is and why filling a widescreen window
+ * is what it is for.
+ *
+ * Both arms are told, because the comparison is only worth anything if the two
+ * are drawing the same picture.
+ */
+let tilted = false;
+function setTilt(next: boolean) {
+  tilted = next;
+  backend.setTilt(tilted);
+  baseline.setTilt(tilted);
+  if (arm === 'gpu') refreshBanner();
+}
+
 function restart() {
   if (mode === COLLISION) {
     restartCollision();
@@ -364,6 +384,7 @@ addEventListener('keydown', (e) => {
   if (e.key === 'm' || e.key === 'M') setMode((mode + 1) % MODE_COUNT);
   if (e.key === 'r' || e.key === 'R') restart();
   if (e.key === 'c' || e.key === 'C') setMono(!mono);
+  if (e.key === 'v' || e.key === 'V') setTilt(!tilted);
 });
 
 function fit() {

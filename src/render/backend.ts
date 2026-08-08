@@ -38,22 +38,79 @@ export const FRAME = [
 ] as const;
 
 /**
+ * Inclination of the tilted view, as the foreshortening factor cos(tilt).
+ *
+ * 0.5 is a 60-degree inclination. Not picked for the round number: a disc seen
+ * at inclination i projects to an ellipse cos(i) as tall as it is wide, so it
+ * exactly fills a window of aspect 1/cos(i). At 0.5 that is 2:1, which covers
+ * the common widescreen shapes -- 16:9 and 21:9 sit either side of it and the
+ * clamp in cameraZoom() takes up the difference.
+ *
+ * This is the honest version of a trick the fixed-potential disc used to play.
+ * That mode scaled x independently of y, so its circular orbits drew as an
+ * ellipse and happened to fill a wide window; it looked right and was a lie
+ * about the physics, and the shape it produced is the shape an inclined disc
+ * actually has. Same picture, different reason -- and now it is a view rather
+ * than a distortion, so it can be turned off.
+ *
+ * M31 sits at about 77 degrees, so 60 is a conservative reading of a real disc.
+ */
+export const TILT_COS = 0.5;
+
+/**
+ * Vertical foreshortening for a mode: 1 face-on, TILT_COS inclined.
+ *
+ * The plate never tilts. It is a physical square with a hard boundary, seen from
+ * directly above -- the whole subject is the standing-wave pattern on its
+ * surface, and an inclined square is just a smaller square with a perspective
+ * excuse. It is also the one mode already filling the window, so a tilt would
+ * cost it that and return nothing.
+ */
+export function cameraTilt(mode: number, tilted: boolean): number {
+  return tilted && mode !== 1 ? TILT_COS : 1;
+}
+
+/**
  * Camera zoom for a mode in a window of this aspect ratio, in clip units per
  * simulation unit along the *short* axis.
  *
- * The only thing that varies is the aspect ratio, so the framing is identical at
- * every resolution with the same window shape -- a 1280x720 laptop and a 4K
- * panel compose the same picture. Both backends call this and hand the result to
- * their vertex shader as a single number; see the entry points there for how the
- * two axes divide it up.
+ * The only thing that varies is the aspect ratio and the tilt, so the framing is
+ * identical at every resolution with the same window shape -- a 1280x720 laptop
+ * and a 4K panel compose the same picture. Both backends call this and hand the
+ * result to their vertex shader as a single number; see the entry points there
+ * for how the two axes divide it up.
  */
-export function cameraZoom(mode: number, aspect: number): number {
+export function cameraZoom(mode: number, aspect: number, tilted = false): number {
   const { r, cover } = FRAME[mode] ?? FRAME[0];
+  const t = cameraTilt(mode, tilted);
+
+  // What the mode now occupies vertically. Tilting alone would only make the
+  // subject shorter inside an unchanged frame -- more empty space, not less --
+  // so the fit has to follow it down: fit r*t rather than r and the camera moves
+  // in by 1/t, which is what turns the foreshortening into a wider picture
+  // instead of a smaller one.
+  //
+  // Clamped because past a point the foreshortened subject is wider than the
+  // window and filling the height would crop the sides. At TILT_COS = 0.5 the
+  // clamp binds below aspect 2 and does nothing above it, so a 16:9 window fills
+  // edge to edge horizontally with a hair of margin top and bottom, and a 21:9
+  // one fills vertically with a hair at the sides. Neither letterboxes.
+  //
+  // max(aspect, 1) rather than aspect, because on a *portrait* window the
+  // horizontal fit is what binds and a tilt cannot help: foreshortening only
+  // ever shortens the axis that already had room to spare. Written with the bare
+  // aspect this clamp reads 1/0.667 and pulls the camera back until the subject
+  // is two thirds the size it should be — measured at 44% of frame height
+  // falling to 22% when the tilt came on, which is exactly backwards. With the
+  // max, a portrait window solves to r whether tilted or not, so the toggle is a
+  // no-op there rather than a regression.
+  const rv = Math.max(r * t, r / Math.max(aspect, 1));
+
   // max(a, 1/a) is the zoom that takes a short-side fit to a cover fit, and it is
   // written this way so a portrait window is handled by the same expression as a
   // landscape one rather than by a second branch.
   const fill = 1 + cover * (Math.max(aspect, 1 / aspect) - 1);
-  return fill / r;
+  return fill / rv;
 }
 
 /** Uniform surface over the WebGPU and WebGL2 paths. */
@@ -113,6 +170,13 @@ export interface Backend {
    */
   /** Drop the species palette and render luminance only. */
   setMono?(mono: boolean): void;
+  /**
+   * Switch between face-on and the inclined view.
+   *
+   * Purely a camera: the simulation is two-dimensional and stays that way, and
+   * nothing downstream of the vertex shader knows this happened. See TILT_COS.
+   */
+  setTilt(tilted: boolean): void;
   reset(): void;
   /**
    * Advance one step. `grav` scales the cursor's mass — 1 is the passive

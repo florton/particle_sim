@@ -27,7 +27,7 @@ import * as barred from '../sim/barred';
 import * as classic from '../sim/classic';
 import { BARRED, CHLADNI, CLASSIC, COLLISION, SELFGRAV, seedMode } from '../sim/modes';
 import { PAIR_MASS, createPair, type PairState } from '../sim/pair';
-import { cameraZoom, type Backend } from './backend';
+import { cameraTilt, cameraZoom, type Backend } from './backend';
 
 const SIM_VS = `#version 300 es
 precision highp float;
@@ -311,6 +311,8 @@ uniform int uMask;
 uniform float uVScale;
 uniform float uMono;
 uniform int uMode;
+// Vertical foreshortening of the inclined view — see cameraTilt in backend.ts.
+uniform float uTilt;
 
 // Mirrors SPECIES_COLORS in sim/world.ts and PALETTE in webgpu.ts.
 const vec3 PALETTE[6] = vec3[6](
@@ -342,9 +344,11 @@ void main() {
   // number across the two axes the same way.
   float fx = uVScale / max(uAspect, 1.0);
   float fy = uVScale * min(uAspect, 1.0);
+  // Inclination on the disc's y only, not the quad's — the disc tilts, the
+  // stars in it stay round. See the vs() entry point in webgpu.ts.
   gl_Position = vec4(
     (aPos.x + aCorner.x * uSize) * fx,
-    (aPos.y + aCorner.y * uSize) * fy,
+    (aPos.y * uTilt + aCorner.y * uSize) * fy,
     0.0, 1.0
   );
 }`;
@@ -463,6 +467,7 @@ export function createWebGL2Backend(
     uVScale: gl.getUniformLocation(drawProg, 'uVScale'),
     uMono: gl.getUniformLocation(drawProg, 'uMono'),
     uMode: gl.getUniformLocation(drawProg, 'uMode'),
+    uTilt: gl.getUniformLocation(drawProg, 'uTilt'),
   };
 
   const tf = gl.createTransformFeedback()!;
@@ -480,6 +485,7 @@ export function createWebGL2Backend(
   let elapsed = 0;
   let cooling = RADIAL_DAMP;
   let mono = false;
+  let tilted = false;
   let cursorMass = barred.G_CURSOR;
   // Replaced by setPair() before collision mode is ever entered.
   let pair: PairState = createPair();
@@ -539,6 +545,10 @@ export function createWebGL2Backend(
 
     setMono(v: boolean) {
       mono = v;
+    },
+
+    setTilt(v: boolean) {
+      tilted = v;
     },
 
     setCursorMass(m: number) {
@@ -611,7 +621,8 @@ export function createWebGL2Backend(
       gl.uniform1f(drawLoc.uGain, Math.min(1, Math.max(0.6, 200_000 / count)));
       gl.uniform1i(drawLoc.uMask, mask);
       // The whole camera, in one number — see cameraZoom() in backend.ts.
-      gl.uniform1f(drawLoc.uVScale, cameraZoom(mode, canvas.width / canvas.height));
+      gl.uniform1f(drawLoc.uVScale, cameraZoom(mode, canvas.width / canvas.height, tilted));
+      gl.uniform1f(drawLoc.uTilt, cameraTilt(mode, tilted));
       gl.uniform1f(drawLoc.uMono, mono ? 1 : 0);
       gl.uniform1i(drawLoc.uMode, mode);
 

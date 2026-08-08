@@ -30,6 +30,7 @@ import * as barred from './sim/barred';
 import * as classic from './sim/classic';
 import { BARRED, CHLADNI, CLASSIC, COLLISION } from './sim/modes';
 import { createPair, type PairState } from './sim/pair';
+import { cameraTilt, cameraZoom } from './render/backend';
 
 /** Even this is generous — 5000 absolutely-positioned nodes is already a lot. */
 export const BASELINE_COUNT = 5_000;
@@ -38,6 +39,7 @@ const BASELINE_ROWS = 400;
 export class BaselineArm {
   private cooling = RADIAL_DAMP;
   private mono = false;
+  private tilted = false;
   private layer: HTMLElement;
   private nodes: HTMLElement[] = [];
   private listHost: HTMLElement;
@@ -103,6 +105,11 @@ export class BaselineArm {
   /** Mirrors the GPU arm's cooling control, so the two stay comparable. */
   setCooling(v: number) {
     this.cooling = v;
+  }
+
+  /** Mirrors the GPU arm's view toggle, so the two arms frame alike. */
+  setTilt(v: boolean) {
+    this.tilted = v;
   }
 
   /** Mirrors the GPU arm's palette toggle. */
@@ -174,13 +181,28 @@ export class BaselineArm {
     const h = innerHeight;
     const p = this.sim.particles;
 
+    // The same camera the GPU arm uses, arithmetic for arithmetic.
+    //
+    // This used to map straight onto innerWidth/innerHeight, which stretches x
+    // and y independently and draws every circular orbit as an ellipse. That was
+    // survivable while the GPU arm did the same thing, and stopped being
+    // survivable when it started framing properly: the two arms were then
+    // drawing different shapes, and a comparison whose halves disagree about the
+    // picture is not measuring what it claims to. The cost here is four
+    // multiplies outside the loop -- nothing that could flatter this arm.
+    const a = w / h;
+    const z = cameraZoom(this.mode, a, this.tilted);
+    const t = cameraTilt(this.mode, this.tilted);
+    const fx = (z / Math.max(a, 1)) * 0.5;
+    const fy = (z * Math.min(a, 1)) * 0.5 * t;
+
     // The classic mistake: writing layout-triggering properties per node, per
     // frame. Each assignment invalidates layout for the whole layer.
     for (let i = 0; i < BASELINE_COUNT; i++) {
       const o = i * STRIDE;
       const node = this.nodes[i];
-      node.style.left = ((p[o] * 0.5 + 0.5) * w).toFixed(1) + 'px';
-      node.style.top = ((-p[o + 1] * 0.5 + 0.5) * h).toFixed(1) + 'px';
+      node.style.left = ((p[o] * fx + 0.5) * w).toFixed(1) + 'px';
+      node.style.top = ((-p[o + 1] * fy + 0.5) * h).toFixed(1) + 'px';
     }
 
     // And the other classic mistake: rebuilding the list markup every frame.

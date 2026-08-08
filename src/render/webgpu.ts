@@ -28,7 +28,7 @@ import * as barred from '../sim/barred';
 import * as classic from '../sim/classic';
 import { BARRED, CHLADNI, CLASSIC, COLLISION, SELFGRAV, seedMode } from '../sim/modes';
 import { PAIR_MASS, createPair, type PairState } from '../sim/pair';
-import { READBACK_MAX, cameraZoom, type Backend } from './backend';
+import { READBACK_MAX, cameraTilt, cameraZoom, type Backend } from './backend';
 
 const WORKGROUP = 64;
 const CELLS = GRID * GRID;
@@ -66,9 +66,10 @@ struct Params {
   grav      : f32,
   // Cursor mass in the fixed-potential modes, switched rather than ramped.
   gcur      : f32,
-  // 4 bytes of padding here, reserved by c0's 8-byte alignment. Camera framing
-  // rides on vscale above -- see FIT in backend.ts.
-  //
+  // Vertical foreshortening of the inclined view: 1 face-on, TILT_COS tilted.
+  // Lands in the 4 bytes of padding c0's 8-byte alignment already reserved, so
+  // it is free -- the struct is still 112 bytes. See cameraTilt in backend.ts.
+  tiltY     : f32,
   // The two colliding cores, solved on the CPU -- see sim/pair.ts.
   c0        : vec2<f32>,
   c1        : vec2<f32>,
@@ -846,9 +847,15 @@ fn vs(@builtin(vertex_index) vi : u32, @builtin(instance_index) ii : u32) -> VSO
   let s = rparams.vscale;
   let fx = s / max(a, 1.0);
   let fy = s * min(a, 1.0);
+
+  // Inclination. The disc's y is foreshortened; the quad's own y is not, so a
+  // particle stays a round dot rather than becoming a squashed one -- the disc
+  // is being tilted, not the stars in it. vscale has already been solved against
+  // the same factor, so the foreshortened disc fills the frame instead of
+  // shrinking inside it. See cameraZoom in backend.ts.
   out.pos = vec4<f32>(
     (p.x + corner.x * size) * fx,
-    (p.y + corner.y * size) * fy,
+    (p.y * rparams.tiltY + corner.y * size) * fy,
     0.0, 1.0
   );
   out.uv = corner;
@@ -1049,6 +1056,7 @@ export async function createWebGPUBackend(
   let mode = SELFGRAV;
   let cooling = RADIAL_DAMP;
   let mono = false;
+  let tilted = false;
   let elapsed = 0;
   let cursorMass = barred.G_CURSOR;
   // Replaced by setPair() before collision mode is ever entered; seeded here so
@@ -1262,6 +1270,10 @@ export async function createWebGPUBackend(
       mono = v;
     },
 
+    setTilt(v: boolean) {
+      tilted = v;
+    },
+
     setCursorMass(m: number) {
       cursorMass = m;
     },
@@ -1338,7 +1350,7 @@ export async function createWebGPUBackend(
       // without clipping.
       paramData[13] = 8;
       // The whole camera, in one number — see cameraZoom() in backend.ts.
-      paramData[14] = cameraZoom(mode, canvas.width / canvas.height);
+      paramData[14] = cameraZoom(mode, canvas.width / canvas.height, tilted);
       paramData[15] = count;
       paramData[16] = cooling;
       // Five orders of magnitude below a typical occupied cell.
@@ -1346,9 +1358,10 @@ export async function createWebGPUBackend(
       paramData[18] = mono ? 1 : 0;
       paramData[19] = grav;
       paramData[20] = cursorMass;
-      // 21 is padding: c0 below is a vec2 and has to start 8-byte aligned, so
-      // the slot the collision's camera pull-back used to occupy is unaddressable
-      // anyway. That pull-back is now FRAME[COLLISION].r in backend.ts.
+      // Slot 21 is the padding c0's 8-byte alignment reserves; tiltY lives there
+      // for free. The collision's old camera pull-back, which used to occupy it,
+      // is now FRAME[COLLISION].r in backend.ts.
+      paramData[21] = cameraTilt(mode, tilted);
       paramData[22] = pair.x0;
       paramData[23] = pair.y0;
       paramData[24] = pair.x1;
