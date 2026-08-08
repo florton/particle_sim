@@ -26,7 +26,7 @@ import {
 } from '../sim/world';
 import * as barred from '../sim/barred';
 import * as classic from '../sim/classic';
-import { BARRED, CHLADNI, CLASSIC, COLLISION, SELFGRAV, seedMode } from '../sim/modes';
+import { BARRED, CHLADNI, CLASSIC, COLLISION, SELFGRAV, seedMode, seedRange } from '../sim/modes';
 import { PAIR_MASS, createPair, type PairState } from '../sim/pair';
 import { cameraTilt, cameraZoom, type Backend } from './backend';
 
@@ -509,6 +509,41 @@ export function createWebGL2Backend(
   gl.blendFunc(gl.ONE, gl.ONE);
 
   /**
+   * De-interleave slots [from, to) out of the sim buffer and into all four
+   * ping-pong buffers.
+   *
+   * All four, and not just the one the next pass reads from, because which of
+   * the two pairs is current depends on how many frames have been drawn — and a
+   * range written to only one of them would be overwritten by the stale copy on
+   * the following swap. The slots being written are not live in either buffer
+   * (this is called with a range that is either the whole population or one
+   * being grown into, never a range being stepped), so writing both sides is
+   * writing the same value twice rather than clobbering a result.
+   */
+  const uploadRange = (from: number, to: number) => {
+    for (let i = from; i < to; i++) {
+      pos[i * 2] = sim.particles[i * 4];
+      pos[i * 2 + 1] = sim.particles[i * 4 + 1];
+      vel[i * 2] = sim.particles[i * 4 + 2];
+      vel[i * 2 + 1] = sim.particles[i * 4 + 3];
+      speciesData[i] = sim.species[i];
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, speciesBuf);
+    gl.bufferSubData(gl.ARRAY_BUFFER, from * 4, speciesData, from, to - from);
+    for (const [buf, data] of [
+      [posA, pos],
+      [posB, pos],
+      [velA, vel],
+      [velB, vel],
+    ] as const) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      // Two floats per particle here: eight bytes into the buffer, two elements
+      // into the source.
+      gl.bufferSubData(gl.ARRAY_BUFFER, from * 8, data, from * 2, (to - from) * 2);
+    }
+  };
+
+  /**
    * Re-seed for the current mode and refill both ping-pong buffers.
    *
    * The same CPU seeding the WebGPU path uses, so the two backends start every
@@ -518,24 +553,7 @@ export function createWebGL2Backend(
    */
   const reseedBuffers = () => {
     seedMode(sim, mode, pair);
-    for (let i = 0; i < n; i++) {
-      pos[i * 2] = sim.particles[i * 4];
-      pos[i * 2 + 1] = sim.particles[i * 4 + 1];
-      vel[i * 2] = sim.particles[i * 4 + 2];
-      vel[i * 2 + 1] = sim.particles[i * 4 + 3];
-      speciesData[i] = sim.species[i];
-    }
-    gl.bindBuffer(gl.ARRAY_BUFFER, speciesBuf);
-    gl.bufferSubData(gl.ARRAY_BUFFER, 0, speciesData);
-    for (const [buf, data] of [
-      [posA, pos],
-      [posB, pos],
-      [velA, vel],
-      [velB, vel],
-    ] as const) {
-      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-      gl.bufferSubData(gl.ARRAY_BUFFER, 0, data);
-    }
+    uploadRange(0, n);
   };
 
   return {
@@ -544,6 +562,13 @@ export function createWebGL2Backend(
 
     setCount(v: number) {
       count = Math.min(v, sim.capacity);
+    },
+
+    grow(from: number, to: number) {
+      const hi = Math.min(to, sim.capacity);
+      if (hi <= from) return;
+      seedRange(sim, mode, pair, from, hi);
+      uploadRange(from, hi);
     },
 
     setSpeciesMask(m: number) {

@@ -22,11 +22,13 @@
 import {
   CAPTURE_K, CAPTURE_R2, CURSOR_SOFT2, CURSOR_SOFT2_HOLD, DISC_SHARE, DOMAIN,
   GRID, G_CORE, G_CURSOR, G_CURSOR_HOLD, HALO_A2, MESH_R, M_DISC, RADIAL_DAMP,
-  SOFT_CELLS, haloMass, type Sim,
+  SOFT_CELLS, STRIDE, haloMass, type Sim,
 } from '../sim/world';
 import * as barred from '../sim/barred';
 import * as classic from '../sim/classic';
-import { BARRED, CHLADNI, CLASSIC, COLLISION, HALO, SELFGRAV, seedMode } from '../sim/modes';
+import {
+  BARRED, CHLADNI, CLASSIC, COLLISION, HALO, SELFGRAV, seedMode, seedRange,
+} from '../sim/modes';
 import { PAIR_MASS, createPair, type PairState } from '../sim/pair';
 import { READBACK_MAX, cameraTilt, cameraZoom, type Backend } from './backend';
 
@@ -1066,9 +1068,11 @@ export async function createWebGPUBackend(
     size: speciesData.byteLength,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   });
-  const uploadSpecies = () => {
-    for (let i = 0; i < sim.capacity; i++) speciesData[i] = sim.species[i];
-    device.queue.writeBuffer(speciesBuf, 0, speciesData);
+  const uploadSpecies = (from = 0, to = sim.capacity) => {
+    for (let i = from; i < to; i++) speciesData[i] = sim.species[i];
+    // Element offsets, not byte offsets: writeBuffer measures into a typed array
+    // in elements and into the destination in bytes.
+    device.queue.writeBuffer(speciesBuf, from * 4, speciesData, from, to - from);
   };
   uploadSpecies();
 
@@ -1271,6 +1275,18 @@ export async function createWebGPUBackend(
 
     setCount(n: number) {
       count = Math.min(n, sim.capacity);
+    },
+
+    grow(from: number, to: number) {
+      const hi = Math.min(to, sim.capacity);
+      if (hi <= from) return;
+      seedRange(sim, mode, pair, from, hi);
+      uploadSpecies(from, hi);
+      // STRIDE floats per particle: 16 bytes into the buffer, 4 elements into
+      // the source array.
+      device.queue.writeBuffer(
+        particleBuf, from * STRIDE * 4, sim.particles, from * STRIDE, (hi - from) * STRIDE,
+      );
     },
 
     setSpeciesMask(m: number) {

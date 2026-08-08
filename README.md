@@ -205,8 +205,11 @@ npm install && npm run dev
 ```
 
 Entity count is the first slider in the sidebar: 25,000 to 2,000,000 disc
-particles, default 1,000,000. Buffers are allocated at the maximum, so the slider
-never reloads — dragging it down applies live, dragging it up re-seeds on release.
+particles, default 1,000,000. Buffers are allocated at the maximum and the
+population is a prefix of them, so the slider never reloads or restarts in either
+direction — dragging down drops the tail, dragging up seeds and uploads only the
+slots being added. The galaxy on screen keeps its arms and its clock; the new
+particles arrive cold and are mixed in by the disc within a second or two.
 
 Query parameters:
 

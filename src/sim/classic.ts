@@ -143,9 +143,9 @@ export function homeRadius(species: number, i: number) {
  * this mode was split out into its own file. Same PRNG and same seed, so this
  * reproduces its initial conditions exactly rather than approximately.
  */
-export function seedDisc(sim: Sim, rand: () => number) {
+export function seedDisc(sim: Sim, rand: () => number, from = 0, to = sim.capacity) {
   const p = sim.particles;
-  for (let i = 0; i < sim.capacity; i++) {
+  for (let i = from; i < to; i++) {
     const o = i * STRIDE;
     const a = rand() * Math.PI * 2;
     const r = Math.sqrt(rand()) * R_DISC;

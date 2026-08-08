@@ -6,7 +6,7 @@ import {
 } from './sim/world';
 import * as barred from './sim/barred';
 import * as classic from './sim/classic';
-import { CHLADNI, CLASSIC, COLLISION, HALO, MODES, MODE_COUNT } from './sim/modes';
+import { CHLADNI, CLASSIC, COLLISION, MODES, MODE_COUNT } from './sim/modes';
 import { createPair, pairSeparation, resetPair, stepPair } from './sim/pair';
 import { VirtualList } from './ui/list';
 import { speciesMask, toggleSpecies, filterLabel, countEffect, effectRuns } from './ui/state';
@@ -256,9 +256,35 @@ function countText(disc: number) {
 }
 
 /**
- * Adopt a new population size, re-seeding only if it grew.
+ * How far the population has ever reached since the last full seed.
  *
- * The two directions are not symmetric, which is what lets one of them be live.
+ * The line between a slot that can be switched back on and one that has to be
+ * filled first. Everything below this mark has been live at some point since the
+ * current galaxy was seeded, so the buffer is holding a real particle there —
+ * frozen where it was when the count last passed it going down, but of this
+ * galaxy. Everything above it has never been stepped and is holding whatever the
+ * last whole-buffer seed left, which by now is an initial condition for a disc
+ * that no longer exists: a different rotation curve if the halo slider has
+ * moved, cores in the wrong place if this is an encounter.
+ *
+ * So the mark is what applyCount() seeds *from*, and dragging back up through
+ * ground the slider has already covered returns the particles that were there
+ * rather than new ones.
+ *
+ * Reset to the live count by every full seed — see markSeeded() below.
+ */
+let seeded = sim.count;
+
+/** A whole-buffer seed just ran, so nothing above the live count is trustworthy. */
+function markSeeded() {
+  seeded = sim.count;
+}
+
+/**
+ * Adopt a new population size, in place.
+ *
+ * Neither direction restarts, and neither is expensive, which is what lets the
+ * whole slider be live under the cursor.
  *
  * Shrinking is exact and free. The live population is the prefix 0..count, so
  * dropping the tail is two assignments and every particle that remains is the
@@ -266,46 +292,39 @@ function countText(disc: number) {
  * the disc just samples thinner. The mass per particle is derived from the count
  * on every path, so the total stays put and the rotation curve does not flinch.
  *
- * Growing cannot be. The slots past the live count are still holding whatever
- * the last seed left there and have not been integrated since, so raising the
- * count without a re-seed drops a pristine cold disc on top of an evolved one
- * and the two sit there counter-rotating. So growing restarts, and that is a CPU
- * seed of the whole buffer plus the upload behind it — tens of milliseconds,
- * nowhere near per-input-event cheap.
+ * Growing fills the slots that are new and touches nothing else. The evolved
+ * disc keeps its arms, its clock, its cursor well and its spin sense; the new
+ * particles are seeded for the mode as it stands right now and arrive into it.
+ * They arrive *cold* — smooth and axisymmetric where the disc they land in has
+ * structure — so a big jump visibly dilutes the arms for a second or two before
+ * the disc re-amplifies them. That is the honest thing for it to do: it is the
+ * same swing amplification that made the first set of arms, running on a disc
+ * that has just been resampled, and it is a far smaller discontinuity than
+ * throwing the galaxy away and starting it over. See grow() on the Backend.
  */
 function applyCount(disc: number) {
   const n = withOuterField(disc);
-  const grew = n > sim.count;
   sim.count = n;
   backend.setCount(n);
+  if (n > seeded) {
+    backend.grow(seeded, n);
+    seeded = n;
+  }
   countLabel.textContent = countText(disc);
   // The row set is built from sim.count, and the banner quotes it.
   refreshFilter();
-  if (grew) {
-    // Without the flip [R] does: resizing the population is not a request to see
-    // the other spin sense, and silently swapping it would break the one thing
-    // the collision restart is for.
-    if (mode === COLLISION) restartCollision(false);
-    else restart();
-  }
   if (arm === 'gpu') refreshBanner();
 }
 
 countInput.value = String(countToSlider(COUNT_DEFAULT));
-// Both events, because the two directions cost different things — see
-// applyCount(). `input` fires continuously through the drag and applies
-// everything that is free, which is the whole downward half of the travel: drag
-// left and the population thins and the frame time falls under the cursor, live.
-// Upward it moves the label only, and `change` — one event, on release — is what
-// actually grows the population and pays for the re-seed. So the number is
-// always live, the picture is live whenever it can be, and a drag never fires
-// more than one restart no matter how far it travels.
+// One event, and it is `input`: both directions are cheap enough to apply
+// continuously through the drag, so the population and the frame time move under
+// the cursor rather than snapping on release. This used to defer growth to
+// `change` because growth meant a restart — see applyCount() for what replaced
+// that. What is left is a seed and an upload of the slots being added, which
+// over a drag is the same total work as one big one, cut into per-event pieces
+// and spread across the frames of the drag.
 countInput.addEventListener('input', () => {
-  const disc = Math.round(countFromSlider(+countInput.value));
-  if (withOuterField(disc) < sim.count) applyCount(disc);
-  else countLabel.textContent = countText(disc);
-});
-countInput.addEventListener('change', () => {
   applyCount(Math.round(countFromSlider(+countInput.value)));
 });
 countRow.append(countLabel, countInput);
@@ -547,25 +566,21 @@ function setArm(next: 'gpu' | 'baseline') {
 }
 
 /**
- * The mode the page boots into.
+ * The mode the page boots into: drawn uniformly from the set on every load.
  *
- * HALO rather than SELFGRAV, which is the mode after it minus one term. Both are
- * the same disc and the same seeding, so this is not a change of subject — it is
- * a choice about which of the two is the picture and which is the comparison,
- * and the halo makes the better one: it flattens the rotation curve, so the
- * outer field turns as a wheel instead of falling off Keplerian, and it takes
- * away the disc's ability to run away with itself, so what is on screen after
- * two minutes still resembles what was on screen after ten seconds. [M] steps
- * straight to the bare disc to take the halo away, which is the direction the
- * comparison reads in anyway — you show the galaxy, then remove the thing
- * holding it together.
+ * Six force laws that answer each other is the point of the set, and a fixed
+ * entry point makes five of them things you only see if you press [M]. A refresh
+ * lands somewhere else instead, and [M] still walks the whole ring from wherever
+ * that is — including the halo/bare-disc pair, which stays adjacent in the order
+ * so the controlled comparison survives whichever of the two you happen to open
+ * on.
  *
  * Both backends construct themselves seeded for SELFGRAV, so booting elsewhere
  * costs one extra seed-and-upload at startup; setMode() at the bottom of this
  * file is what pays it, and it has to be setMode() rather than an assignment
  * because the halo mass must reach the world before the re-seed reads it.
  */
-let mode = HALO;
+let mode = Math.floor(Math.random() * MODE_COUNT);
 
 // The colliding pair. One object, mutated in place and held by reference on all
 // sides, so the per-frame cost of the whole encounter is two bodies of leapfrog.
@@ -582,6 +597,7 @@ function setMode(next: number) {
   // shares one force law, and the halo is what makes this one a different mode.
   setHaloMass(MODES[mode].halo ? haloValue : 0);
   backend.setMode(mode);
+  markSeeded();
   // Which re-seeds — so the cursor goes back out of the force law until it is
   // aimed at the new population. See CURSOR_DEADZONE.
   disarmCursor();
@@ -643,6 +659,7 @@ function restart() {
   }
   backend.reset();
   baseline.reset();
+  markSeeded();
   hud.reset();
   // A fresh disc is centred on the origin again, and the pointer is wherever it
   // was left — often right on top of it. See CURSOR_DEADZONE.
@@ -659,6 +676,7 @@ function restart() {
 function restartCollision(flip = true) {
   resetPair(pair, flip ? -pair.spin1 : pair.spin1);
   backend.setMode(COLLISION);
+  markSeeded();
   if (arm === 'baseline') baseline.setMode(COLLISION, pair);
   else refreshBanner();
   hud.reset();

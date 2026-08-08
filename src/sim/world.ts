@@ -515,9 +515,16 @@ export function randomSeed() {
  * because species is assigned *from* radius here and the species buffer is
  * uploaded once and never changed. Redraw the radii independently and every
  * species ends up spread over the whole disc: six colors, one gray ring.
+ *
+ * Takes a slot range so that growing the population can seed only the slots that
+ * are new — see seedRange() in sim/modes.ts. A partial call draws from its own
+ * stream rather than fast-forwarding the full one to `from`, so the tail it
+ * writes is not the tail a whole-buffer call with the same seed would have
+ * written. That costs nothing worth having: the whole-buffer path is the one
+ * determinism is a claim about, and it is the one left alone.
  */
-export function seedGalaxy(sim: Sim, seed = 0x9e3779b9) {
-  const { particles, species, stat, capacity } = sim;
+export function seedGalaxy(sim: Sim, seed = 0x9e3779b9, from = 0, to = sim.capacity) {
+  const { particles, species, stat } = sim;
   const rand = mulberry32(seed);
 
   // Box-Muller, drawing from the same deterministic stream as everything else.
@@ -526,7 +533,7 @@ export function seedGalaxy(sim: Sim, seed = 0x9e3779b9) {
     return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rand());
   };
 
-  for (let i = 0; i < capacity; i++) {
+  for (let i = from; i < to; i++) {
     const o = i * STRIDE;
     // Every eighth slot is outer field rather than disc — see HALO_EVERY. It
     // draws from the same stream in the same order, so restarting is still
@@ -885,16 +892,16 @@ export function integrateChladniCPU(
 }
 
 /**
- * Spread the first `n` slots evenly over the box, at rest.
+ * Spread slots [from, n) evenly over the box, at rest.
  *
  * The plate has to start as evenly spread sand. Arriving from a galaxy with
  * everything piled in the core produces one bright diagonal and nothing else,
  * because a grain that reaches a node has zero vibration amplitude and never
  * moves again.
  */
-export function scatterPlate(sim: Sim, n: number, rand: () => number = Math.random) {
+export function scatterPlate(sim: Sim, n: number, rand: () => number = Math.random, from = 0) {
   const p = sim.particles;
-  for (let i = 0; i < n; i++) {
+  for (let i = from; i < n; i++) {
     const o = i * STRIDE;
     p[o] = rand() * 2 - 1;
     p[o + 1] = rand() * 2 - 1;

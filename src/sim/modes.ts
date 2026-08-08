@@ -154,27 +154,64 @@ export const MODE_COUNT = MODES.length;
  * explicitly to pin the initial conditions for a measurement.
  */
 export function seedMode(sim: Sim, mode: number, pair: PairState, seed = randomSeed()) {
+  seedRange(sim, mode, pair, 0, sim.capacity, seed);
+}
+
+/**
+ * The same, over the slot range [from, to) only.
+ *
+ * What lets the population grow without restarting: the slots past the live
+ * count have never been integrated, so raising the count is a matter of filling
+ * exactly those and leaving every particle already on screen where it is. See
+ * applyCount() in main.ts for the shape of that, and grow() on the Backend for
+ * the upload it turns into.
+ *
+ * Every seeder here writes slot i from slot i's own draw, so a range is a
+ * well-formed piece of the same population rather than a special case — the
+ * strided field/disc split and the species banding are both functions of the
+ * index. What a range does *not* get is the whole-buffer stream, so seeding
+ * [0, n) then [n, m) is not the same draw as seeding [0, m) at once. Nothing
+ * depends on it being: determinism is a claim about restarts, and those go
+ * through seedMode() above.
+ *
+ * The one thing that is not index-local is the *time* the range is seeded at.
+ * Everything here reads live state — the halo through vCirc(), the collision
+ * through `pair` — so a range seeded now is placed on the rotation curve and
+ * around the cores as they are now, not as they were when the mode was entered.
+ * That is what makes growing during an encounter put the new particles around
+ * the cores rather than where the cores started.
+ */
+export function seedRange(
+  sim: Sim,
+  mode: number,
+  pair: PairState,
+  from: number,
+  to: number,
+  seed = randomSeed(),
+) {
   switch (mode) {
     case BARRED:
-      barred.seedSpecies(sim, mulberry32(seed));
-      barred.reseedDisc(sim, sim.capacity, mulberry32(seed ^ 0x51));
+      barred.seedSpecies(sim, mulberry32(seed), from, to);
+      barred.reseedDisc(sim, to, mulberry32(seed ^ 0x51), from);
       break;
     case COLLISION:
-      barred.seedSpecies(sim, mulberry32(seed));
-      barred.reseedCollision(sim, sim.capacity, pair, mulberry32(seed ^ 0x51));
+      // Species first, and over the same range: reseedCollision() reads it back
+      // to place each particle at the radius its colour belongs at.
+      barred.seedSpecies(sim, mulberry32(seed), from, to);
+      barred.reseedCollision(sim, to, pair, mulberry32(seed ^ 0x51), from);
       break;
     case CLASSIC:
       // One call over one stream, unlike the two families above. Species here is
       // banded from the radius it is seeded at rather than from a home radius
       // the force law returns particles to, so the two cannot be drawn
       // separately — see seedDisc() in sim/classic.ts.
-      classic.seedDisc(sim, mulberry32(seed));
+      classic.seedDisc(sim, mulberry32(seed), from, to);
       break;
     case CHLADNI:
       // Species stays the exponential disc's, so leaving the plate for mode 0
       // finds its bands intact. Only the positions become sand.
-      seedGalaxy(sim, seed);
-      scatterPlate(sim, sim.capacity, mulberry32(seed ^ 0x51));
+      seedGalaxy(sim, seed, from, to);
+      scatterPlate(sim, to, mulberry32(seed ^ 0x51), from);
       break;
     default:
       // SELFGRAV and HALO both. Same seeder, and the halo reaches it through
@@ -182,6 +219,6 @@ export function seedMode(sim: Sim, mode: number, pair: PairState, seed = randomS
       // whichever rotation curve the mode it is being seeded for actually has.
       // See haloMass() in sim/world.ts for why that is module state, and why
       // main.ts has to set it before it calls this.
-      seedGalaxy(sim, seed);
+      seedGalaxy(sim, seed, from, to);
   }
 }

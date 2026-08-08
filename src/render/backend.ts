@@ -163,6 +163,22 @@ export interface Backend {
   detail: string;
   setCount(n: number): void;
   /**
+   * Seed slots [from, to) for the current mode and upload just that range,
+   * leaving every particle below `from` exactly where it is.
+   *
+   * The population is a prefix of a buffer allocated at capacity, so growing it
+   * is not a rebuild — it is filling slots that were already there and had never
+   * been stepped. Doing that as a partial upload rather than a re-seed is the
+   * whole reason the count slider can be dragged upward without restarting the
+   * galaxy: the evolved disc keeps its arms, its cursor well and its clock, and
+   * the new particles arrive into it. See seedRange() in sim/modes.ts.
+   *
+   * Cost is proportional to `to - from`, not to the population — dragging the
+   * slider from a million to two seeds and uploads one million slots, once,
+   * spread over however many events the drag takes.
+   */
+  grow(from: number, to: number): void;
+  /**
    * Bitmask of visible species. Filtering a million particles is a uniform bit
    * test per vertex on the GPU — the CPU never walks the population to do it.
    */
