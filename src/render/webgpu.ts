@@ -26,14 +26,24 @@ import {
 } from '../sim/world';
 import * as barred from '../sim/barred';
 import * as classic from '../sim/classic';
+import * as smoke from '../sim/smoke';
 import {
-  BARRED, CHLADNI, CLASSIC, COLLISION, HALO, SELFGRAV, seedMode, seedRange,
+  BARRED, CHLADNI, CLASSIC, COLLISION, HALO, SELFGRAV, SMOKE, seedMode, seedRange,
 } from '../sim/modes';
 import { PAIR_MASS, createPair, type PairState } from '../sim/pair';
 import { READBACK_MAX, cameraTilt, cameraZoom, type Backend } from './backend';
 
 const WORKGROUP = 64;
 const CELLS = GRID * GRID;
+
+// The smoke solver's grid, from sim/smoke.ts so there is one source of truth.
+// Two storage buffers hold all of it, each cut into planes — see SMOKE_SHADER.
+const SM_CELLS = smoke.CELLS;
+const SM_FACES = smoke.FACES;
+/** Planes in `scal`: temperature, its advection scratch, pressure, divergence,
+ *  curl, the two components of the confinement force, and the thermal-expansion
+ *  target the projection solves against. */
+const SM_PLANES = 8;
 
 
 const SHADER = /* wgsl */ `
@@ -87,6 +97,14 @@ struct Params {
   // mode, which is what lets the term stay in the force law unbranched. Pushes
   // the struct to 116 bytes, padded to 120 by its vec2 alignment.
   mhalo     : f32,
+  // Vorticity confinement strength for the smoke, live from the UI -- see VORT
+  // in sim/smoke.ts. Lands at 116, in the padding the vec2 alignment already
+  // reserved, so it is free.
+  vort      : f32,
+  // Pointer velocity in simulation units per second. A fluid is stirred by a
+  // cursor that moves, not by one that is merely somewhere, so the smoke reads
+  // this where every other mode reads mx/my. Takes the struct to 128 bytes.
+  cvel      : vec2<f32>,
 };
 
 // Central bulge + halo. Fixed at the origin -- see the integrate entry point.
@@ -151,6 +169,20 @@ const PALETTE = array<vec3<f32>, 6>(
 @group(0) @binding(4) var<storage, read_write> field : array<vec2<f32>>;
 // The same mesh as plain f32, baked once per frame -- see bakeGrid.
 @group(0) @binding(5) var<storage, read_write> cellMass : array<f32>;
+// The smoke solver's entire state, in two buffers rather than the nine it
+// naturally wants.
+//
+// Not a micro-optimization: maxStorageBuffersPerShaderStage defaults to 8, and
+// the five above plus a velocity ping-pong pair, a temperature pair, pressure,
+// divergence, curl and two confinement components is fourteen. Packing is the
+// difference between running on a default device and requiring a raised limit
+// that some adapters do not have.
+//
+// svel is the staggered velocity as vec2 -- .x on the vertical faces, .y on the
+// horizontal ones -- in two planes of SM_FACES, which is the advection's
+// ping-pong. scal is seven planes of SM_CELLS. See the P_ and V_ offsets.
+@group(0) @binding(6) var<storage, read_write> svel : array<vec2<f32>>;
+@group(0) @binding(7) var<storage, read_write> scal : array<f32>;
 
 /** Center of cell c in simulation space, which is the unit box [-1, 1]. */
 fn cellCenter(c : u32) -> vec2<f32> {
@@ -663,6 +695,563 @@ fn sampleField(p : vec2<f32>) -> vec2<f32> {
   return a;
 }
 
+// --- smoke: an incompressible fluid on a staggered grid ----------------------
+//
+// Mirrors sim/smoke.ts pass for pass; that file is the specification and carries
+// the argument for every constant and every boundary. What is here is the same
+// scheme with the loops turned into dispatches.
+//
+// Nine passes per frame, in order:
+//
+//   smAdvectVel      backtrace the velocity through itself, plane A -> plane B
+//   smAdvectScalar   backtrace temperature; take the curl while walking cells
+//   smCommitScalar   commit temperature with source and cooling; solve confinement
+//   smForces         buoyancy, jet, confinement, cursor, drag -- onto plane B
+//   smDivergence     divergence of plane B
+//   smRelaxRed       \  twenty red-black Gauss-Seidel sweeps, in place, no
+//   smRelaxBlack     /  ping-pong: red cells only ever read black ones
+//   smProject        subtract the pressure gradient, plane B -> plane A
+//
+// Plane A is where the frame starts and ends, so the ping-pong needs no copy and
+// the particle integrate below reads the projected field directly.
+
+const SM_NX = ${smoke.NX}u;
+const SM_NY = ${smoke.NY}u;
+const SM_SX = ${smoke.SX}u;
+const SM_CELLS = ${SM_CELLS}u;
+const SM_FACES = ${SM_FACES}u;
+const SM_H = ${smoke.H};
+const SM_XR = ${smoke.XR};
+const SM_YR = ${smoke.YR};
+
+// Plane offsets into scal.
+const P_T    = 0u;
+const P_TS   = ${SM_CELLS}u;
+const P_PHI  = ${2 * SM_CELLS}u;
+const P_DIV  = ${3 * SM_CELLS}u;
+const P_CURL = ${4 * SM_CELLS}u;
+const P_CFX  = ${5 * SM_CELLS}u;
+const P_CFY  = ${6 * SM_CELLS}u;
+const P_DIL  = ${7 * SM_CELLS}u;
+// And into svel.
+const V_A = 0u;
+const V_B = ${SM_FACES}u;
+
+const SM_BUOY = ${smoke.BUOY};
+const SM_SRC_RATE = ${smoke.SRC_RATE};
+const SM_COOL = ${smoke.COOL};
+const SM_JET = ${smoke.JET};
+const SM_DRAG = ${smoke.DRAG};
+const SM_SRC_W = ${smoke.SRC_W};
+const SM_SRC_H = ${smoke.SRC_H};
+const SM_CONF_MAX = ${smoke.CONF_MAX};
+const SM_CURSOR_K = ${smoke.CURSOR_K};
+const SM_CURSOR_R2 = ${smoke.CURSOR_R2};
+const SM_CURSOR_HEAT = ${smoke.CURSOR_HEAT};
+const SM_SRC_RAMP = ${smoke.SRC_RAMP};
+const SM_SPREAD = ${smoke.SPECIES_SPREAD};
+const SM_TURN_HZ = ${smoke.TURN_HZ};
+const SM_RECYCLE_P = ${smoke.RECYCLE_P};
+const SM_VMAX = ${smoke.V_MAX};
+const SM_DIFFUSIVITY = ${smoke.DIFFUSIVITY};
+const SM_SUB_L = ${smoke.SUBGRID_L};
+const SM_SUB_V = ${smoke.SUBGRID_V};
+const SM_SUB_FALLOFF = ${smoke.SUBGRID_FALLOFF};
+const SM_SUB_RATE = ${smoke.SUBGRID_RATE};
+const SM_SUB_OMEGA = ${smoke.SUBGRID_OMEGA};
+const SM_SUB_FLOOR = ${smoke.SUBGRID_FLOOR};
+const SM_AMB_V = ${smoke.AMBIENT_V};
+const SM_AMB_L = ${smoke.AMBIENT_L};
+const SM_AMB_RATE = ${smoke.AMBIENT_RATE};
+const SM_EXPAND = ${smoke.EXPAND};
+const SM_NOISE_NORM = ${smoke.NOISE_NORM};
+
+fn smCell(i : u32, j : u32) -> u32 { return j * SM_NX + i; }
+fn smFace(i : u32, j : u32) -> u32 { return j * SM_SX + i; }
+
+/** Integer sample and fraction for a bilinear read over n samples. */
+fn smSpan(g : f32, n : u32) -> vec2<f32> {
+  let x = clamp(g, 0.0, f32(n - 1u));
+  let i = min(floor(x), f32(n - 2u));
+  return vec2<f32>(i, x - i);
+}
+
+fn smSampleU(base : u32, gx : f32, gy : f32) -> f32 {
+  let a = smSpan(gx, SM_NX + 1u);
+  let b = smSpan(gy, SM_NY);
+  let i = u32(a.x);
+  let j = u32(b.x);
+  let o = base + j * SM_SX + i;
+  let s0 = mix(svel[o].x, svel[o + 1u].x, a.y);
+  let s1 = mix(svel[o + SM_SX].x, svel[o + SM_SX + 1u].x, a.y);
+  return mix(s0, s1, b.y);
+}
+
+fn smSampleV(base : u32, gx : f32, gy : f32) -> f32 {
+  let a = smSpan(gx, SM_NX);
+  let b = smSpan(gy, SM_NY + 1u);
+  let i = u32(a.x);
+  let j = u32(b.x);
+  let o = base + j * SM_SX + i;
+  let s0 = mix(svel[o].y, svel[o + 1u].y, a.y);
+  let s1 = mix(svel[o + SM_SX].y, svel[o + SM_SX + 1u].y, a.y);
+  return mix(s0, s1, b.y);
+}
+
+/** Bilinear read of any cell-centered plane. */
+fn smSampleCell(base : u32, gx : f32, gy : f32) -> f32 {
+  let a = smSpan(gx, SM_NX);
+  let b = smSpan(gy, SM_NY);
+  let i = u32(a.x);
+  let j = u32(b.x);
+  let o = base + j * SM_NX + i;
+  let s0 = mix(scal[o], scal[o + 1u], a.y);
+  let s1 = mix(scal[o + SM_NX], scal[o + SM_NX + 1u], a.y);
+  return mix(s0, s1, b.y);
+}
+
+fn smSampleT(gx : f32, gy : f32) -> f32 {
+  return smSampleCell(P_T, gx, gy);
+}
+
+/** Grid coordinates: vertical faces on integer x, horizontal faces on integer y. */
+fn smGrid(p : vec2<f32>) -> vec2<f32> {
+  return vec2<f32>((p.x + SM_XR) / SM_H, (p.y + SM_YR) / SM_H);
+}
+
+/** The fluid's velocity at an arbitrary point -- what a tracer follows. */
+fn smVel(base : u32, p : vec2<f32>) -> vec2<f32> {
+  let g = smGrid(p);
+  return vec2<f32>(
+    smSampleU(base, g.x, g.y - 0.5),
+    smSampleV(base, g.x - 0.5, g.y)
+  );
+}
+
+/** The curl at an arbitrary point -- the gate on the sub-grid noise. */
+fn smCurlAt(p : vec2<f32>) -> f32 {
+  let g = smGrid(p);
+  return smSampleCell(P_CURL, g.x - 0.5, g.y - 0.5);
+}
+
+// --- curl noise --------------------------------------------------------------
+//
+// Mirrors the block of the same name in sim/smoke.ts, which carries the argument
+// for why a 2D solver needs this at all: there is no vortex stretching in two
+// dimensions, so the cascade runs backwards and nothing populates the scales
+// below a cell. This is the curl of a scalar potential, which is divergence-free
+// identically and can therefore be added downstream of the projection.
+//
+// Gradient noise rather than value noise, and that file carries the reason: the
+// derivative of value noise vanishes on every lattice plane, which draws a
+// visible square grid through a million tracers.
+
+/**
+ * Mirrors hash3(). Multiplied in u32, which wraps by definition, because that is
+ * exactly what Math.imul does to the same inputs -- so the two arms agree bit for
+ * bit and a tracer takes the same path on either.
+ */
+fn smHash3(i : i32, j : i32, k : i32) -> f32 {
+  let h = (u32(i) * 374761393u) ^ (u32(j) * 668265263u) ^ (u32(k) * 1442695041u);
+  return hash(h);
+}
+
+/** A lattice corner's direction, uniform on the circle. Mirrors the angle draw
+ *  in noiseSlice(); a table of eight would be half axis-aligned. */
+fn smGradDir(i : i32, j : i32, k : i32) -> vec2<f32> {
+  let a = smHash3(i, j, k) * 6.28318531;
+  return vec2<f32>(cos(a), sin(a));
+}
+
+/** One 2D slice of gradient noise, weighted. Mirrors noiseSlice(). */
+fn smNoiseSlice(i : i32, j : i32, k : i32, f : vec2<f32>, w : f32) -> vec2<f32> {
+  // Quintic fade: with gradient noise the derivative is the output, so it is the
+  // derivative that has to join smoothly across a lattice plane.
+  let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+  let du = 30.0 * f * f * (f - 1.0) * (f - 1.0);
+
+  let g00 = smGradDir(i,     j,     k);
+  let g10 = smGradDir(i + 1, j,     k);
+  let g01 = smGradDir(i,     j + 1, k);
+  let g11 = smGradDir(i + 1, j + 1, k);
+
+  let n00 = dot(g00, f);
+  let n10 = dot(g10, f - vec2<f32>(1.0, 0.0));
+  let n01 = dot(g01, f - vec2<f32>(0.0, 1.0));
+  let n11 = dot(g11, f - vec2<f32>(1.0, 1.0));
+
+  let b = n10 - n00;
+  let c = n01 - n00;
+  let d = n00 - n10 - n01 + n11;
+
+  let w00 = (1.0 - u.x) * (1.0 - u.y);
+  let w10 = u.x * (1.0 - u.y);
+  let w01 = (1.0 - u.x) * u.y;
+  let w11 = u.x * u.y;
+
+  // Second term is the fade-weighted mean corner direction, and it is the one
+  // that does not vanish on the lattice.
+  let mean = w00 * g00 + w10 * g10 + w01 * g01 + w11 * g11;
+  return w * (vec2<f32>(du.x * (b + d * u.y), du.y * (c + d * u.x)) + mean);
+}
+
+/** psi's x and y derivatives, analytically. Mirrors noiseGrad(). */
+fn smNoiseGrad(x : f32, y : f32, z : f32) -> vec2<f32> {
+  let i = i32(floor(x));
+  let j = i32(floor(y));
+  let k = i32(floor(z));
+  let f = vec2<f32>(x - floor(x), y - floor(y));
+  let fz = z - floor(z);
+  // Two slices lerped in time. The weight does not depend on x or y, so the
+  // derivative of the lerp is exactly the lerp of the derivatives.
+  let uz = fz * fz * fz * (fz * (fz * 6.0 - 15.0) + 10.0);
+  return smNoiseSlice(i, j, k, f, 1.0 - uz) + smNoiseSlice(i, j, k + 1, f, uz);
+}
+
+/** Divergence-free velocity from the potential. Mirrors curlNoise(). */
+fn smCurlNoise(p : vec2<f32>, t : f32, len : f32, vel : f32, rate : f32) -> vec2<f32> {
+  // The +512 keeps the lattice indices positive over the whole box, so neither
+  // arm has to have an opinion about negative indices.
+  let g = smNoiseGrad(p.x / len + 512.0, p.y / len + 512.0, t * rate);
+  let a = vel * SM_NOISE_NORM;
+  return vec2<f32>(g.y * a, -g.x * a);
+}
+
+/** Two octaves of it, for the tracers. Mirrors subgridNoise(). */
+fn smSubgrid(p : vec2<f32>, t : f32) -> vec2<f32> {
+  // Offset on the fine octave so the two do not share their extrema and leave a
+  // visible lattice in the sum; rate at 2^(2/3), which is the turnover vel/len
+  // at half the scale and 0.79 of the speed.
+  return smCurlNoise(p, t, SM_SUB_L, SM_SUB_V, SM_SUB_RATE)
+       + smCurlNoise(p + vec2<f32>(37.1, -19.3), t,
+                     SM_SUB_L * 0.5, SM_SUB_V * SM_SUB_FALLOFF, SM_SUB_RATE * 1.587);
+}
+
+/** How much of the source a point is in. Mirrors sourceWeight(). */
+fn smSource(p : vec2<f32>) -> f32 {
+  let h = p.y + SM_YR;
+  if (h > SM_SRC_H) { return 0.0; }
+  let fx = max(0.0, 1.0 - (p.x / SM_SRC_W) * (p.x / SM_SRC_W));
+  return fx * fx * (1.0 - h / SM_SRC_H);
+}
+
+/** How far the source has come up since the seed. Mirrors sourceRamp(), and
+ *  params.time is zeroed by every seed so this restarts with the mode. */
+fn smRamp() -> f32 {
+  let s = clamp(params.time / SM_SRC_RAMP, 0.0, 1.0);
+  return s * s * (3.0 - 2.0 * s);
+}
+
+@compute @workgroup_size(${WORKGROUP})
+fn smAdvectVel(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let t = gid.x;
+  if (t >= SM_FACES) { return; }
+  let i = t % SM_SX;
+  let j = t / SM_SX;
+
+  var nu = 0.0;
+  if (j < SM_NY) {
+    let p = vec2<f32>(-SM_XR + f32(i) * SM_H, -SM_YR + (f32(j) + 0.5) * SM_H);
+    let b = smGrid(p - smVel(V_A, p) * params.dt);
+    nu = smSampleU(V_A, b.x, b.y - 0.5);
+  }
+
+  var nv = 0.0;
+  // j == 0 is the solid floor and stays at zero. Left, right and top are open
+  // and take the backtrace unmodified.
+  if (i < SM_NX && j > 0u) {
+    let p = vec2<f32>(-SM_XR + (f32(i) + 0.5) * SM_H, -SM_YR + f32(j) * SM_H);
+    let b = smGrid(p - smVel(V_A, p) * params.dt);
+    nv = smSampleV(V_A, b.x - 0.5, b.y);
+  }
+
+  svel[V_B + t] = vec2<f32>(nu, nv);
+}
+
+/** Cell-centered velocity, for the curl. Clamped at the edges. */
+fn smUCen(i : u32, j : u32) -> f32 {
+  let ci = min(i, SM_NX - 1u);
+  let cj = min(j, SM_NY - 1u);
+  let o = V_B + smFace(ci, cj);
+  return 0.5 * (svel[o].x + svel[o + 1u].x);
+}
+
+fn smVCen(i : u32, j : u32) -> f32 {
+  let ci = min(i, SM_NX - 1u);
+  let cj = min(j, SM_NY - 1u);
+  let o = V_B + smFace(ci, cj);
+  return 0.5 * (svel[o].y + svel[o + SM_SX].y);
+}
+
+@compute @workgroup_size(${WORKGROUP})
+fn smAdvectScalar(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let c = gid.x;
+  if (c >= SM_CELLS) { return; }
+  let i = c % SM_NX;
+  let j = c / SM_NX;
+
+  let p = vec2<f32>(-SM_XR + (f32(i) + 0.5) * SM_H, -SM_YR + (f32(j) + 0.5) * SM_H);
+  let b = smGrid(p - smVel(V_B, p) * params.dt);
+  scal[P_TS + c] = smSampleT(b.x - 0.5, b.y - 0.5);
+
+  // Saturating subtraction, so the clamped neighbour of an edge cell is the
+  // cell itself rather than an index that wrapped.
+  let il = select(i - 1u, i, i == 0u);
+  let jd = select(j - 1u, j, j == 0u);
+  let inv = 1.0 / (2.0 * SM_H);
+  scal[P_CURL + c] = (smVCen(i + 1u, j) - smVCen(il, j)) * inv
+                   - (smUCen(i, j + 1u) - smUCen(i, jd)) * inv;
+}
+
+@compute @workgroup_size(${WORKGROUP})
+fn smCommitScalar(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let c = gid.x;
+  if (c >= SM_CELLS) { return; }
+  let i = c % SM_NX;
+  let j = c / SM_NX;
+  let dt = params.dt;
+
+  // Confinement, from the curl the pass above left behind. Unconditional even at
+  // epsilon 0, where every term it writes is zero -- branching on the slider
+  // would leave the previous setting's forces in the planes the moment it was
+  // dragged to the bottom.
+  {
+    let il = select(i - 1u, i, i == 0u);
+    let ir = select(i + 1u, i, i == SM_NX - 1u);
+    let jd = select(j - 1u, j, j == 0u);
+    let ju = select(j + 1u, j, j == SM_NY - 1u);
+    let inv = 1.0 / (2.0 * SM_H);
+    var e = vec2<f32>(
+      (abs(scal[P_CURL + smCell(ir, j)]) - abs(scal[P_CURL + smCell(il, j)])) * inv,
+      (abs(scal[P_CURL + smCell(i, ju)]) - abs(scal[P_CURL + smCell(i, jd)])) * inv
+    );
+    e = e / (length(e) + 1e-8);
+    let w = params.vort * SM_H * scal[P_CURL + c];
+    var f = vec2<f32>(e.y * w, -e.x * w);
+    let m = abs(w);
+    if (m > SM_CONF_MAX) { f = f * (SM_CONF_MAX / m); }
+    scal[P_CFX + c] = f.x;
+    scal[P_CFY + c] = f.y;
+  }
+
+  let p = vec2<f32>(-SM_XR + (f32(i) + 0.5) * SM_H, -SM_YR + (f32(j) + 0.5) * SM_H);
+  let advected = scal[P_TS + c];
+  var t = advected * exp(-SM_COOL * dt);
+  t += (1.0 - t) * min(1.0, SM_SRC_RATE * dt) * smRamp() * smSource(p);
+  let cheat = SM_CURSOR_HEAT * dt * max(0.0, params.grav - 1.0);
+  if (cheat > 0.0) {
+    let d = p - vec2<f32>(params.mx, params.my);
+    t += cheat * exp(-dot(d, d) / SM_CURSOR_R2);
+  }
+  scal[P_T + c] = t;
+  // Thermal expansion -- see EXPAND in sim/smoke.ts. Whatever the temperature
+  // did this step that advection did not do is heating, and heating is what a
+  // low-Mach fluid expands in response to. Taken as the difference rather than
+  // by re-deriving the source and cooling terms, so the cursor's heat is in for
+  // free and the two cannot drift apart.
+  scal[P_DIL + c] = (t - advected) * SM_EXPAND / max(dt, 1e-6);
+}
+
+@compute @workgroup_size(${WORKGROUP})
+fn smForces(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let t = gid.x;
+  if (t >= SM_FACES) { return; }
+  let i = t % SM_SX;
+  let j = t / SM_SX;
+  let dt = params.dt;
+  let keep = exp(-SM_DRAG * dt);
+  let k = SM_CURSOR_K * dt * params.grav;
+  // The ambient drift is specified as the speed it settles at, and under a
+  // linear drag that is f/DRAG -- so the force is DRAG times it. A force rather
+  // than a velocity so it goes in upstream of the projection and the fluid gets
+  // to answer it. See AMBIENT_V in sim/smoke.ts.
+  let amb = SM_AMB_V * SM_DRAG;
+
+  var vel = svel[V_B + t];
+
+  if (j < SM_NY) {
+    let p = vec2<f32>(-SM_XR + f32(i) * SM_H, -SM_YR + (f32(j) + 0.5) * SM_H);
+    let cl = scal[P_CFX + smCell(select(i - 1u, i, i == 0u), j)];
+    let cr = scal[P_CFX + smCell(min(i, SM_NX - 1u), j)];
+    var f = 0.5 * (cl + cr);
+    let d = p - vec2<f32>(params.mx, params.my);
+    f += params.cvel.x * k * exp(-dot(d, d) / SM_CURSOR_R2);
+    f += smCurlNoise(p, params.time, SM_AMB_L, amb, SM_AMB_RATE).x;
+    vel.x = vel.x * keep + f * dt;
+  }
+
+  if (i < SM_NX && j > 0u) {
+    let p = vec2<f32>(-SM_XR + (f32(i) + 0.5) * SM_H, -SM_YR + f32(j) * SM_H);
+    let tb = scal[P_T + smCell(i, j - 1u)];
+    let ta = select(scal[P_T + smCell(i, min(j, SM_NY - 1u))], 0.0, j >= SM_NY);
+    var f = SM_BUOY * 0.5 * (tb + ta);
+    f += SM_JET * smRamp() * smSource(p);
+    f += 0.5 * (scal[P_CFY + smCell(i, j - 1u)]
+              + scal[P_CFY + smCell(i, min(j, SM_NY - 1u))]);
+    let d = p - vec2<f32>(params.mx, params.my);
+    f += params.cvel.y * k * exp(-dot(d, d) / SM_CURSOR_R2);
+    f += smCurlNoise(p, params.time, SM_AMB_L, amb, SM_AMB_RATE).y;
+    vel.y = vel.y * keep + f * dt;
+  }
+
+  svel[V_B + t] = vel;
+}
+
+@compute @workgroup_size(${WORKGROUP})
+fn smDivergence(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let c = gid.x;
+  if (c >= SM_CELLS) { return; }
+  let i = c % SM_NX;
+  let j = c / SM_NX;
+  let o = V_B + smFace(i, j);
+  // Divergence the field has, less the divergence it is supposed to have.
+  // Solving against the difference leaves the projected field carrying exactly
+  // the expansion term; with it zero this is the incompressible projection
+  // unchanged, which is what every cell that is not heating gets.
+  scal[P_DIV + c] =
+    (svel[o + 1u].x - svel[o].x + svel[o + SM_SX].y - svel[o].y) / SM_H
+    - scal[P_DIL + c];
+}
+
+/**
+ * One red-black Gauss-Seidel cell. The parity argument picks the colour.
+ *
+ * Safe in place with every cell of one colour running at once, because a cell
+ * of one colour has only neighbours of the other -- which is the entire reason
+ * this needs no second pressure buffer and the Jacobi version would.
+ *
+ * Only the floor is Neumann (ghost equal to the cell itself). The other three
+ * sides are open, so the ghost is a hard zero and fluid can cross them.
+ */
+fn smRelax(t : u32, parity : u32) {
+  let half = SM_NX / 2u;
+  if (t >= half * SM_NY) { return; }
+  let j = t / half;
+  let i = (t % half) * 2u + ((j + parity) & 1u);
+  if (i >= SM_NX) { return; }
+  let c = smCell(i, j);
+
+  let l = select(scal[P_PHI + c - 1u], 0.0, i == 0u);
+  let r = select(scal[P_PHI + c + 1u], 0.0, i == SM_NX - 1u);
+  let d = select(scal[P_PHI + c - SM_NX], scal[P_PHI + c], j == 0u);
+  let u = select(scal[P_PHI + c + SM_NX], 0.0, j == SM_NY - 1u);
+  scal[P_PHI + c] = (l + r + d + u - SM_H * SM_H * scal[P_DIV + c]) * 0.25;
+}
+
+@compute @workgroup_size(${WORKGROUP})
+fn smRelaxRed(@builtin(global_invocation_id) gid : vec3<u32>) {
+  smRelax(gid.x, 0u);
+}
+
+@compute @workgroup_size(${WORKGROUP})
+fn smRelaxBlack(@builtin(global_invocation_id) gid : vec3<u32>) {
+  smRelax(gid.x, 1u);
+}
+
+@compute @workgroup_size(${WORKGROUP})
+fn smProject(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let t = gid.x;
+  if (t >= SM_FACES) { return; }
+  let i = t % SM_SX;
+  let j = t / SM_SX;
+  let inv = 1.0 / SM_H;
+
+  var vel = svel[V_B + t];
+
+  if (j < SM_NY) {
+    // The Dirichlet ghost of zero outside each open edge falls straight out of
+    // the gradient, so the edge faces need no special case.
+    let pr = select(scal[P_PHI + smCell(min(i, SM_NX - 1u), j)], 0.0, i >= SM_NX);
+    let pl = select(scal[P_PHI + smCell(select(i - 1u, 0u, i == 0u), j)], 0.0, i == 0u);
+    vel.x = vel.x - (pr - pl) * inv;
+  } else {
+    vel.x = 0.0;
+  }
+
+  if (i < SM_NX && j > 0u) {
+    let pa = select(scal[P_PHI + smCell(i, min(j, SM_NY - 1u))], 0.0, j >= SM_NY);
+    vel.y = vel.y - (pa - scal[P_PHI + smCell(i, j - 1u)]) * inv;
+  } else {
+    vel.y = 0.0;
+  }
+
+  svel[V_A + t] = vel;
+}
+
+/**
+ * Where in the source a tracer belongs, from its species. Mirrors sourceX().
+ *
+ * Six dye ribbons injected side by side and never mixed at the root, so the
+ * filter chips isolate a single material line and show it folding. See
+ * sim/smoke.ts for why that is the thing worth showing here.
+ */
+fn smSourceX(i : u32) -> f32 {
+  let j = (hash(i * 11u + 5u) - 0.5) * SM_SPREAD;
+  let f = clamp((f32(cspecies[i]) + 0.5 + j) / 6.0, 0.0, 1.0);
+  return (f * 2.0 - 1.0) * SM_SRC_W;
+}
+
+fn smRespawn(i : u32) -> vec4<f32> {
+  return vec4<f32>(
+    smSourceX(i) + (hash(i * 17u + 9u) - 0.5) * 0.02,
+    -SM_YR + hash(i * 7u + 3u) * SM_SRC_H,
+    0.0, 0.0
+  );
+}
+
+/**
+ * Carry one tracer with the flow.
+ *
+ * Massless and with no equation of its own: position integrates the field, and
+ * the velocity slot is read back out of the field rather than accumulated. A
+ * tracer with inertia lags the flow and draws a blunted version of it, and the
+ * claim of this mode is that the filaments on screen belong to the fluid rather
+ * than to a million independent integrators.
+ */
+fn smokeStep(i : u32, p : vec4<f32>, dt : f32) -> vec4<f32> {
+  let tick = u32(params.time * 60.0);
+
+  // Finite residence time, drawn statelessly against a time bucket -- a tracer
+  // is four floats and all four are taken, so there is nowhere to keep a clock.
+  // Without it the stagnant corners silt up and never empty. See TURN_HZ.
+  if (hash(i * 2654435761u + u32(params.time * SM_TURN_HZ) * 40503u) < SM_RECYCLE_P) {
+    return smRespawn(i);
+  }
+
+  var v = smVel(V_A, p.xy);
+  let speed = length(v);
+  if (speed > SM_VMAX) { v = v * (SM_VMAX / speed); }
+
+  // Sub-grid turbulence, gated by how hard the resolved flow is turning here --
+  // see SUBGRID_V in sim/smoke.ts. Divergence-free by construction, which is
+  // what lets it be added downstream of the projection without putting the
+  // compression back that the projection just removed.
+  //
+  // Added to the position rather than to the reported velocity: the velocity
+  // slot is what the renderer tints by and the sidebar reads, and that is a
+  // statement about the fluid. The closure term moves the tracer; it is not
+  // something the fluid is doing.
+  let gate = SM_SUB_FLOOR
+    + (1.0 - SM_SUB_FLOOR) * min(1.0, abs(smCurlAt(p.xy)) / SM_SUB_OMEGA);
+  let sub = smSubgrid(p.xy, params.time) * gate;
+
+  // Advection, the sub-grid field, and the uncorrelated jitter under it -- rms
+  // sqrt(2 D dt) per axis, with the sqrt(3) turning that into the half-width of
+  // a uniform draw. See DIFFUSIVITY in sim/smoke.ts for what is left for it to
+  // do now that the curl noise carries the structure.
+  let walk = sqrt(2.0 * SM_DIFFUSIVITY * dt) * 1.7320508;
+  let jitter = vec2<f32>(
+    hash(i * 3u + tick * 9781u) * 2.0 - 1.0,
+    hash(i * 3u + 1u + tick * 6151u) * 2.0 - 1.0
+  ) * walk;
+  let pos = p.xy + (v + sub) * dt + jitter;
+
+  if (pos.y > SM_YR || pos.y < -SM_YR || pos.x < -SM_XR || pos.x > SM_XR) {
+    return smRespawn(i);
+  }
+  return vec4<f32>(pos, v);
+}
+
 @compute @workgroup_size(${WORKGROUP})
 fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = gid.x;
@@ -685,6 +1274,10 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   }
   if (params.mode == ${CLASSIC}u) {
     parts[i] = clsIntegrate(p, dt);
+    return;
+  }
+  if (params.mode == ${SMOKE}u) {
+    parts[i] = smokeStep(i, p, dt);
     return;
   }
 
@@ -949,9 +1542,161 @@ fn tmVs(@builtin(vertex_index) vi : u32) -> TMOut {
 @group(0) @binding(0) var hdr : texture_2d<f32>;
 @group(0) @binding(1) var<uniform> tparams : Params;
 
+// --- smoke as participating media --------------------------------------------
+//
+// Every other mode here is luminous. A galaxy, a plate of glowing grains and a
+// pair of colliding cores all genuinely emit, so accumulating additively into
+// the HDR buffer and curving the result is not a stylization -- it is what a
+// long exposure of a bright thing on a dark sky does, and the tonemap above is
+// the film.
+//
+// Smoke emits nothing. It is lit from outside, and the two things it does with
+// that light are scatter it and block it. Rendered additively it comes out as a
+// glowing plume in a vacuum, which is the single loudest reason the mode reads
+// as CG: not the shapes, which are the solver's and are correct, but the fact
+// that the dense parts get *brighter* where they should get more opaque, and
+// that a thick region shows no sign of having anything behind it.
+//
+// So the smoke branch below is a different picture built from the same buffer.
+// The alpha channel already carries exactly what is needed and always has: the
+// particle shader writes tint*w into rgb and w into alpha, so alpha is a column
+// density and rgb/alpha is the density-weighted mean dye colour, with the gain
+// cancelling out of the ratio. Nothing about the accumulation pass changes.
+//
+// What is missing is a light path, and in two dimensions there isn't one -- the
+// depth the light would travel through does not exist. The march below fakes it
+// in the plane: step from the pixel toward the key light, sum the density found
+// along the way, and attenuate. It is the standard 2D dodge and it works for the
+// reason most rendering dodges work, which is that the eye reads the *gradient*
+// -- lit rim, shadowed interior, soft falloff between -- and is not checking the
+// transport equation.
+
+/** Optical depth per unit of accumulated column density, along the view ray. */
+const SM_EXTINCT = 7.0;
+/**
+ * The same, along the light ray, per frame-height of travel.
+ *
+ * Not derivable from SM_EXTINCT and much larger than it, which is a real
+ * statement rather than a fudge factor: the view ray integrates a density that
+ * has *already* been integrated through the sprite, while the light ray
+ * integrates it across the screen. The number is large because it is standing in
+ * for a path through a third dimension that this mode does not have.
+ */
+const SM_SHADOW = 120.0;
+/** Toward the key light, in screen space with y up. */
+const SM_LIGHT = vec2<f32>(-0.55, 0.84);
+/**
+ * Shadow march: taps, first step as a fraction of the frame height, and the
+ * ratio between successive steps.
+ *
+ * Geometric rather than uniform, because the near field is what carries the
+ * shape. Fourteen taps at 1.4x from 0.002 reaches 0.55 of the frame height,
+ * which a uniform march at the same near resolution would need 275 taps to do.
+ * The far taps undersample and can miss a thin filament, but they are also the
+ * ones already attenuated by everything in front of them.
+ */
+const SM_TAPS = 14;
+const SM_STEP0 = 0.002;
+const SM_GROWTH = 1.4;
+/** Key and fill. Warm key, cool fill -- the fill stands in for the light the
+ *  smoke scatters between its own parts, which single scattering cannot see. */
+const SM_KEY = vec3<f32>(1.00, 0.95, 0.86);
+const SM_FILL = vec3<f32>(0.20, 0.25, 0.34);
+/**
+ * Chroma boost, and how far the result is lifted toward white before being used
+ * as an albedo.
+ *
+ * A palette entry is a hue, not a scattering albedo, and smoke's is high -- it
+ * scatters most of what reaches it, which is why it is pale. Used raw the plume
+ * renders as coloured glass, so some lift is not optional.
+ *
+ * The boost is, and it is a deliberate departure from the physics that the rest
+ * of this block is careful about. Three separate things desaturate the dye here
+ * and they compound: a pixel's tint is the density-weighted *mean* of whatever
+ * species landed on it and six overlapping ribbons average to grey; the lift
+ * pulls what survives toward white; and the composite is bg*trans + lit*(1-trans)
+ * over a neutral room, so thin smoke at trans 0.7 is seven parts grey wall. All
+ * three are correct and the sum of them is a monochrome plume — which is fine as
+ * a picture of smoke and useless as this mode, where the six ribbons are the
+ * entire reason species exist and the filter chips are the only way to watch a
+ * single material line fold.
+ *
+ * So chroma is scaled about the pixel's own luminance before the lift, which
+ * moves hue without moving brightness — the same separation the tonemap below
+ * makes for the opposite reason. At 1.6 a filament carrying mostly one dye reads
+ * as that dye and a well-mixed region still goes grey, which is the honest part:
+ * mixing really has happened there.
+ */
+const SM_SATURATE = 1.6;
+const SM_ALBEDO_LIFT = 0.25;
+
+/** The room the plume is in. */
+fn smokeRoom(px : vec2<f32>, dim : vec2<f32>) -> vec3<f32> {
+  // A vacuum is the one thing the background cannot be. Smoke is generally
+  // *lighter* than what is behind it, so against black it can only ever add
+  // light, and every part of the argument above collapses -- there is nothing
+  // for the opaque regions to occlude and no darker value for the shadowed side
+  // to fall to. A dim room, brighter toward the key, gives the plume both.
+  //
+  // Kept dim and kept falling off fast. A wide, bright gradient stops reading as
+  // a wall and starts reading as a light source in frame, which is a second
+  // subject competing with the plume; the falloff below puts most of the range in
+  // the corner nearest the key and leaves the rest of the box nearly as dark as
+  // every other mode's background.
+  let uv = px / dim;
+  let g = 1.0 - clamp(length(uv - vec2<f32>(0.18, 0.06)) * 1.15, 0.0, 1.0);
+  return mix(vec3<f32>(0.013, 0.015, 0.020), vec3<f32>(0.046, 0.047, 0.055), g * g);
+}
+
+/** Density between this pixel and the key light, as an optical depth. */
+fn smokeShadow(px : vec2<f32>, dim : vec2<f32>) -> f32 {
+  // Screen y runs down and SM_LIGHT is written with y up.
+  let dir = vec2<f32>(SM_LIGHT.x, -SM_LIGHT.y);
+  var step = SM_STEP0 * dim.y;
+  var dist = 0.0;
+  var tau = 0.0;
+  for (var n = 0; n < SM_TAPS; n = n + 1) {
+    dist = dist + step;
+    let s = px + dir * dist;
+    if (s.x < 0.0 || s.y < 0.0 || s.x >= dim.x || s.y >= dim.y) { break; }
+    // Steps measured in frame-heights, so the same plume casts the same shadow
+    // at every resolution.
+    tau = tau + textureLoad(hdr, vec2<i32>(s), 0).a * (step / dim.y);
+    step = step * SM_GROWTH;
+  }
+  return tau * SM_SHADOW;
+}
+
+/** Scattered radiance for one pixel of smoke, composited over the room. */
+fn smokeShade(px : vec2<f32>, acc : vec4<f32>, dim : vec2<f32>, bg : vec3<f32>) -> vec3<f32> {
+  let dens = acc.a;
+  // Most of the frame is empty, and this is what keeps the march off it.
+  if (dens < 1e-5) { return bg; }
+  let tint = acc.rgb / dens;
+  let lum = dot(tint, vec3<f32>(0.2126, 0.7152, 0.0722));
+  let chroma = max(vec3<f32>(0.0), mix(vec3<f32>(lum), tint, SM_SATURATE));
+  let albedo = mix(chroma, vec3<f32>(1.0), SM_ALBEDO_LIFT);
+  let lit = albedo * (SM_KEY * exp(-smokeShadow(px, dim)) + SM_FILL);
+  let trans = exp(-dens * SM_EXTINCT);
+  return bg * trans + lit * (1.0 - trans);
+}
+
 @fragment
 fn tmFs(in : TMOut) -> @location(0) vec4<f32> {
-  let c = textureLoad(hdr, vec2<i32>(in.pos.xy), 0).rgb;
+  let acc = textureLoad(hdr, vec2<i32>(in.pos.xy), 0);
+  var c = acc.rgb;
+
+  // Background sits underneath rather than being cleared into the accumulation
+  // buffer, so it never participates in the tonemap and the darkest particle
+  // still lifts off it. The smoke is the exception and has to be: there the
+  // background is part of the lit scene, seen *through* the medium rather than
+  // behind it, so it is composited in here and laid under nothing.
+  var bg = vec3<f32>(0.027, 0.035, 0.051);
+  if (tparams.mode == ${SMOKE}u) {
+    let dim = vec2<f32>(textureDimensions(hdr));
+    c = smokeShade(in.pos.xy, acc, dim, smokeRoom(in.pos.xy, dim));
+    bg = vec3<f32>(0.0);
+  }
 
   // Tonemap the *luminance* and carry the chroma through unchanged, rather than
   // curving each channel on its own.
@@ -982,10 +1727,6 @@ fn tmFs(in : TMOut) -> @location(0) vec4<f32> {
   // which is what an overexposed source does -- without touching anything below.
   mapped = mix(mapped, vec3<f32>(lm), smoothstep(0.75, 1.0, lm));
 
-  // Background sits underneath rather than being cleared into the accumulation
-  // buffer, so it never participates in the tonemap and the darkest particle
-  // still lifts off it.
-  let bg = vec3<f32>(0.027, 0.035, 0.051);
   let lit = bg + clamp(mapped, vec3<f32>(0.0), vec3<f32>(1.0)) * (1.0 - bg);
 
   // The swap chain is a plain unorm format, so the sRGB transfer is ours to
@@ -1024,10 +1765,10 @@ export async function createWebGPUBackend(
   });
   device.queue.writeBuffer(particleBuf, 0, sim.particles);
 
-  // 120 bytes: 22 scalars, the two collision cores and their mass, then the two
-  // live slider values and four bytes of tail padding the vec2 alignment forces.
-  // Must match the Params struct exactly, vec2 alignment included.
-  const PARAM_BYTES = 120;
+  // 128 bytes: 22 scalars, the two collision cores and their mass, the three
+  // live slider values, and the pointer velocity the smoke is stirred by. Must
+  // match the Params struct exactly, vec2 alignment included.
+  const PARAM_BYTES = 128;
   const paramBuf = device.createBuffer({
     size: PARAM_BYTES,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -1051,6 +1792,41 @@ export async function createWebGPUBackend(
   const cellMassBuf = device.createBuffer({
     size: CELLS * 4,
     usage: GPUBufferUsage.STORAGE,
+  });
+
+  // The smoke solver's whole state: two planes of staggered velocity and seven
+  // of cell-centered scalars. 520 kB together, and never read by the CPU except
+  // through dumpSmoke() below.
+  const smVelBuf = device.createBuffer({
+    size: SM_FACES * 2 * 8,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+  });
+  const smScalBuf = device.createBuffer({
+    size: SM_CELLS * SM_PLANES * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+  });
+  /**
+   * Zero the fluid.
+   *
+   * Has to happen on every seed, not only at boot. The field is the mode's real
+   * state — the tracers are only what it is carrying — so re-seeding the
+   * particles while leaving a developed flow in place would drop a fresh column
+   * of dye into somebody else's turbulence and [R] would restart nothing.
+   */
+  const clearSmoke = () => {
+    device.queue.writeBuffer(smVelBuf, 0, new Float32Array(SM_FACES * 2 * 2));
+    device.queue.writeBuffer(smScalBuf, 0, new Float32Array(SM_CELLS * SM_PLANES));
+  };
+  clearSmoke();
+  // Sized for the scalar planes and the projected velocity together. Both,
+  // because the claim worth checking is that the projection removed the
+  // divergence it was handed, and that needs the field it left behind as well as
+  // the one it was given.
+  const SM_SCAL_BYTES = SM_CELLS * SM_PLANES * 4;
+  const SM_VEL_BYTES = SM_FACES * 8;
+  const smokeStaging = device.createBuffer({
+    size: SM_SCAL_BYTES + SM_VEL_BYTES,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
   });
   // Its own staging buffer, deliberately not shared with the particle readback:
   // the sidebar holds that one mapped most of the time, and a second mapAsync
@@ -1128,6 +1904,8 @@ export async function createWebGPUBackend(
       { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     ],
   });
   const renderLayout = device.createBindGroupLayout({
@@ -1158,6 +1936,15 @@ export async function createWebGPUBackend(
   const depositPipeline = mkCompute('depositMass');
   const bakePipeline = mkCompute('bakeGrid');
   const solvePipeline = mkCompute('solveField');
+
+  const smAdvectVelPipe = mkCompute('smAdvectVel');
+  const smAdvectScalarPipe = mkCompute('smAdvectScalar');
+  const smCommitPipe = mkCompute('smCommitScalar');
+  const smForcesPipe = mkCompute('smForces');
+  const smDivPipe = mkCompute('smDivergence');
+  const smRedPipe = mkCompute('smRelaxRed');
+  const smBlackPipe = mkCompute('smRelaxBlack');
+  const smProjectPipe = mkCompute('smProject');
 
   // Particles accumulate here, not in the swap chain. rgba16float is blendable
   // in WebGPU and gives the additive sum somewhere to go above 1.0.
@@ -1240,6 +2027,8 @@ export async function createWebGPUBackend(
       { binding: 3, resource: { buffer: densBuf } },
       { binding: 4, resource: { buffer: fieldBuf } },
       { binding: 5, resource: { buffer: cellMassBuf } },
+      { binding: 6, resource: { buffer: smVelBuf } },
+      { binding: 7, resource: { buffer: smScalBuf } },
     ],
   });
   const renderBind = device.createBindGroup({
@@ -1267,6 +2056,16 @@ export async function createWebGPUBackend(
     seedMode(sim, mode, pair);
     uploadSpecies();
     device.queue.writeBuffer(particleBuf, 0, sim.particles);
+    // The fluid is state too — see clearSmoke().
+    clearSmoke();
+    // And so is the clock. reset() used to zero this and setMode() did not, so a
+    // mode switch carried the previous mode's elapsed time into the new one —
+    // survivable while the only things reading it were the bar's phase and the
+    // plate's drift, both of which are periodic and have no zero worth being at.
+    // The smoke's source ramp does: it is measured from the seed, and left to a
+    // stale clock the fluid comes up already at full strength and the mode is
+    // back to starting its jet impulsively. See SRC_RAMP in sim/smoke.ts.
+    elapsed = 0;
   }
 
   return {
@@ -1302,6 +2101,12 @@ export async function createWebGPUBackend(
       cooling = v;
     },
 
+    // Straight through to the module the CPU reference reads, rather than into a
+    // local of its own — one value, so the two arms cannot disagree about it.
+    setVorticity(v: number) {
+      smoke.setVorticity(v);
+    },
+
     setMono(v: boolean) {
       mono = v;
     },
@@ -1319,7 +2124,7 @@ export async function createWebGPUBackend(
     },
 
     reset() {
-      elapsed = 0;
+      // seed() zeroes the clock now, for both this and setMode().
       seed();
     },
 
@@ -1327,7 +2132,7 @@ export async function createWebGPUBackend(
       // The self-gravitating disc and the plate are tonemapped out of an HDR
       // buffer; the fixed-potential modes draw straight to the swap chain, which
       // is the renderer each of them was tuned against.
-      const hdr = mode === SELFGRAV || mode === HALO || mode === CHLADNI;
+      const hdr = mode === SELFGRAV || mode === HALO || mode === CHLADNI || mode === SMOKE;
 
       paramData[0] = dt;
       paramData[1] = mx;
@@ -1371,7 +2176,20 @@ export async function createWebGPUBackend(
       // as before, only concentrated in a face-on-sized point rather than smeared
       // over one 1/t^2 larger. The cancellation is independent of the zoom clamp
       // in cameraZoom(), so it holds at every window shape.
-      paramData[5] = (hdr ? 60_000 / count : Math.min(1, Math.max(0.3, 120_000 / count))) / tilt;
+      // The fluid gets its own, and needs to: the galaxy's number is sized for a
+      // population packed inside r = 0.7 with an enormous density range across
+      // it, and the tonemap's job there is to keep a core that is orders of
+      // magnitude brighter than the arms from flattening to a disc. A plume is
+      // the opposite distribution -- spread over a box four times the area, with
+      // its light in filaments that are all roughly as bright as each other.
+      // Handed the disc's gain it renders every filament above the tonemap's
+      // white rolloff, which was measured on screen as exactly that: correct
+      // turbulent structure, rendered in white, with all six dye ribbons
+      // indistinguishable. Lower gain and lower exposure put the plume back in
+      // the part of the curve that still has colour in it.
+      const hdrGain = (mode === SMOKE ? 16_000 : 60_000) / count;
+      paramData[5] =
+        (hdr ? hdrGain : Math.min(1, Math.max(0.3, 120_000 / count))) / tilt;
       paramU32[6] = mask;
       paramU32[7] = mode;
       elapsed += dt;
@@ -1404,7 +2222,14 @@ export async function createWebGPUBackend(
       // the accumulation buffer. Under Reinhard that wants an exposure around 8
       // to land the mid-disc near a third and leave the core room to climb
       // without clipping.
-      paramData[13] = 8;
+      //
+      // The smoke is handed something else entirely. Its branch of the tonemap
+      // composites a *radiance* — lit smoke over a lit room, already bounded by
+      // the albedo and the key — rather than an unbounded accumulation, so the
+      // curve is there to roll off the brightest lit filaments and nothing else.
+      // Its old 5 was sized for the accumulation and would blow the composite to
+      // white.
+      paramData[13] = mode === SMOKE ? 2.0 : 8;
       // The whole camera, in one number — see cameraZoom() in backend.ts.
       paramData[14] = cameraZoom(mode, canvas.width / canvas.height, tilted);
       paramData[15] = count;
@@ -1431,12 +2256,27 @@ export async function createWebGPUBackend(
       // CPU baseline and the seeding. Zero outside the HALO mode -- see
       // haloMass() in sim/world.ts.
       paramData[28] = haloMass();
+      // Slot 29 is the padding cvel's 8-byte alignment reserves, so the
+      // confinement strength lands there for free. Same arrangement as the two
+      // above: read from the module rather than mirrored into a local, because
+      // the CPU reference needs the identical number and does not come through
+      // a backend. See vorticity() in sim/smoke.ts.
+      paramData[29] = smoke.vorticity();
+      const [scvx, scvy] = smoke.cursorVel();
+      paramData[30] = scvx;
+      paramData[31] = scvy;
       device.queue.writeBuffer(paramBuf, 0, paramBytes);
 
       const enc = device.createCommandEncoder();
 
       const groups = Math.ceil(count / WORKGROUP);
       const cellGroups = Math.ceil(CELLS / WORKGROUP);
+      const smCellGroups = Math.ceil(SM_CELLS / WORKGROUP);
+      const smFaceGroups = Math.ceil(SM_FACES / WORKGROUP);
+      // Half the cells per relaxation dispatch: one colour of the red-black
+      // checkerboard, indexed directly rather than by testing parity and
+      // returning, so no thread is launched to do nothing.
+      const smHalfGroups = Math.ceil(SM_CELLS / 2 / WORKGROUP);
       const cpass = enc.beginComputePass();
       cpass.setBindGroup(0, computeBind);
       // Self-gravity: the two disc modes only. Every other mode is a prescribed
@@ -1457,6 +2297,35 @@ export async function createWebGPUBackend(
         cpass.dispatchWorkgroups(cellGroups);
         cpass.setPipeline(solvePipeline);
         cpass.dispatchWorkgroups(cellGroups);
+      }
+      // The fluid, in the same pass and for the same reason: dispatches inside
+      // one compute pass are ordered and their writes are visible to the next,
+      // so a chain this long needs no explicit barrier anywhere in it.
+      //
+      // Forty-eight dispatches, forty of them the pressure solve, and that is
+      // what the mode costs. Each one is small — 258 workgroups at most — so the
+      // per-dispatch overhead is a real fraction of it, which is exactly why the
+      // relaxation is red-black rather than Jacobi: twice the convergence for
+      // the same number of dispatches.
+      if (mode === SMOKE) {
+        cpass.setPipeline(smAdvectVelPipe);
+        cpass.dispatchWorkgroups(smFaceGroups);
+        cpass.setPipeline(smAdvectScalarPipe);
+        cpass.dispatchWorkgroups(smCellGroups);
+        cpass.setPipeline(smCommitPipe);
+        cpass.dispatchWorkgroups(smCellGroups);
+        cpass.setPipeline(smForcesPipe);
+        cpass.dispatchWorkgroups(smFaceGroups);
+        cpass.setPipeline(smDivPipe);
+        cpass.dispatchWorkgroups(smCellGroups);
+        for (let s = 0; s < smoke.SWEEPS; s++) {
+          cpass.setPipeline(smRedPipe);
+          cpass.dispatchWorkgroups(smHalfGroups);
+          cpass.setPipeline(smBlackPipe);
+          cpass.dispatchWorkgroups(smHalfGroups);
+        }
+        cpass.setPipeline(smProjectPipe);
+        cpass.dispatchWorkgroups(smFaceGroups);
       }
       cpass.setPipeline(computePipeline);
       cpass.dispatchWorkgroups(groups);
@@ -1537,6 +2406,43 @@ export async function createWebGPUBackend(
      * against an independent implementation rather than against how it looks.
      * `dens` comes back in raw fixed-point units; multiply by `massScale`.
      */
+    /**
+     * Dump the fluid's scalar planes, so the projection can be checked rather
+     * than admired.
+     *
+     * `div` is what the pressure solve was handed this frame; recomputing the
+     * divergence from the velocity afterwards is what says whether it removed
+     * it. See the verification section of the README.
+     */
+    async dumpSmoke() {
+      const enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(smScalBuf, 0, smokeStaging, 0, SM_SCAL_BYTES);
+      // Plane A only: the projected field, which is the one the tracers were
+      // stepped with. Plane B is the frame's scratch and is already stale.
+      enc.copyBufferToBuffer(smVelBuf, 0, smokeStaging, SM_SCAL_BYTES, SM_VEL_BYTES);
+      device.queue.submit([enc.finish()]);
+
+      await smokeStaging.mapAsync(GPUMapMode.READ);
+      const raw = new Float32Array(smokeStaging.getMappedRange().slice(0));
+      smokeStaging.unmap();
+      const plane = (n: number) => raw.subarray(n * SM_CELLS, (n + 1) * SM_CELLS);
+      // Interleaved u, v per face, so the caller reads vel[2*(j*stride+i)] and
+      // the odd neighbour -- the same layout as the vec2 the shader sees.
+      const vel = raw.subarray(SM_SCAL_BYTES / 4, SM_SCAL_BYTES / 4 + SM_FACES * 2);
+      return {
+        temp: plane(0),
+        phi: plane(2),
+        div: plane(3),
+        curl: plane(4),
+        dil: plane(7),
+        vel,
+        nx: smoke.NX,
+        ny: smoke.NY,
+        stride: smoke.SX,
+        h: smoke.H,
+      };
+    },
+
     async dumpGrid() {
       const enc = device.createCommandEncoder();
       enc.copyBufferToBuffer(densBuf, 0, gridStaging, 0, CELLS * 4);
@@ -1558,6 +2464,9 @@ export async function createWebGPUBackend(
       densBuf.destroy();
       fieldBuf.destroy();
       cellMassBuf.destroy();
+      smVelBuf.destroy();
+      smScalBuf.destroy();
+      smokeStaging.destroy();
       staging.destroy();
       gridStaging.destroy();
       hdrTex?.destroy();
