@@ -4,6 +4,8 @@ A browser demo that simulates and renders one million particles at 60 fps while 
 sidebar scrolls all 1,000,000 of them, and instruments itself so the claims can be
 checked. All figures below are measured, not estimated.
 
+LIVE: https://flanderslorton.com/particles/
+
 ## Stack
 
 | | |
